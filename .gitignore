@@ -1,0 +1,27 @@
+# Rust target directory
+/target
+Cargo.lock.bak
+
+# IDE & Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Operating System files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment and sensitive data
+.env
+.env.*
+*.local
+
+# Database and runtime state
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.log

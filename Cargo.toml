@@ -1,0 +1,86 @@
+[package]
+name = "warust"
+version = "0.1.0"
+edition = "2021"
+description = "WhatsApp desktop client in Rust (egui + whatsapp-rust)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/FoxxoOwO/warust"
+readme = "README.md"
+keywords = ["whatsapp", "client", "egui", "desktop"]
+categories = ["gui", "network-programming"]
+
+[workspace]
+
+[dependencies]
+# --- WhatsApp core ---
+# IMPORTANT: default-features = false to avoid 'simd' which requires nightly
+whatsapp-rust = { version = "0.7.0", default-features = false, features = [
+    "signal",
+    "sqlite-storage",
+    "tokio-native",
+    "tokio-runtime",
+    "tokio-transport",
+    "ureq-client",
+    "whatsapp-rust-sqlite-storage",
+    "voip-mlow"
+] }
+
+# --- UI ---
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "persistence", "glow"] }
+egui = "0.37"
+egui_extras = "0.37"
+qrcode = { version = "0.14", features = ["image"] }
+image = "0.25"
+ureq = "3"
+
+# --- Async & Runtime ---
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "fs"] }
+async-channel = "2"
+anyhow = "1.0"
+futures = "0.3"
+
+# --- Serialization ---
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# --- Logging & Observability ---
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "chrono"] }
+
+# --- Platform & Utils ---
+dirs = "5.0"
+parking_lot = "0.12"  # faster RwLock/Mutex
+once_cell = "1.19"
+glow = "0.14"
+
+# --- Development ---
+console_error_panic_hook = { version = "0.1", optional = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3.8"
+
+[[bin]]
+name = "warust"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[features]
+default = []
+# Enable for development builds with console logging on WASM (not used here)
+dev = ["console_error_panic_hook"]
+[patch.crates-io]
+whatsapp-rust = { path = "vendor/whatsapp-rust" }
+
