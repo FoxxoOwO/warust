@@ -11,10 +11,10 @@ pub fn show_settings_with_ctx(ctx: &Context, state: &SharedState, backend: &Back
     Window::new("⚙️  Nastavení")
         .open(open)
         .resizable(true)
-        .default_width(740.0)
-        .default_height(540.0)
-        .min_width(620.0)
-        .min_height(460.0)
+        .default_width(760.0)
+        .default_height(680.0)
+        .min_width(640.0)
+        .min_height(560.0)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .show(ctx, |ui| {
             show_settings_content(ui, state, backend, &mut should_close);
@@ -46,6 +46,7 @@ fn show_settings_content(ui: &mut Ui, state: &SharedState, backend: &BackendHand
                 (SettingsTab::Privacy, "🔒  Soukromí"),
                 (SettingsTab::Appearance, "🎨  Vzhled"),
                 (SettingsTab::Storage, "ℹ️  O aplikaci a data"),
+                (SettingsTab::System, "🖥️  Systém a spuštění"),
             ];
 
             for (tab, label) in tabs {
@@ -101,6 +102,7 @@ fn show_settings_content(ui: &mut Ui, state: &SharedState, backend: &BackendHand
                         SettingsTab::Privacy => show_privacy_settings(ui, &mut s),
                         SettingsTab::Appearance => show_appearance_settings(ui, &mut s),
                         SettingsTab::Storage => show_storage_settings(ui, &mut s, backend, should_close),
+                        SettingsTab::System => show_system_settings(ui, &mut s),
                     }
                     ui.add_space(16.0);
                 });
@@ -288,5 +290,40 @@ fn show_storage_settings(ui: &mut Ui, _s: &mut crate::state::AppState, backend: 
             let _ = backend.send_command(crate::commands::Command::Disconnect);
             *should_close = true;
         }
+    });
+}
+
+fn show_system_settings(ui: &mut Ui, s: &mut crate::state::AppState) {
+    ui.label(RichText::new("Systém a spuštění").font(FontId::proportional(18.0)).strong());
+    ui.label(RichText::new("Nastavení chování aplikace v systému Windows a oznamovací oblasti (Tray)").font(FontId::proportional(12.0)).color(Color32::from_rgb(0x86, 0x96, 0xA0)));
+    ui.add_space(12.0);
+
+    setting_card(ui, "Spuštění se systémem Windows", |ui| {
+        let mut autostart = s.preferences.start_with_windows;
+        if ui.checkbox(&mut autostart, "Spouštět Warust při přihlášení do Windows").changed() {
+            s.preferences.start_with_windows = autostart;
+            let _ = crate::autostart::set_autostart_enabled(autostart);
+        }
+        ui.label(
+            RichText::new("Aplikace se po přihlášení automaticky spustí na pozadí minimalizovaná do oznamovací oblasti.")
+                .font(FontId::proportional(11.0))
+                .color(Color32::from_rgb(0x86, 0x96, 0xA0))
+        );
+    });
+
+    setting_card(ui, "Oznamovací oblast (Systémová lišta / Tray)", |ui| {
+        ui.checkbox(&mut s.preferences.close_to_tray, "Zavřením okna (křížkem) minimalizovat do systémové lišty");
+        ui.label(
+            RichText::new("Při kliknutí na křížek se okno pouze skryje a Warust zůstane aktivní na pozadí pro příjem zpráv a hovorů.")
+                .font(FontId::proportional(11.0))
+                .color(Color32::from_rgb(0x86, 0x96, 0xA0))
+        );
+        ui.add_space(8.0);
+        ui.checkbox(&mut s.preferences.run_in_tray, "Zobrazovat ikonu v oznamovací oblasti (Tray)");
+        ui.label(
+            RichText::new("Umožňuje snadné otevření nebo úplné ukončení aplikace kliknutím na ikonu vedle hodin.")
+                .font(FontId::proportional(11.0))
+                .color(Color32::from_rgb(0x86, 0x96, 0xA0))
+        );
     });
 }

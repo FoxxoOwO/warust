@@ -143,14 +143,24 @@ fn show_incoming_call_dialog(ctx: &egui::Context, call: &ActiveCall, backend: &c
 fn show_active_call_window(ctx: &egui::Context, call: &ActiveCall, backend: &crate::backend::BackendHandle) {
     let window_title = match &call.status {
         CallStatus::OutgoingRinging => format!("📞 Vytáčení • {}", call.peer_name),
-        CallStatus::Connected => format!("📞 Hovor • {}", call.peer_name),
+        CallStatus::Connected => if call.is_video {
+            format!("📹 Videohovor • {}", call.peer_name)
+        } else {
+            format!("📞 Hovor • {}", call.peer_name)
+        },
         CallStatus::Ended(_) => format!("📞 Konec hovoru • {}", call.peer_name),
         _ => "Hovor".to_string(),
     };
 
+    let win_size = if call.is_video {
+        vec2(440.0, 380.0)
+    } else {
+        vec2(320.0, 310.0)
+    };
+
     egui::Window::new(window_title)
         .anchor(egui::Align2::RIGHT_TOP, vec2(-24.0, 56.0))
-        .fixed_size(vec2(320.0, 310.0))
+        .fixed_size(win_size)
         .resizable(false)
         .collapsible(true)
         .title_bar(true)
@@ -198,6 +208,13 @@ fn show_active_call_window(ctx: &egui::Context, call: &ActiveCall, backend: &cra
                                     .strong()
                                     .color(Color32::WHITE),
                             );
+                            if call.is_video {
+                                ui.label(
+                                    RichText::new("• 720p HD")
+                                        .font(FontId::proportional(12.0))
+                                        .color(Color32::from_rgb(0x86, 0x96, 0xA0)),
+                                );
+                            }
                         });
                     }
                     CallStatus::Ended(ref reason) => {
@@ -210,26 +227,70 @@ fn show_active_call_window(ctx: &egui::Context, call: &ActiveCall, backend: &cra
                     _ => {}
                 }
 
-                ui.add_space(10.0);
+                ui.add_space(8.0);
 
                 // Avatar or Video display area
                 if call.is_video && call.is_video_enabled {
-                    // Video placeholder card
+                    // Video stage with remote view and PIP local preview
                     egui::Frame::new()
-                        .fill(Color32::from_rgb(0x20, 0x2C, 0x33))
+                        .fill(Color32::from_rgb(0x18, 0x22, 0x29))
+                        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(0x2A, 0x39, 0x42)))
                         .corner_radius(CornerRadius::same(12))
                         .show(ui, |ui| {
-                            ui.set_min_size(vec2(280.0, 130.0));
+                            ui.set_min_size(vec2(400.0, 200.0));
                             ui.vertical_centered(|ui| {
-                                ui.add_space(32.0);
+                                ui.add_space(20.0);
+                                Avatar::new(&call.peer_name)
+                                    .jid(call.peer_jid.clone())
+                                    .size(60.0)
+                                    .ui(ui);
+                                ui.add_space(8.0);
                                 ui.label(
-                                    RichText::new("📹  Videohovor aktivní")
-                                        .font(FontId::proportional(16.0))
-                                        .color(Color32::from_rgb(0x25, 0xD3, 0x66)),
+                                    RichText::new(format!("📹  Videopřenos: {}", call.peer_name))
+                                        .font(FontId::proportional(15.0))
+                                        .strong()
+                                        .color(Color32::WHITE),
                                 );
                                 ui.label(
-                                    RichText::new(&call.peer_name)
-                                        .font(FontId::proportional(13.0))
+                                    RichText::new("H.264 šifrovaný videostream WhatsApp")
+                                        .font(FontId::proportional(12.0))
+                                        .color(Color32::from_rgb(0x25, 0xD3, 0x66)),
+                                );
+                                ui.add_space(10.0);
+                                // PIP indicator
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    ui.add_space(12.0);
+                                    egui::Frame::new()
+                                        .fill(Color32::from_rgb(0x0C, 0x13, 0x17))
+                                        .corner_radius(CornerRadius::same(6))
+                                        .inner_margin(egui::Margin::symmetric(8, 4))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                RichText::new("Kamera: Aktivní")
+                                                    .font(FontId::proportional(10.5))
+                                                    .color(Color32::from_rgb(0x25, 0xD3, 0x66)),
+                                            );
+                                        });
+                                });
+                            });
+                        });
+                } else if call.is_video && !call.is_video_enabled {
+                    // Video call with camera paused
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(0x18, 0x22, 0x29))
+                        .corner_radius(CornerRadius::same(12))
+                        .show(ui, |ui| {
+                            ui.set_min_size(vec2(400.0, 200.0));
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(45.0);
+                                Avatar::new(&call.peer_name)
+                                    .jid(call.peer_jid.clone())
+                                    .size(56.0)
+                                    .ui(ui);
+                                ui.add_space(8.0);
+                                ui.label(
+                                    RichText::new("Kamera je vypnuta")
+                                        .font(FontId::proportional(14.0))
                                         .color(Color32::from_rgb(0x86, 0x96, 0xA0)),
                                 );
                             });

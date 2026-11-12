@@ -220,6 +220,10 @@ pub struct ScheduledMessage {
     pub status: ScheduledStatus,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SettingsTab {
     #[default]
@@ -229,6 +233,7 @@ pub enum SettingsTab {
     Privacy,
     Appearance,
     Storage,
+    System,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,6 +247,12 @@ pub struct UserPreferences {
     pub auto_download_docs: bool,
     pub font_size: f32,
     pub dark_theme_preset: usize,
+    #[serde(default = "default_true")]
+    pub run_in_tray: bool,
+    #[serde(default = "default_true")]
+    pub close_to_tray: bool,
+    #[serde(default)]
+    pub start_with_windows: bool,
 }
 
 impl Default for UserPreferences {
@@ -256,6 +267,9 @@ impl Default for UserPreferences {
             auto_download_docs: false,
             font_size: 14.0,
             dark_theme_preset: 0,
+            run_in_tray: true,
+            close_to_tray: true,
+            start_with_windows: false,
         }
     }
 }
@@ -357,6 +371,8 @@ pub struct AppState {
     pub emoji_active_category: usize,
     #[serde(skip)]
     pub reaction_picker_target: Option<String>,
+    #[serde(skip)]
+    pub pending_reactions: HashMap<(Jid, String), Vec<Reaction>>,
     /// Set by any content mutation; cleared after a successful persist so the
     /// periodic writer can skip no-op serialization of the whole message store.
     #[serde(skip)]
@@ -401,13 +417,28 @@ impl Default for AppState {
             emoji_search: String::new(),
             emoji_active_category: 0,
             reaction_picker_target: None,
+            pending_reactions: HashMap::new(),
             dirty: false,
         }
     }
 }
 
 pub fn is_reaction_only(text: &str) -> bool {
-    matches!(text.trim(), "❤️" | "💀" | "😂" | "👍" | "👎" | "🙏" | "🎉" | "😮" | "😢" | "🔥" | "👏")
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let stripped: String = trimmed.chars().filter(|c| *c != '\u{FE0F}').collect();
+    if matches!(
+        stripped.as_str(),
+        "❤️" | "❤" | "💀" | "😂" | "👍" | "👎" | "🙏" | "🎉" | "😮" | "😢" | "🔥" | "👏" | "😍" | "😭" | "🤔" | "🥰" | "✨" | "👀" | "💯"
+    ) {
+        return true;
+    }
+    if stripped.chars().count() == 1 && is_emoji_char(stripped.chars().next().unwrap()) {
+        return true;
+    }
+    false
 }
 
 pub fn is_emoji_char(c: char) -> bool {
@@ -515,6 +546,27 @@ impl AppState {
         let canon_chat_jid = self.canonical_jid(&msg.chat_jid);
         msg.chat_jid = canon_chat_jid.clone();
         let msgs = self.messages.entry(canon_chat_jid.clone()).or_default();
+
+        // If message is a standalone reaction text without media, attach as reaction to previous message instead of showing as bubble
+        if is_reaction_only(&msg.text) && msg.media_type.is_none() {
+            if let Some(target) = msgs.iter_mut().rev().find(|m| m.media_type.is_some() || !m.text.is_empty()) {
+                target.reactions.retain(|r| r.sender != msg.sender_jid);
+                target.reactions.push(Reaction {
+                    emoji: msg.text.clone(),
+                    sender: msg.sender_jid,
+                });
+                return;
+            }
+        }
+
+        // Attach any pending reactions for this message
+        if let Some(pending) = self.pending_reactions.remove(&(canon_chat_jid.clone(), msg.id.clone())) {
+            for r in pending {
+                msg.reactions.retain(|existing| existing.sender != r.sender);
+                msg.reactions.push(r);
+            }
+        }
+
         if let Some(pos) = msgs.iter().position(|m| m.id == msg.id) {
             msgs[pos].status = msg.status;
         } else {
@@ -563,7 +615,26 @@ impl AppState {
             let canon_chat_jid = self.canonical_jid(&msg.chat_jid);
             msg.chat_jid = canon_chat_jid.clone();
             affected_chats.insert(canon_chat_jid.clone());
-            let msgs = self.messages.entry(canon_chat_jid).or_default();
+            let msgs = self.messages.entry(canon_chat_jid.clone()).or_default();
+
+            if is_reaction_only(&msg.text) && msg.media_type.is_none() {
+                if let Some(target) = msgs.iter_mut().rev().find(|m| m.media_type.is_some() || !m.text.is_empty()) {
+                    target.reactions.retain(|r| r.sender != msg.sender_jid);
+                    target.reactions.push(Reaction {
+                        emoji: msg.text.clone(),
+                        sender: msg.sender_jid,
+                    });
+                    continue;
+                }
+            }
+
+            if let Some(pending) = self.pending_reactions.remove(&(canon_chat_jid.clone(), msg.id.clone())) {
+                for r in pending {
+                    msg.reactions.retain(|existing| existing.sender != r.sender);
+                    msg.reactions.push(r);
+                }
+            }
+
             if let Some(pos) = msgs.iter().position(|m| m.id == msg.id) {
                 msgs[pos].status = msg.status;
             } else {
@@ -599,6 +670,32 @@ impl AppState {
                                 chat.last_activity = ts;
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn clean_stray_reactions(&mut self) {
+        self.dirty = true;
+        for (_jid, msgs) in self.messages.iter_mut() {
+            let mut reactions_to_attach: Vec<(Jid, String)> = Vec::new();
+            msgs.retain(|m| {
+                if is_reaction_only(&m.text) && m.media_type.is_none() {
+                    reactions_to_attach.push((m.sender_jid.clone(), m.text.clone()));
+                    false
+                } else {
+                    true
+                }
+            });
+            if !reactions_to_attach.is_empty() {
+                for (sender, emoji) in reactions_to_attach {
+                    if let Some(target) = msgs.iter_mut().rev().find(|m| m.media_type.is_some() || !m.text.is_empty()) {
+                        target.reactions.retain(|r| r.sender != sender);
+                        target.reactions.push(Reaction {
+                            emoji,
+                            sender,
+                        });
                     }
                 }
             }
@@ -755,6 +852,15 @@ impl AppState {
                 }
                 return true;
             }
+        }
+        // Save in pending reactions if message has not loaded yet
+        if !emoji.is_empty() {
+            let entry = self.pending_reactions.entry((canon_chat, target_msg_id.to_string())).or_default();
+            entry.retain(|r| &r.sender != sender_jid);
+            entry.push(Reaction {
+                emoji: emoji.to_string(),
+                sender: sender_jid.clone(),
+            });
         }
         false
     }
@@ -1022,6 +1128,42 @@ mod tests {
         // Check preview is NOT the emoji
         let chat = state.chats.get(&chat_jid).unwrap();
         assert_eq!(chat.last_message.as_ref().unwrap().text, "📷 Image");
+
+        // 3. Test clean_stray_reactions if stray emoji messages existed
+        state.messages.get_mut(&chat_jid).unwrap().push(Message::new_text(
+            "stray-1".into(),
+            chat_jid.clone(),
+            friend_jid.clone(),
+            "❤️".into(),
+            Utc::now(),
+            false,
+            MessageStatus::Delivered,
+            None,
+            None,
+        ));
+        assert_eq!(state.messages.get(&chat_jid).unwrap().len(), 2);
+        state.clean_stray_reactions();
+        assert_eq!(state.messages.get(&chat_jid).unwrap().len(), 1); // Stripped stray emoji message bubble
+        assert_eq!(state.messages.get(&chat_jid).unwrap()[0].reactions[0].emoji, "❤️");
+
+        // 4. Test pending_reactions when reaction arrives BEFORE message
+        state.apply_reaction(&chat_jid, "msg-future-99", &friend_jid, "🔥");
+        let future_msg = Message::new_text(
+            "msg-future-99".into(),
+            chat_jid.clone(),
+            self_jid.clone(),
+            "New incoming photo".into(),
+            Utc::now(),
+            true,
+            MessageStatus::Sent,
+            None,
+            None,
+        );
+        state.add_message(future_msg);
+        let msgs3 = state.get_chat_messages(&chat_jid).unwrap();
+        let target_future = msgs3.iter().find(|m| m.id == "msg-future-99").unwrap();
+        assert_eq!(target_future.reactions.len(), 1);
+        assert_eq!(target_future.reactions[0].emoji, "🔥");
     }
 
     #[test]

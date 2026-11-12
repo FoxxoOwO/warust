@@ -22,6 +22,7 @@ pub struct CallManager {
     pub incoming_calls: tokio::sync::Mutex<std::collections::HashMap<String, IncomingCall>>,
     pub active_handle: tokio::sync::Mutex<Option<CallHandle>>,
     pub mic_tx: tokio::sync::Mutex<Option<async_channel::Sender<Vec<i16>>>>,
+    pub video_tx: tokio::sync::Mutex<Option<async_channel::Sender<Vec<u8>>>>,
 }
 
 /// Helper function to find ContextInfo in a message (replaces find_context_info_ref! macro)
@@ -304,6 +305,7 @@ pub async fn spawn_backend(state: SharedState) -> Result<BackendHandle> {
         incoming_calls: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         active_handle: tokio::sync::Mutex::new(None),
         mic_tx: tokio::sync::Mutex::new(None),
+        video_tx: tokio::sync::Mutex::new(None),
     });
     let builder = Bot::builder()
         .with_backend(store)
@@ -561,11 +563,13 @@ async fn handle_incoming_message(
     
     // Check if this is a reaction message
     let base_msg = message.get_base_message();
-    if let Some(reaction) = base_msg.reaction_message.as_option() {
+    let reaction_opt = message.reaction_message.as_option()
+        .or_else(|| base_msg.reaction_message.as_option());
+    if let Some(reaction) = reaction_opt {
         let target_id = reaction.key.as_option().and_then(|k| k.id.as_deref()).unwrap_or("");
         let emoji = reaction.text.as_deref().unwrap_or("");
+        let canon_chat_jid = if info.source.is_group { chat_jid.clone() } else { state.read().canonical_jid(&chat_jid) };
         if !target_id.is_empty() {
-            let canon_chat_jid = if info.source.is_group { chat_jid.clone() } else { state.read().canonical_jid(&chat_jid) };
             info!("Received reaction '{}' for message {} from {} in chat {}", emoji, target_id, sender_jid, canon_chat_jid);
             {
                 let mut s = state.write();
@@ -573,18 +577,18 @@ async fn handle_incoming_message(
                 s.consolidate_canonical_chats();
             }
             let _ = crate::storage::persist_state(&state).await;
-
-            if !from_me {
-                let client = client.clone();
-                let chat_jid = chat_jid.clone();
-                let sender_opt = if info.source.is_group { Some(sender_jid) } else { None };
-                let msg_id = info.id.to_string();
-                tokio::spawn(async move {
-                    let _ = client.mark_as_read(&chat_jid, sender_opt.as_ref(), &[&msg_id]).await;
-                });
-            }
-            return;
         }
+
+        if !from_me {
+            let client = client.clone();
+            let chat_jid = chat_jid.clone();
+            let sender_opt = if info.source.is_group { Some(sender_jid) } else { None };
+            let msg_id = info.id.to_string();
+            tokio::spawn(async move {
+                let _ = client.mark_as_read(&chat_jid, sender_opt.as_ref(), &[&msg_id]).await;
+            });
+        }
+        return;
     }
 
     // Check if this is a protocol message (revoke, ephemeral sync, etc.) without edited message
@@ -863,11 +867,8 @@ fn extract_message_text(message: &wa::Message) -> &str {
         return "[Live Location]";
     }
     // Check for reaction
-    if let Some(reaction) = message.reaction_message.as_option() {
-        if let Some(text) = reaction.text.as_deref().filter(|s| !s.is_empty()) {
-            return text;
-        }
-        return "[Reaction]";
+    if message.reaction_message.is_set() {
+        return "";
     }
     // Check for poll
     if message.poll_creation_message.is_set() {
@@ -1048,7 +1049,9 @@ async fn handle_event(
                             // Check if this is a reaction message
                             if let Some(wa_msg) = inner_msg.message.as_option() {
                                 let base_msg = wa_msg.get_base_message();
-                                if let Some(reaction) = base_msg.reaction_message.as_option() {
+                                let reaction_opt = wa_msg.reaction_message.as_option()
+                                    .or_else(|| base_msg.reaction_message.as_option());
+                                if let Some(reaction) = reaction_opt {
                                     let target_id = reaction.key.as_option().and_then(|k| k.id.as_deref()).unwrap_or("");
                                     let emoji = reaction.text.as_deref().unwrap_or("");
                                     if !target_id.is_empty() {
@@ -1068,8 +1071,8 @@ async fn handle_event(
                                             chat_jid.clone()
                                         };
                                         new_reactions.push((chat_jid.clone(), target_id.to_string(), sender, emoji.to_string()));
-                                        continue;
                                     }
+                                    continue;
                                 }
                             }
 
@@ -1895,12 +1898,29 @@ async fn handle_command(
                 while let Ok(_frame) = speaker_rx.recv().await {}
             });
 
+            let (v_src_rx, v_sink_tx) = if is_video {
+                let (v_src_tx, v_src_rx) = async_channel::bounded::<Vec<u8>>(15);
+                let (v_sink_tx, v_sink_rx) = async_channel::bounded::<whatsapp_rust::voip::VideoFrame>(15);
+                *call_manager.video_tx.lock().await = Some(v_src_tx);
+                tokio::spawn(async move {
+                    while let Ok(_vf) = v_sink_rx.recv().await {}
+                });
+                (Some(v_src_rx), Some(v_sink_tx))
+            } else {
+                (None, None)
+            };
+
             let client_clone = client.clone();
             let state_clone = state.clone();
             let call_mgr = call_manager.clone();
             tokio::spawn(async move {
-                info!("Starting outgoing call to {}", canon_peer);
-                match client_clone.voip().call(&canon_peer).audio(mic_rx, speaker_tx).start().await {
+                info!("Starting outgoing call to {} (video={})", canon_peer, is_video);
+                let voip = client_clone.voip();
+                let mut builder = voip.call(&canon_peer).audio(mic_rx, speaker_tx);
+                if let (Some(v_rx), Some(v_tx)) = (v_src_rx, v_sink_tx) {
+                    builder = builder.video(v_rx, v_tx);
+                }
+                match builder.start().await {
                     Ok(handle) => {
                         let call_id = handle.call_id().to_string();
                         info!("Outgoing call started successfully: call_id={}", call_id);
@@ -1959,12 +1979,30 @@ async fn handle_command(
                     while let Ok(_frame) = speaker_rx.recv().await {}
                 });
 
+                let is_video = matches!(&incoming.action, CallAction::Offer { is_video: true, .. });
+                let (v_src_rx, v_sink_tx) = if is_video {
+                    let (v_src_tx, v_src_rx) = async_channel::bounded::<Vec<u8>>(15);
+                    let (v_sink_tx, v_sink_rx) = async_channel::bounded::<whatsapp_rust::voip::VideoFrame>(15);
+                    *call_manager.video_tx.lock().await = Some(v_src_tx);
+                    tokio::spawn(async move {
+                        while let Ok(_vf) = v_sink_rx.recv().await {}
+                    });
+                    (Some(v_src_rx), Some(v_sink_tx))
+                } else {
+                    (None, None)
+                };
+
                 let client_clone = client.clone();
                 let state_clone = state.clone();
                 let call_mgr = call_manager.clone();
                 tokio::spawn(async move {
-                    info!("Accepting incoming call: {}", call_id);
-                    match client_clone.voip().accept(&incoming).audio(mic_rx, speaker_tx).start().await {
+                    info!("Accepting incoming call: {} (video={})", call_id, is_video);
+                    let voip = client_clone.voip();
+                    let mut builder = voip.accept(&incoming).audio(mic_rx, speaker_tx);
+                    if let (Some(v_rx), Some(v_tx)) = (v_src_rx, v_sink_tx) {
+                        builder = builder.video(v_rx, v_tx);
+                    }
+                    match builder.start().await {
                         Ok(handle) => {
                             info!("Call accepted and attached: call_id={}", handle.call_id());
                             {
@@ -2082,9 +2120,24 @@ async fn handle_command(
         }
 
         Command::ToggleCallVideo => {
-            let mut s = state.write();
-            if let Some(ref mut ac) = s.active_call {
-                ac.is_video_enabled = !ac.is_video_enabled;
+            let is_enabled = {
+                let mut s = state.write();
+                if let Some(ref mut ac) = s.active_call {
+                    ac.is_video_enabled = !ac.is_video_enabled;
+                    ac.is_video_enabled
+                } else {
+                    false
+                }
+            };
+            let handle_opt = call_manager.active_handle.lock().await.clone();
+            if let Some(handle) = handle_opt {
+                tokio::spawn(async move {
+                    if is_enabled {
+                        let _ = handle.announce_video_enabled().await;
+                    } else {
+                        let _ = handle.stop_video().await;
+                    }
+                });
             }
         }
         

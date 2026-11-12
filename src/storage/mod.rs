@@ -158,6 +158,7 @@ pub async fn load_state() -> Result<AppState> {
                 state.self_name = persisted.self_name;
                 state.scheduled_messages = persisted.scheduled_messages;
                 state.preferences = persisted.preferences;
+                state.clean_stray_reactions();
                 state.consolidate_canonical_chats();
                 info!("Loaded and consolidated UI state with {} chats from {:?}", state.chats.len(), path);
                 return Ok(state);

@@ -18,6 +18,7 @@ pub struct WarustApp {
     backend: Option<BackendHandle>,
     runtime: tokio::runtime::Runtime,
     show_settings: bool,
+    tray: Option<crate::tray::SystemTray>,
 }
 
 impl WarustApp {
@@ -32,6 +33,7 @@ impl WarustApp {
         
         // Load persisted state or create fresh
         let loaded_state = runtime.block_on(crate::storage::load_state()).unwrap_or_default();
+        let run_in_tray = loaded_state.preferences.run_in_tray;
         let state = Arc::new(RwLock::new(loaded_state));
         
         // Spawn backend
@@ -39,12 +41,26 @@ impl WarustApp {
         let backend = runtime.block_on(async {
             crate::backend::spawn_backend(state_clone).await
         })?;
+
+        // Initialize system tray icon if enabled
+        let tray = if run_in_tray {
+            match crate::tray::SystemTray::new() {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    tracing::warn!("Failed to initialize system tray icon: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         
         Ok(Self {
             state,
             backend: Some(backend),
             runtime,
             show_settings: false,
+            tray,
         })
     }
     
@@ -55,6 +71,30 @@ impl WarustApp {
 
 impl eframe::App for WarustApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        // Handle system tray messages
+        if let Some(tray) = &self.tray {
+            while let Ok(msg) = tray.rx.try_recv() {
+                match msg {
+                    crate::tray::TrayMessage::ShowWindow => {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
+                    crate::tray::TrayMessage::QuitApp => {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+            }
+        }
+
+        // Intercept close event if close-to-tray is enabled
+        if ui.input(|i| i.viewport().close_requested()) {
+            let close_to_tray = self.state.read().preferences.close_to_tray && self.tray.is_some();
+            if close_to_tray {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+        }
+
         // Update connection status from backend
         if let Some(backend) = &self.backend {
             let status = backend.connection_status();
