@@ -19,6 +19,11 @@ pub fn is_real_name(s: &str) -> bool {
     non_plus.chars().any(|c| c.is_alphabetic())
 }
 
+/// Shorten a JID user part to at most `n` chars without splitting UTF-8
+fn short_user(user: &str, n: usize) -> String {
+    user.chars().take(n).collect()
+}
+
 /// Format JID for display (phone number formatting)
 pub fn format_jid(jid: &Jid) -> String {
     let user = jid.user();
@@ -33,11 +38,9 @@ pub fn format_jid(jid: &Jid) -> String {
                 user.to_string()
             }
         }
-        "lid" => {
-            format!("User:{}", &user[..user.len().min(8)])
-        }
-        "g.us" => format!("Group:{}", &user[..user.len().min(8)]),
-        "broadcast" => format!("Broadcast:{}", &user[..user.len().min(8)]),
+        "lid" => format!("User:{}", short_user(user, 8)),
+        "g.us" => format!("Group:{}", short_user(user, 8)),
+        "broadcast" => format!("Broadcast:{}", short_user(user, 8)),
         "newsletter" => format!("Channel:{}", user),
         _ => jid.to_string(),
     }
@@ -93,13 +96,16 @@ pub fn format_message_time(ts: DateTime<Utc>) -> String {
     ts.format("%H:%M").to_string()
 }
 
-/// Truncate text for preview
+/// Truncate text for preview (char-safe, never splits UTF-8 sequences)
 pub fn truncate(text: &str, max_len: usize) -> String {
-    if text.len() <= max_len {
-        text.to_string()
-    } else {
-        format!("{}...", &text[..max_len.saturating_sub(3)])
+    let count = text.chars().count();
+    if count <= max_len {
+        return text.to_string();
     }
+    let keep = max_len.saturating_sub(3);
+    let mut out: String = text.chars().take(keep).collect();
+    out.push_str("...");
+    out
 }
 
 /// Get initials from name for avatar
@@ -162,5 +168,26 @@ mod tests {
         assert!(!is_real_name("272825097166848@lid"));
         assert!(!is_real_name("User:27282509"));
         assert!(!is_real_name(""));
+    }
+
+    #[test]
+    fn test_truncate_is_utf8_safe() {
+        // Byte slicing on these used to panic.
+        let czech = "Příliš žluťoučký kůň úpěl ďábelské ódy";
+        let emoji = "😀😀😀😀😀😀😀😀😀😀";
+        for len in 0..40 {
+            let _ = truncate(czech, len);
+            let _ = truncate(emoji, len);
+        }
+        assert_eq!(truncate("abc", 10), "abc");
+        assert_eq!(truncate(czech, 5).chars().count(), 5);
+        assert!(truncate(czech, 5).ends_with("..."));
+    }
+
+    #[test]
+    fn test_format_jid_short_server_names() {
+        // Short LID users used to hit an out-of-bounds slice.
+        let jid: Jid = "123@lid".parse().unwrap();
+        assert!(format_jid(&jid).starts_with("User:"));
     }
 }

@@ -19,6 +19,9 @@ pub fn show_settings_with_ctx(ctx: &Context, state: &SharedState, backend: &Back
         .show(ctx, |ui| {
             show_settings_content(ui, state, backend, &mut should_close);
         });
+
+    // Settings are edited in place; flag them so they get flushed to disk.
+    state.write().dirty = true;
         
     if should_close {
         *open = false;

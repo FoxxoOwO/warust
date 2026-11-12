@@ -87,16 +87,24 @@ fn show_chat_header(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Chat
             ui.add_space(4.0);
             ui.label(RichText::new(&chat.name).font(FontId::proportional(17.0)).strong().color(Color32::WHITE));
             
-            let status_text = if chat.is_group {
-                format!("{} participants", chat.participants.len())
-            } else if crate::util::is_real_name(&chat.name) {
-                crate::util::format_jid(&chat.jid)
+            if chat.is_currently_typing() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("píše").font(FontId::proportional(12.0)).color(Color32::from_rgb(0x25, 0xD3, 0x66)));
+                    crate::ui::animations::bouncing_dots(ui, Color32::from_rgb(0x25, 0xD3, 0x66), 2.5, 3.5);
+                    ui.ctx().request_repaint();
+                });
             } else {
-                "".to_string()
-            };
-            
-            if !status_text.is_empty() {
-                ui.label(RichText::new(status_text).font(FontId::proportional(12.0)).color(Color32::from_rgb(0x86, 0x96, 0xA0)));
+                let status_text = if chat.is_group {
+                    format!("{} participants", chat.participants.len())
+                } else if crate::util::is_real_name(&chat.name) {
+                    crate::util::format_jid(&chat.jid)
+                } else {
+                    "".to_string()
+                };
+                
+                if !status_text.is_empty() {
+                    ui.label(RichText::new(status_text).font(FontId::proportional(12.0)).color(Color32::from_rgb(0x86, 0x96, 0xA0)));
+                }
             }
         });
         
@@ -219,12 +227,14 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
     
     // Check if we should auto-scroll to bottom
     let should_scroll_to_bottom = state.auto_scroll_to_bottom;
-    let mut selected_reply = None;
+    let mut selected_reply: Option<usize> = None;
     let mut message_to_delete = None;
     let mut selected_reaction: Option<(String, String)> = None;
     let mut view_reactions_id: Option<String> = None;
     let message_to_download = std::rc::Rc::new(std::cell::RefCell::new(None));
     let to_dl = message_to_download.clone();
+    let open_emoji_picker_id = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let to_open_picker = open_emoji_picker_id.clone();
     
     ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -250,6 +260,8 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
             } else {
                 let mut last_date: Option<chrono::NaiveDate> = None;
                 
+                // Cloning the full Message (media bytes included) for every bubble just
+                // to support "reply" was wasteful; grab the index instead.
                 for (idx, msg) in messages.iter().enumerate() {
                     // Show date separator
                     let msg_date = msg.timestamp.date_naive();
@@ -277,12 +289,11 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
                     };
                     
                     let sender_name_str = sender_name.as_deref().unwrap_or("");
-                    let msg_clone = msg.clone();
-                    
+
                     MessageBubble::new(msg, is_own)
                         .show_sender(sender_name_str)
                         .on_reply(|_id| {
-                            selected_reply = Some(msg_clone);
+                            selected_reply = Some(idx);
                         })
                         .on_delete(|id| {
                             message_to_delete = Some(id.to_string());
@@ -299,6 +310,12 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
                         .on_view_reactions(|id| {
                             view_reactions_id = Some(id.to_string());
                         })
+                        .on_open_emoji_picker({
+                            let to_open_picker = to_open_picker.clone();
+                            move |id| {
+                                *to_open_picker.borrow_mut() = Some(id.to_string());
+                            }
+                        })
                         .ui(ui);
                     
                     ui.add_space(2.0);
@@ -309,8 +326,8 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
             ui.add_space(24.0);
         });
         
-    if let Some(r) = selected_reply {
-        state.replying_to = Some(r);
+    if let Some(idx) = selected_reply {
+        state.replying_to = messages.get(idx).cloned();
     }
     if let Some(id) = message_to_delete {
         let _ = backend.send_command(Command::DeleteMessageForMe {
@@ -327,6 +344,10 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
     }
     if let Some(id) = view_reactions_id {
         state.reaction_detail_modal = Some((chat_jid.clone(), id));
+    }
+    if let Some(id) = open_emoji_picker_id.borrow().clone() {
+        state.reaction_picker_target = Some(id);
+        state.show_emoji_picker = true;
     }
     let to_download = message_to_download.borrow().clone();
     if let Some(id) = to_download {
@@ -502,7 +523,7 @@ fn show_composer(ui: &mut Ui, state: &mut AppState, chat_jid: &Jid, backend: &cr
                     egui::Button::new(RichText::new("📎").font(FontId::proportional(18.0)))
                         .frame(false)
                         .fill(Color32::TRANSPARENT)
-                ).on_hover_text("Attach file, photo or video");
+                ).on_hover_text("Připojit soubor, foto nebo video");
 
                 if attach_btn.clicked() {
                     if let Some(path) = crate::media::pick_file() {
@@ -510,13 +531,25 @@ fn show_composer(ui: &mut Ui, state: &mut AppState, chat_jid: &Jid, backend: &cr
                     }
                 }
 
+                // Emoji picker button
+                let emoji_btn = ui.add(
+                    egui::Button::new(RichText::new("😊").font(FontId::proportional(18.0)))
+                        .frame(false)
+                        .fill(if state.show_emoji_picker && state.reaction_picker_target.is_none() { Color32::from_rgb(0x2A, 0x39, 0x42) } else { Color32::TRANSPARENT })
+                ).on_hover_text("Vybrat emoji");
+
+                if emoji_btn.clicked() {
+                    state.show_emoji_picker = !state.show_emoji_picker;
+                    state.reaction_picker_target = None;
+                }
+
                 // Text input - takes most space
                 let hint = if state.pending_attachment.is_some() {
-                    "Add a caption..."
+                    "Přidat popisek..."
                 } else {
-                    "Type a message..."
+                    "Napište zprávu..."
                 };
-                let input_width = (ui.available_width() - 85.0).max(50.0);
+                let input_width = (ui.available_width() - 115.0).max(50.0);
                 let response = ui.add(
                     TextEdit::multiline(&mut state.composer_text)
                         .hint_text(hint)
@@ -535,7 +568,7 @@ fn show_composer(ui: &mut Ui, state: &mut AppState, chat_jid: &Jid, backend: &cr
                     egui::Button::new(RichText::new("🕒").font(FontId::proportional(18.0)))
                         .frame(false)
                         .fill(Color32::TRANSPARENT)
-                ).on_hover_text("Schedule message for later");
+                ).on_hover_text("Naplánovat odeslání zprávy");
 
                 if schedule_btn.clicked() {
                     state.schedule_target_chat = Some(chat_jid.clone());
@@ -573,6 +606,44 @@ fn show_composer(ui: &mut Ui, state: &mut AppState, chat_jid: &Jid, backend: &cr
             });
         });
     
+    // Emoji Picker Window / Popup
+    if state.show_emoji_picker {
+        let is_reaction = state.reaction_picker_target.is_some();
+        let title = if is_reaction { "❤️  Vybrat reakci" } else { "😊  Emoji" };
+        let mut open = true;
+        let mut picked_emoji = None;
+
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size(egui::vec2(340.0, 360.0))
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-20.0, -80.0))
+            .open(&mut open)
+            .show(ui.ctx(), |ui| {
+                crate::ui::emoji::show_emoji_picker(ui, state, |emoji| {
+                    picked_emoji = Some(emoji.to_string());
+                });
+            });
+
+        if !open {
+            state.show_emoji_picker = false;
+            state.reaction_picker_target = None;
+        }
+
+        if let Some(emoji) = picked_emoji {
+            if let Some(target_msg_id) = state.reaction_picker_target.take() {
+                let _ = backend.send_command(Command::SendReaction {
+                    chat_jid: chat_jid.clone(),
+                    message_id: target_msg_id,
+                    emoji,
+                });
+            } else {
+                state.composer_text.push_str(&emoji);
+            }
+            state.show_emoji_picker = false;
+        }
+    }
+
     ui.add_space(6.0);
 }
 

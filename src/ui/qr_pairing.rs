@@ -10,9 +10,14 @@ use crate::theme;
 
 /// QR Pairing full-screen view
 pub fn show_qr_pairing(ui: &mut Ui, state: &SharedState, backend: &BackendHandle) {
-    let s = state.read();
-    
-    match &s.connection {
+    // Snapshot what we need and release the lock before building the UI:
+    // nested `state.write()` below would otherwise deadlock on the held guard.
+    let (connection, pair_phone_number) = {
+        let s = state.read();
+        (s.connection.clone(), s.pair_phone_number.clone())
+    };
+
+    match &connection {
         ConnectionStatus::QrCode(code) => {
             ui.vertical_centered(|ui| {
                 ui.add_space(50.0);
@@ -63,7 +68,7 @@ pub fn show_qr_pairing(ui: &mut Ui, state: &SharedState, backend: &BackendHandle
                 ui.add_space(8.0);
                 
                 ui.horizontal(|ui| {
-                    let mut phone = state.read().pair_phone_number.clone();
+                    let mut phone = pair_phone_number.clone();
                     let response = ui.add(
                         TextEdit::singleline(&mut phone)
                             .hint_text("Phone number (e.g. 15551234567)")

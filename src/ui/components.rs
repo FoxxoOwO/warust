@@ -195,13 +195,39 @@ impl<'a> Widget for ChatItem<'a> {
                 );
             }
             
-            // Preview and unread badge
+            // Preview, typing animation, and unread badge
             let preview_y = name_y + 22.0;
-            if let Some(preview) = &self.chat.last_message {
-                let preview_text = if preview.from_me {
-                    format!("You: {}", truncate(&preview.text, 40))
+            if self.chat.is_currently_typing() {
+                painter.text(
+                    egui::pos2(text_x, preview_y),
+                    egui::Align2::LEFT_TOP,
+                    "píše",
+                    FontId::proportional(13.0),
+                    Color32::from_rgb(0x25, 0xD3, 0x66),
+                );
+                let time = ui.ctx().input(|i| i.time);
+                crate::ui::animations::bouncing_dots_painter(
+                    &painter,
+                    egui::pos2(text_x + 32.0, preview_y + 4.0),
+                    time,
+                    Color32::from_rgb(0x25, 0xD3, 0x66),
+                    2.5,
+                    3.5,
+                );
+                ui.ctx().request_repaint();
+            } else if let Some(preview) = &self.chat.last_message {
+                let clean_text = if preview.text == "[Protocol Message]" || preview.text.is_empty() {
+                    "Zpráva".to_string()
+                } else if preview.text.starts_with("[Reaction]") {
+                    "Reakce".to_string()
                 } else {
-                    truncate(&preview.text, 40)
+                    preview.text.clone()
+                };
+
+                let preview_text = if preview.from_me {
+                    format!("You: {}", truncate(&clean_text, 40))
+                } else {
+                    truncate(&clean_text, 40)
                 };
                 
                 let preview_color = if self.chat.unread_count > 0 {
@@ -300,6 +326,7 @@ pub struct MessageBubble<'a> {
     pub on_download: Option<Box<dyn Fn(&'a str) + 'a>>,
     pub on_react: Option<Box<dyn FnOnce(&'a str, &'a str) + 'a>>,
     pub on_view_reactions: Option<Box<dyn FnOnce(&'a str) + 'a>>,
+    pub on_open_emoji_picker: Option<Box<dyn FnOnce(&'a str) + 'a>>,
 }
 
 impl<'a> MessageBubble<'a> {
@@ -314,6 +341,7 @@ impl<'a> MessageBubble<'a> {
             on_download: None,
             on_react: None,
             on_view_reactions: None,
+            on_open_emoji_picker: None,
         }
     }
     
@@ -345,6 +373,11 @@ impl<'a> MessageBubble<'a> {
 
     pub fn on_view_reactions(mut self, f: impl FnOnce(&'a str) + 'a) -> Self {
         self.on_view_reactions = Some(Box::new(f));
+        self
+    }
+
+    pub fn on_open_emoji_picker(mut self, f: impl FnOnce(&'a str) + 'a) -> Self {
+        self.on_open_emoji_picker = Some(Box::new(f));
         self
     }
 }
@@ -417,11 +450,24 @@ impl<'a> Widget for MessageBubble<'a> {
             self.message.text.clone()
         };
 
+        let is_emoji_only = if media_type.is_none() && !display_text.trim().is_empty() {
+            crate::state::count_emoji_only(&display_text)
+        } else {
+            None
+        };
+
+        let (font_size, is_big_emoji) = match is_emoji_only {
+            Some(1) => (44.0, true),
+            Some(2) => (30.0, true),
+            Some(3) => (24.0, true),
+            _ => (14.0, false),
+        };
+
         let has_text = !display_text.trim().is_empty();
         let galley = if has_text {
             Some(ui.painter().layout(
                 display_text,
-                FontId::proportional(14.0),
+                FontId::proportional(font_size),
                 text_color,
                 text_wrap_width,
             ))
@@ -485,25 +531,33 @@ impl<'a> Widget for MessageBubble<'a> {
             let painter = ui.painter();
             
             // Bubble background
-            let bubble_color = if self.is_own { bubble::OUTGOING_BG } else { bubble::INCOMING_BG };
-            painter.rect_filled(bubble_rect, 12.0, bubble_color);
-            
-            // Tail (triangle)
-            let tail_size = 12.0;
-            if self.is_own {
-                let tail_points = [
-                    bubble_rect.right_top() + Vec2::new(-tail_size, 0.0),
-                    bubble_rect.right_top() + Vec2::new(4.0, 0.0),
-                    bubble_rect.right_top() + Vec2::new(0.0, tail_size),
-                ];
-                painter.add(egui::Shape::convex_polygon(tail_points.to_vec(), bubble_color, Stroke::NONE));
+            let bubble_color = if is_big_emoji {
+                Color32::TRANSPARENT
+            } else if self.is_own {
+                bubble::OUTGOING_BG
             } else {
-                let tail_points = [
-                    bubble_rect.left_top() + Vec2::new(tail_size, 0.0),
-                    bubble_rect.left_top() + Vec2::new(-4.0, 0.0),
-                    bubble_rect.left_top() + Vec2::new(0.0, tail_size),
-                ];
-                painter.add(egui::Shape::convex_polygon(tail_points.to_vec(), bubble_color, Stroke::NONE));
+                bubble::INCOMING_BG
+            };
+            if !is_big_emoji {
+                painter.rect_filled(bubble_rect, 12.0, bubble_color);
+                
+                // Tail (triangle)
+                let tail_size = 12.0;
+                if self.is_own {
+                    let tail_points = [
+                        bubble_rect.right_top() + Vec2::new(-tail_size, 0.0),
+                        bubble_rect.right_top() + Vec2::new(4.0, 0.0),
+                        bubble_rect.right_top() + Vec2::new(0.0, tail_size),
+                    ];
+                    painter.add(egui::Shape::convex_polygon(tail_points.to_vec(), bubble_color, Stroke::NONE));
+                } else {
+                    let tail_points = [
+                        bubble_rect.left_top() + Vec2::new(tail_size, 0.0),
+                        bubble_rect.left_top() + Vec2::new(-4.0, 0.0),
+                        bubble_rect.left_top() + Vec2::new(0.0, tail_size),
+                    ];
+                    painter.add(egui::Shape::convex_polygon(tail_points.to_vec(), bubble_color, Stroke::NONE));
+                }
             }
             
             // Sender name (for groups)
@@ -790,6 +844,7 @@ impl<'a> Widget for MessageBubble<'a> {
         }
         
         let mut on_react = self.on_react;
+        let mut on_open_emoji_picker = self.on_open_emoji_picker;
         
         // Quick reaction button on hover
         if response.hovered() {
@@ -818,6 +873,16 @@ impl<'a> Widget for MessageBubble<'a> {
                             }
                             ui.close();
                         }
+                    }
+
+                    let plus_btn = egui::Button::new(RichText::new("➕").font(FontId::proportional(14.0)))
+                        .fill(Color32::TRANSPARENT)
+                        .corner_radius(egui::CornerRadius::same(6));
+                    if ui.add(plus_btn).on_hover_text("Další emoji...").clicked() {
+                        if let Some(f) = on_open_emoji_picker.take() {
+                            f(&self.message.id);
+                        }
+                        ui.close();
                     }
                 });
             });
@@ -855,6 +920,16 @@ impl<'a> Widget for MessageBubble<'a> {
                         }
                         ui.close();
                     }
+                }
+
+                let plus_btn = egui::Button::new(RichText::new("➕").font(FontId::proportional(14.0)))
+                    .fill(Color32::TRANSPARENT)
+                    .corner_radius(egui::CornerRadius::same(6));
+                if ui.add(plus_btn).on_hover_text("Další emoji...").clicked() {
+                    if let Some(f) = on_open_emoji_picker.take() {
+                        f(&self.message.id);
+                    }
+                    ui.close();
                 }
             });
             ui.separator();

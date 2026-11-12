@@ -116,10 +116,11 @@ impl eframe::App for WarustApp {
         });
         
         // Show QR pairing ONLY if user has no credentials and needs pairing
-        let show_pairing = self.state.read().self_jid.is_none() && matches!(
-            self.state.read().connection,
-            ConnectionStatus::QrCode(_) | ConnectionStatus::PairCode(_)
-        );
+        let show_pairing = {
+            let s = self.state.read();
+            s.self_jid.is_none()
+                && matches!(s.connection, ConnectionStatus::QrCode(_) | ConnectionStatus::PairCode(_))
+        };
         
         if show_pairing {
             CentralPanel::default().show(ui, |ui| {

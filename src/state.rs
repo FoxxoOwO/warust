@@ -59,6 +59,10 @@ pub struct Chat {
     pub mute_until: Option<DateTime<Utc>>,
     pub last_activity: DateTime<Utc>,
     pub participants: HashSet<Jid>,
+    #[serde(skip)]
+    pub is_typing: bool,
+    #[serde(skip)]
+    pub typing_until: Option<DateTime<Utc>>,
 }
 
 impl Chat {
@@ -68,6 +72,10 @@ impl Chat {
 
     pub fn is_muted(&self) -> bool {
         self.mute_until.map_or(false, |until| until > Utc::now())
+    }
+
+    pub fn is_currently_typing(&self) -> bool {
+        self.is_typing && self.typing_until.map_or(false, |until| until > Utc::now())
     }
 }
 
@@ -340,6 +348,19 @@ pub struct AppState {
     // Active / incoming / outgoing call state
     #[serde(skip)]
     pub active_call: Option<ActiveCall>,
+    // Emoji Picker state
+    #[serde(skip)]
+    pub show_emoji_picker: bool,
+    #[serde(skip)]
+    pub emoji_search: String,
+    #[serde(skip)]
+    pub emoji_active_category: usize,
+    #[serde(skip)]
+    pub reaction_picker_target: Option<String>,
+    /// Set by any content mutation; cleared after a successful persist so the
+    /// periodic writer can skip no-op serialization of the whole message store.
+    #[serde(skip)]
+    pub dirty: bool,
 }
 
 impl Default for AppState {
@@ -376,12 +397,59 @@ impl Default for AppState {
             settings_tab: SettingsTab::default(),
             reaction_detail_modal: None,
             active_call: None,
+            show_emoji_picker: false,
+            emoji_search: String::new(),
+            emoji_active_category: 0,
+            reaction_picker_target: None,
+            dirty: false,
         }
     }
 }
 
 pub fn is_reaction_only(text: &str) -> bool {
     matches!(text.trim(), "❤️" | "💀" | "😂" | "👍" | "👎" | "🙏" | "🎉" | "😮" | "😢" | "🔥" | "👏")
+}
+
+pub fn is_emoji_char(c: char) -> bool {
+    matches!(c as u32,
+        0x1F600..=0x1F64F | // Emoticons
+        0x1F300..=0x1F5FF | // Misc Symbols and Pictographs
+        0x1F680..=0x1F6FF | // Transport and Map
+        0x1F700..=0x1F77F | // Alchemical Symbols
+        0x1F780..=0x1F7FF | // Geometric Shapes Extended
+        0x1F800..=0x1F8FF | // Supplemental Arrows-C
+        0x1F900..=0x1F9FF | // Supplemental Symbols and Pictographs
+        0x1FA00..=0x1FA6F | // Chess Symbols
+        0x1FA70..=0x1FAFF | // Symbols and Pictographs Extended-A
+        0x2600..=0x26FF   | // Misc symbols (hearts, stars, etc)
+        0x2700..=0x27BF   | // Dingbats
+        0x2300..=0x23FF   | // Misc Technical
+        0x2B50 | 0x2B55 | 0x200D | 0xFE0F // Stars, circles, ZWJ, variation selector
+    )
+}
+
+/// Returns Some(count) if the text consists ONLY of 1, 2, or 3 emojis (so they can be enlarged)
+pub fn count_emoji_only(text: &str) -> Option<usize> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut count = 0;
+    for c in trimmed.chars() {
+        if c.is_whitespace() || c == '\u{FE0F}' || c == '\u{200D}' {
+            continue;
+        }
+        if is_emoji_char(c) {
+            count += 1;
+        } else {
+            return None;
+        }
+    }
+    if count > 0 && count <= 3 {
+        Some(count)
+    } else {
+        None
+    }
 }
 
 impl AppState {
@@ -437,10 +505,13 @@ impl AppState {
             mute_until: None,
             last_activity: Utc::now(),
             participants: HashSet::new(),
+            is_typing: false,
+            typing_until: None,
         })
     }
 
     pub fn add_message(&mut self, mut msg: Message) {
+        self.dirty = true;
         let canon_chat_jid = self.canonical_jid(&msg.chat_jid);
         msg.chat_jid = canon_chat_jid.clone();
         let msgs = self.messages.entry(canon_chat_jid.clone()).or_default();
@@ -484,6 +555,7 @@ impl AppState {
         if new_msgs.is_empty() {
             return;
         }
+        self.dirty = true;
 
         let mut affected_chats = HashSet::new();
 
@@ -535,6 +607,7 @@ impl AppState {
 
     /// Consolidate chats and messages so that if a LID maps to a PN, they are merged under the canonical PN.
     pub fn consolidate_canonical_chats(&mut self) {
+        self.dirty = true;
         let mappings: Vec<(Jid, Jid)> = self.lid_to_pn.iter().map(|(l, p)| (l.clone(), p.clone())).collect();
         for (lid_jid, pn_jid) in mappings {
             // 1. Move any messages from lid_jid into pn_jid
@@ -563,6 +636,8 @@ impl AppState {
                     mute_until: lid_chat.mute_until,
                     last_activity: lid_chat.last_activity,
                     participants: HashSet::new(),
+                    is_typing: false,
+                    typing_until: None,
                 });
                 if crate::util::is_real_name(&lid_chat.name) && !crate::util::is_real_name(&pn_chat.name) {
                     pn_chat.name = lid_chat.name;
@@ -667,6 +742,7 @@ impl AppState {
     }
 
     pub fn apply_reaction(&mut self, chat_jid: &Jid, target_msg_id: &str, sender_jid: &Jid, emoji: &str) -> bool {
+        self.dirty = true;
         let canon_chat = self.canonical_jid(chat_jid);
         if let Some(msgs) = self.messages.get_mut(&canon_chat) {
             if let Some(msg) = msgs.iter_mut().find(|m| m.id == target_msg_id) {
@@ -847,6 +923,8 @@ mod tests {
             mute_until: None,
             last_activity: Utc::now(),
             participants: HashSet::new(),
+            is_typing: false,
+            typing_until: None,
         });
         state.messages.insert(lid_jid.clone(), vec![
             Message::new_text("msg-lid".into(), lid_jid.clone(), pn_jid.clone(), "Hello from LID".into(), Utc::now(), true, MessageStatus::Sent, None, None)
@@ -864,6 +942,8 @@ mod tests {
             mute_until: None,
             last_activity: Utc::now() - chrono::Duration::hours(1),
             participants: HashSet::new(),
+            is_typing: false,
+            typing_until: None,
         });
         state.messages.insert(pn_jid.clone(), vec![
             Message::new_text("msg-pn".into(), pn_jid.clone(), pn_jid.clone(), "Hello from PN history".into(), Utc::now() - chrono::Duration::hours(1), false, MessageStatus::Read, None, None)

@@ -41,7 +41,8 @@ pub fn compute_file_name(
         if let Some(name) = caption_or_name {
             let clean = clean_filename(name);
             if clean.contains('.') {
-                return format!("{}_{}", &clean_id[..clean_id.len().min(8)], clean);
+                let prefix: String = clean_id.chars().take(8).collect();
+                return format!("{}_{}", prefix, clean);
             }
         }
     }

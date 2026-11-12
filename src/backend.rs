@@ -251,61 +251,51 @@ pub async fn spawn_backend(state: SharedState) -> Result<BackendHandle> {
 
     // Pre-load known LID <-> Phone Number mappings from whatsapp.db
     if let Ok(mappings) = store.get_all_lid_mappings().await {
-        let mut s = state.write();
-        let _chats_empty = s.chats.is_empty();
-        for item in mappings {
-            if let (Ok(lid_jid), Ok(pn_jid)) = (
-                format!("{}@lid", item.lid).parse::<Jid>(),
-                format!("{}@s.whatsapp.net", item.phone_number).parse::<Jid>(),
-            ) {
-                s.lid_to_pn.insert(lid_jid.clone(), pn_jid.clone());
-                let formatted_phone = crate::util::format_jid(&pn_jid);
-                
-                // Do not store phone numbers as contact human names!
-                // Real names will be learned from ContactUpdate, PushName, or UserInfo
-                s.contacts.entry(lid_jid.clone()).or_insert_with(|| {
-                    crate::state::Contact::new(lid_jid.clone(), None)
-                });
-                s.contacts.entry(pn_jid.clone()).or_insert_with(|| {
-                    crate::state::Contact::new(pn_jid.clone(), None)
-                });
-                
-                let display_name = s.resolve_display_name(&pn_jid).unwrap_or(formatted_phone);
-                let is_self = s.self_jid.as_ref().map_or(false, |sj| sj.user == item.lid || sj.user == item.phone_number);
-                if !is_self {
-                    let _ = s.get_or_create_chat(pn_jid.clone(), display_name, false);
+        {
+            let mut s = state.write();
+            for item in mappings {
+                if let (Ok(lid_jid), Ok(pn_jid)) = (
+                    format!("{}@lid", item.lid).parse::<Jid>(),
+                    format!("{}@s.whatsapp.net", item.phone_number).parse::<Jid>(),
+                ) {
+                    s.lid_to_pn.insert(lid_jid.clone(), pn_jid.clone());
+                    let formatted_phone = crate::util::format_jid(&pn_jid);
+
+                    // Do not store phone numbers as contact human names!
+                    // Real names will be learned from ContactUpdate, PushName, or UserInfo
+                    s.contacts.entry(lid_jid.clone()).or_insert_with(|| {
+                        crate::state::Contact::new(lid_jid.clone(), None)
+                    });
+                    s.contacts.entry(pn_jid.clone()).or_insert_with(|| {
+                        crate::state::Contact::new(pn_jid.clone(), None)
+                    });
+
+                    let display_name = s.resolve_display_name(&pn_jid).unwrap_or(formatted_phone);
+                    let is_self = s.self_jid.as_ref().map_or(false, |sj| sj.user == item.lid || sj.user == item.phone_number);
+                    if !is_self {
+                        let _ = s.get_or_create_chat(pn_jid.clone(), display_name, false);
+                    }
                 }
             }
-        }
 
-        // Ensure all contacts with verified/human names have a corresponding chat entry
-        let named_contacts: Vec<(Jid, String)> = s.contacts.iter()
-            .filter_map(|(jid, c)| {
-                let name = c.name.as_ref().filter(|n| crate::util::is_real_name(n))
-                    .or_else(|| c.verified_name.as_ref().filter(|n| crate::util::is_real_name(n)));
-                name.map(|n| (s.canonical_jid(jid), n.clone()))
-            })
-            .collect();
-        for (canon_jid, name) in named_contacts {
-            let is_self = s.self_jid.as_ref().map_or(false, |sj| sj.user == canon_jid.user);
-            if !is_self {
-                let chat = s.get_or_create_chat(canon_jid, name.clone(), false);
-                chat.name = name;
+            // Ensure all contacts with verified/human names have a corresponding chat entry
+            let named_contacts: Vec<(Jid, String)> = s.contacts.iter()
+                .filter_map(|(jid, c)| {
+                    let name = c.name.as_ref().filter(|n| crate::util::is_real_name(n))
+                        .or_else(|| c.verified_name.as_ref().filter(|n| crate::util::is_real_name(n)));
+                    name.map(|n| (s.canonical_jid(jid), n.clone()))
+                })
+                .collect();
+            for (canon_jid, name) in named_contacts {
+                let is_self = s.self_jid.as_ref().map_or(false, |sj| sj.user == canon_jid.user);
+                if !is_self {
+                    let chat = s.get_or_create_chat(canon_jid, name.clone(), false);
+                    chat.name = name;
+                }
             }
-        }
 
-        // Pre-seed known groups from SQLite
-        if let Ok(rodina_jid) = "120363139451107529@g.us".parse::<Jid>() {
-            let chat = s.get_or_create_chat(rodina_jid, "Rodina".to_string(), true);
-            chat.is_group = true;
+            s.consolidate_canonical_chats();
         }
-        if let Ok(r51_jid) = "120363427708094881@g.us".parse::<Jid>() {
-            let chat = s.get_or_create_chat(r51_jid, "r51.com 21.7.".to_string(), true);
-            chat.is_group = true;
-        }
-
-        s.consolidate_canonical_chats();
-        drop(s);
         let _ = crate::storage::persist_state(&state).await;
     }
 
@@ -486,13 +476,13 @@ pub async fn spawn_backend(state: SharedState) -> Result<BackendHandle> {
         }
     });
     
-    // Periodic state persistence
+    // Periodic state persistence (skips when nothing changed)
     let state_for_persist = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         loop {
             interval.tick().await;
-            if let Err(e) = crate::storage::persist_state(&state_for_persist).await {
+            if let Err(e) = crate::storage::persist_if_dirty(&state_for_persist).await {
                 warn!("State persistence failed: {}", e);
             }
         }
@@ -597,6 +587,13 @@ async fn handle_incoming_message(
         }
     }
 
+    // Check if this is a protocol message (revoke, ephemeral sync, etc.) without edited message
+    if let Some(pm) = base_msg.protocol_message.as_option() {
+        if !pm.edited_message.is_set() {
+            return;
+        }
+    }
+
     // Extract text content
     let text = extract_message_text(&message).to_string();
     
@@ -684,9 +681,16 @@ async fn handle_incoming_message(
         
         // Add message
         let mut msg_canon = msg;
-        msg_canon.chat_jid = canon_chat_jid;
+        msg_canon.chat_jid = canon_chat_jid.clone();
         s.add_message(msg_canon);
         s.consolidate_canonical_chats();
+
+        // Bump unread badge for messages the user has not looked at yet
+        if !from_me && s.selected_chat.as_ref() != Some(&canon_chat_jid) {
+            if let Some(chat) = s.chats.get_mut(&canon_chat_jid) {
+                chat.unread_count = chat.unread_count.saturating_add(1);
+            }
+        }
     }
     
     // Auto-send read receipt for non-own messages
@@ -878,7 +882,7 @@ fn extract_message_text(message: &wa::Message) -> &str {
         if let Some(edited) = pm.edited_message.as_option() {
             return extract_message_text(edited);
         }
-        return "[Protocol Message]";
+        return "";
     }
     
     "[Unknown]"
@@ -980,9 +984,13 @@ async fn handle_event(
                                     new_contacts.push((pn_jid, n.clone()));
                                 }
                             }
-                        } else if let (Some(ref n), Some(lid_str)) = (name, &ic.lid_jid) {
+                        } else if let (Some(ref n), Some(lid_str)) = (&name, &ic.lid_jid) {
                             if let Ok(lid_jid) = lid_str.parse::<Jid>() {
                                 new_contacts.push((lid_jid, n.clone()));
+                            }
+                        } else if let (Some(ref n), Some(pn_str)) = (&name, &ic.pn_jid) {
+                            if let Ok(pn_jid) = pn_str.parse::<Jid>() {
+                                new_contacts.push((pn_jid, n.clone()));
                             }
                         }
                     }
@@ -1028,6 +1036,10 @@ async fn handle_event(
                         crate::util::format_jid(&chat_jid)
                     };
                     
+                    if !is_group && crate::util::is_real_name(&chat_name) {
+                        new_contacts.push((chat_jid.clone(), chat_name.clone()));
+                    }
+
                     new_chats.push((chat_jid.clone(), chat_name, is_group));
                     
                     for msg in &conv.messages {
@@ -1063,6 +1075,15 @@ async fn handle_event(
 
                             // Get the actual Message from WebMessageInfo
                             let wa_message = inner_msg.message.as_option();
+                            if let Some(wa_m) = wa_message.as_ref() {
+                                let base_m = wa_m.get_base_message();
+                                if let Some(pm) = base_m.protocol_message.as_option() {
+                                    if !pm.edited_message.is_set() {
+                                        // Ignore protocol message like delete/sync
+                                        continue;
+                                    }
+                                }
+                            }
                             if let Some(msg_text) = wa_message.as_ref().map(|m| extract_message_text(m)) {
                                 let msg_id = inner_msg
                                     .key.as_option()
@@ -1236,9 +1257,21 @@ async fn handle_event(
         
         Event::ChatPresence(chat_presence) => {
             let mut s = state.write();
-            let jid = chat_presence.source.chat.clone();
+            let jid = s.canonical_jid(&chat_presence.source.chat);
             if let Some(c) = s.chats.get_mut(&jid) {
-                c.unread_count = if chat_presence.source.is_from_me { 0 } else { 1 }; // Approximation
+                // Presence snapshots must not clobber locally counted unread state;
+                // only an explicit "read from this device" resets it.
+                if chat_presence.source.is_from_me {
+                    c.unread_count = 0;
+                } else {
+                    let is_composing = matches!(chat_presence.state, whatsapp_rust::wacore::types::presence::ChatPresence::Composing);
+                    c.is_typing = is_composing;
+                    if is_composing {
+                        c.typing_until = Some(chrono::Utc::now() + chrono::Duration::seconds(5));
+                    } else {
+                        c.typing_until = None;
+                    }
+                }
             }
         }
         
@@ -1481,6 +1514,7 @@ async fn handle_event(
             if let Some(c) = s.chats.get_mut(&archive_update.jid) {
                 // ArchiveChatAction has `archived` field (bool)
                 c.is_archived = archive_update.action.archived.unwrap_or(false);
+                s.dirty = true;
             }
         }
         
@@ -1489,6 +1523,7 @@ async fn handle_event(
             if let Some(c) = s.chats.get_mut(&pin_update.jid) {
                 // PinAction has `pinned` field (bool)
                 c.is_pinned = pin_update.action.pinned.unwrap_or(false);
+                s.dirty = true;
             }
         }
         
@@ -1496,7 +1531,8 @@ async fn handle_event(
             let mut s = state.write();
             if let Some(c) = s.chats.get_mut(&mute_update.jid) {
                 // MuteAction has `muteEndTimestamp` field (int64)
-                c.mute_until = mute_update.action.mute_end_timestamp.and_then(|ms| chrono::DateTime::from_timestamp_millis(ms));
+                c.mute_until = mute_update.action.mute_end_timestamp.and_then(chrono::DateTime::from_timestamp_millis);
+                s.dirty = true;
             }
         }
         
@@ -1559,6 +1595,19 @@ async fn handle_command(
         
         Command::SendMedia { chat_jid, file_path, caption, reply_to } => {
             let canon_to = state.read().canonical_jid(&chat_jid);
+            let quote_context = reply_to.as_ref().and_then(|reply_id| {
+                let s = state.read();
+                let reply_msg = s
+                    .get_chat_messages(&canon_to)
+                    .and_then(|msgs| msgs.iter().find(|m| m.id == *reply_id))?;
+                Some(Box::new(build_quote_context_with_info(
+                    reply_id,
+                    &reply_msg.sender_jid,
+                    &canon_to,
+                    &canon_to,
+                    &wa::Message::default(),
+                )))
+            });
             let client_clone = client.clone();
             let state_clone = state.clone();
             
@@ -1574,26 +1623,30 @@ async fn handle_command(
                             crate::state::MediaType::Sticker => whatsapp_rust::download::MediaType::Sticker,
                         };
                         
-                        tracing::info!("Uploading media {:?} ({} bytes) to {:?}", media_type, bytes.len(), canon_to);
-                        match client_clone.upload(bytes.clone(), wa_type, Default::default()).await {
+                        let file_size = bytes.len() as u64;
+                        tracing::info!("Uploading media {:?} ({} bytes) to {:?}", media_type, file_size, canon_to);
+                        match client_clone.upload(bytes, wa_type, Default::default()).await {
                             Ok(upload) => {
                                 let file_name = file_path.file_name().map(|n| n.to_string_lossy().to_string());
                                 let wa_msg = match media_type {
                                     crate::state::MediaType::Image => {
                                         whatsapp_rust::media::image_message(upload, whatsapp_rust::media::ImageOptions {
                                             caption: caption.clone(),
+                                            context_info: quote_context.clone(),
                                             ..Default::default()
                                         })
                                     }
                                     crate::state::MediaType::Video => {
                                         whatsapp_rust::media::video_message(upload, whatsapp_rust::media::VideoOptions {
                                             caption: caption.clone(),
+                                            context_info: quote_context.clone(),
                                             ..Default::default()
                                         })
                                     }
                                     crate::state::MediaType::Audio | crate::state::MediaType::Voice => {
                                         whatsapp_rust::media::audio_message(upload, whatsapp_rust::media::AudioOptions {
                                             ptt: Some(media_type == crate::state::MediaType::Voice),
+                                            context_info: quote_context.clone(),
                                             ..Default::default()
                                         })
                                     }
@@ -1601,6 +1654,7 @@ async fn handle_command(
                                         whatsapp_rust::media::document_message(upload, whatsapp_rust::media::DocumentOptions {
                                             file_name: file_name.clone(),
                                             caption: caption.clone(),
+                                            context_info: quote_context.clone(),
                                             ..Default::default()
                                         })
                                     }
@@ -1638,7 +1692,7 @@ async fn handle_command(
                                         local_msg.media_type = Some(media_type);
                                         local_msg.media_path = Some(file_path.to_string_lossy().to_string());
                                         local_msg.media_caption = caption;
-                                        local_msg.media_file_length = Some(bytes.len() as u64);
+                                        local_msg.media_file_length = Some(file_size);
                                         {
                                             let mut s = state_clone.write();
                                             s.add_message(local_msg);
@@ -2133,6 +2187,7 @@ async fn handle_command(
         Command::ArchiveChat { chat_jid } => {
             client.chat_actions().archive_chat(&chat_jid, None).await?;
             let mut s = state.write();
+            s.dirty = true;
             if let Some(chat) = s.chats.get_mut(&chat_jid) {
                 chat.is_archived = true;
             }
@@ -2141,6 +2196,7 @@ async fn handle_command(
         Command::UnarchiveChat { chat_jid } => {
             client.chat_actions().unarchive_chat(&chat_jid, None).await?;
             let mut s = state.write();
+            s.dirty = true;
             if let Some(chat) = s.chats.get_mut(&chat_jid) {
                 chat.is_archived = false;
             }
@@ -2149,6 +2205,7 @@ async fn handle_command(
         Command::PinChat { chat_jid } => {
             client.chat_actions().pin_chat(&chat_jid).await?;
             let mut s = state.write();
+            s.dirty = true;
             if let Some(chat) = s.chats.get_mut(&chat_jid) {
                 chat.is_pinned = true;
             }
@@ -2157,6 +2214,7 @@ async fn handle_command(
         Command::UnpinChat { chat_jid } => {
             client.chat_actions().unpin_chat(&chat_jid).await?;
             let mut s = state.write();
+            s.dirty = true;
             if let Some(chat) = s.chats.get_mut(&chat_jid) {
                 chat.is_pinned = false;
             }
@@ -2170,6 +2228,7 @@ async fn handle_command(
                 client.chat_actions().mute_chat(&chat_jid).await?;
             }
             let mut s = state.write();
+            s.dirty = true;
             if let Some(chat) = s.chats.get_mut(&chat_jid) {
                 chat.mute_until = until;
             }
@@ -2178,6 +2237,7 @@ async fn handle_command(
         Command::UnmuteChat { chat_jid } => {
             client.chat_actions().unmute_chat(&chat_jid).await?;
             let mut s = state.write();
+            s.dirty = true;
             if let Some(chat) = s.chats.get_mut(&chat_jid) {
                 chat.mute_until = None;
             }
@@ -2186,6 +2246,7 @@ async fn handle_command(
         Command::DeleteChat { chat_jid } => {
             let res = client.chat_actions().delete_chat(&chat_jid, false, None).await;
             let mut s = state.write();
+            s.dirty = true;
             s.chats.remove(&chat_jid);
             s.messages.remove(&chat_jid);
             if s.selected_chat.as_ref() == Some(&chat_jid) {
@@ -2196,8 +2257,12 @@ async fn handle_command(
         
         Command::ClearChat { chat_jid } => {
             let res = client.chat_actions().clear_chat(&chat_jid, false, false, None).await;
-            if let Some(msgs) = state.write().messages.get_mut(&chat_jid) {
-                msgs.clear();
+            {
+                let mut s = state.write();
+                s.dirty = true;
+                if let Some(msgs) = s.messages.get_mut(&chat_jid) {
+                    msgs.clear();
+                }
             }
             res?;
         }
@@ -2222,8 +2287,12 @@ async fn handle_command(
         
         Command::DeleteMessageForMe { chat_jid, message_id } => {
             let res = client.revoke_message(chat_jid.clone(), message_id.clone(), whatsapp_rust::send::RevokeType::Sender).await;
-            if let Some(msgs) = state.write().messages.get_mut(&chat_jid) {
-                msgs.retain(|m| m.id != message_id);
+            {
+                let mut s = state.write();
+                s.dirty = true;
+                if let Some(msgs) = s.messages.get_mut(&chat_jid) {
+                    msgs.retain(|m| m.id != message_id);
+                }
             }
             res?;
         }
@@ -2235,8 +2304,12 @@ async fn handle_command(
                 whatsapp_rust::send::RevokeType::Sender
             };
             let res = client.revoke_message(chat_jid.clone(), message_id.clone(), revoke_type).await;
-            if let Some(msgs) = state.write().messages.get_mut(&chat_jid) {
-                msgs.retain(|m| m.id != message_id);
+            {
+                let mut s = state.write();
+                s.dirty = true;
+                if let Some(msgs) = s.messages.get_mut(&chat_jid) {
+                    msgs.retain(|m| m.id != message_id);
+                }
             }
             res?;
         }
@@ -2355,7 +2428,9 @@ async fn handle_command(
         }
         
         Command::SetGroupSubject { chat_jid, subject } => {
-            client.groups().set_subject(&chat_jid, GroupSubject::new(&subject).unwrap()).await?;
+            let validated = GroupSubject::new(&subject)
+                .map_err(|e| anyhow::anyhow!("Invalid group subject: {}", e))?;
+            client.groups().set_subject(&chat_jid, validated).await?;
             let mut s = state.write();
             if let Some(chat) = s.chats.get_mut(&chat_jid) {
                 chat.name = subject;
@@ -2363,7 +2438,9 @@ async fn handle_command(
         }
         
         Command::SetGroupDescription { chat_jid, description } => {
-            client.groups().set_description(&chat_jid, Some(GroupDescription::new(&description).unwrap()), PreviousDescription::Resolve).await?;
+            let validated = GroupDescription::new(&description)
+                .map_err(|e| anyhow::anyhow!("Invalid group description: {}", e))?;
+            client.groups().set_description(&chat_jid, Some(validated), PreviousDescription::Resolve).await?;
         }
         
         Command::SetGroupEphemeral { chat_jid, expiration } => {

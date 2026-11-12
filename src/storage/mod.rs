@@ -30,12 +30,28 @@ fn get_storage_path() -> PathBuf {
 }
 
 pub async fn persist_state(state: &SharedState) -> Result<()> {
+    persist_state_inner(state, false).await
+}
+
+/// Persist only when content actually changed since the last successful write.
+pub async fn persist_if_dirty(state: &SharedState) -> Result<()> {
+    persist_state_inner(state, true).await
+}
+
+async fn persist_state_inner(state: &SharedState, only_if_dirty: bool) -> Result<()> {
     let path = get_storage_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let persisted = {
-        let s = state.read();
+        let mut s = state.write();
+        if only_if_dirty && !s.dirty {
+            return Ok(());
+        }
+        // Clear the flag while still holding the lock, so any mutation that
+        // happens after this snapshot immediately re-marks the state dirty
+        // instead of being lost by the write below.
+        s.dirty = false;
         PersistedAppState {
             chats: s.chats.values().cloned().collect(),
             messages: s.messages.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
@@ -47,8 +63,21 @@ pub async fn persist_state(state: &SharedState) -> Result<()> {
             preferences: s.preferences.clone(),
         }
     };
-    let data = serde_json::to_string_pretty(&persisted)?;
-    tokio::fs::write(&path, data).await?;
+    let data = serde_json::to_string(&persisted)?;
+
+    // Write to a temp file and rename, so an interrupted write can never
+    // truncate the existing history file.
+    let tmp = path.with_extension("json.tmp");
+    let write_result = async {
+        tokio::fs::write(&tmp, data).await?;
+        tokio::fs::rename(&tmp, &path).await
+    }
+    .await;
+    if let Err(e) = write_result {
+        // The data never reached disk, so try again on the next tick.
+        state.write().dirty = true;
+        return Err(e.into());
+    }
     debug!("UI state persisted to {:?}", path);
     Ok(())
 }
@@ -56,8 +85,9 @@ pub async fn persist_state(state: &SharedState) -> Result<()> {
 pub async fn load_state() -> Result<AppState> {
     let path = get_storage_path();
     if path.exists() {
-        if let Ok(data) = tokio::fs::read_to_string(&path).await {
-            if let Ok(persisted) = serde_json::from_str::<PersistedAppState>(&data) {
+        let data = tokio::fs::read_to_string(&path).await?;
+        match serde_json::from_str::<PersistedAppState>(&data) {
+            Ok(persisted) => {
                 let mut state = AppState::new();
                 for (lid_str, pn_str) in persisted.lid_to_pn {
                     if let (Ok(lid_jid), Ok(pn_jid)) = (lid_str.parse::<Jid>(), pn_str.parse::<Jid>()) {
@@ -131,6 +161,16 @@ pub async fn load_state() -> Result<AppState> {
                 state.consolidate_canonical_chats();
                 info!("Loaded and consolidated UI state with {} chats from {:?}", state.chats.len(), path);
                 return Ok(state);
+            }
+            Err(e) => {
+                // Never silently start empty: the 5s persistence loop would then
+                // overwrite the user's history with an empty file.
+                let backup = path.with_extension("json.corrupt");
+                let _ = std::fs::rename(&path, &backup);
+                tracing::error!(
+                    "Failed to parse {}: {}. Moved it to {:?} and starting with empty state.",
+                    path.display(), e, backup
+                );
             }
         }
     }

@@ -9,3 +9,5 @@ pub mod export_dialog;
 pub mod search_dialog;
 pub mod schedule_dialog;
 pub mod call_dialog;
+pub mod animations;
+pub mod emoji;

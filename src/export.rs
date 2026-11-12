@@ -430,6 +430,8 @@ mod tests {
             mute_until: None,
             last_activity: Utc::now(),
             participants: HashSet::new(),
+            is_typing: false,
+            typing_until: None,
         };
 
         let mut contacts = HashMap::new();
