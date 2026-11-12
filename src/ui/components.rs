@@ -847,19 +847,26 @@ impl<'a> Widget for MessageBubble<'a> {
         let mut on_open_emoji_picker = self.on_open_emoji_picker;
         
         // Quick reaction button on hover
-        if response.hovered() {
-            let smile_center = if self.is_own {
-                bubble_rect.left_center() + Vec2::new(-16.0, 0.0)
-            } else {
-                bubble_rect.right_center() + Vec2::new(16.0, 0.0)
-            };
-            let smile_rect = egui::Rect::from_center_size(smile_center, Vec2::splat(22.0));
-            let smile_id = ui.scope_id().with(("smile_btn", &self.message.id));
+        let smile_center = if self.is_own {
+            bubble_rect.left_center() + Vec2::new(-16.0, 0.0)
+        } else {
+            bubble_rect.right_center() + Vec2::new(16.0, 0.0)
+        };
+        let smile_rect = egui::Rect::from_center_size(smile_center, Vec2::splat(24.0));
+        let smile_id = ui.scope_id().with(("smile_btn", &self.message.id));
+        let popup_id = smile_id.with("popup");
+        let is_popup_open = egui::Popup::is_id_open(ui.ctx(), popup_id);
+
+        let hover_check_rect = bubble_rect.union(smile_rect).expand(8.0);
+        let is_hovered = ui.rect_contains_pointer(hover_check_rect);
+
+        if is_hovered || is_popup_open {
             let smile_resp = ui.interact(smile_rect, smile_id, Sense::click());
-            ui.painter().circle_filled(smile_center, 11.0, Color32::from_black_alpha(if smile_resp.hovered() { 160 } else { 100 }));
-            ui.painter().text(smile_center, egui::Align2::CENTER_CENTER, "😊", FontId::proportional(12.0), Color32::WHITE);
+            let bg_alpha = if smile_resp.hovered() || is_popup_open { 180 } else { 120 };
+            ui.painter().circle_filled(smile_center, 12.0, Color32::from_black_alpha(bg_alpha));
+            ui.painter().text(smile_center, egui::Align2::CENTER_CENTER, "😊", FontId::proportional(12.5), Color32::WHITE);
             
-            smile_resp.context_menu(|ui| {
+            egui::Popup::menu(&smile_resp).show(|ui| {
                 ui.label(RichText::new("Reagovat na zprávu").font(FontId::proportional(11.0)).color(Color32::from_rgb(0x86, 0x96, 0xA0)));
                 ui.horizontal(|ui| {
                     for emoji in ["👍", "❤️", "😂", "😮", "😢", "🙏", "🔥", "🎉"] {
