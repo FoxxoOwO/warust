@@ -373,6 +373,9 @@ pub struct AppState {
     pub reaction_picker_target: Option<String>,
     #[serde(skip)]
     pub pending_reactions: HashMap<(Jid, String), Vec<Reaction>>,
+    /// Set to true once initial 20-message history has been fetched on first login
+    #[serde(default)]
+    pub initial_history_fetched: bool,
     /// Set by any content mutation; cleared after a successful persist so the
     /// periodic writer can skip no-op serialization of the whole message store.
     #[serde(skip)]
@@ -418,6 +421,7 @@ impl Default for AppState {
             emoji_active_category: 0,
             reaction_picker_target: None,
             pending_reactions: HashMap::new(),
+            initial_history_fetched: false,
             dirty: false,
         }
     }
@@ -789,12 +793,18 @@ impl AppState {
                         status: latest.status,
                         media_type: latest.media_type,
                     });
-                    chat.last_activity = latest.timestamp;
+                    if latest.timestamp > chat.last_activity {
+                        chat.last_activity = latest.timestamp;
+                    }
                 } else if let Some(last_any) = msgs.last() {
-                    chat.last_activity = last_any.timestamp;
+                    if last_any.timestamp > chat.last_activity {
+                        chat.last_activity = last_any.timestamp;
+                    }
                 }
             } else if let Some(lm) = &chat.last_message {
-                chat.last_activity = lm.timestamp;
+                if lm.timestamp > chat.last_activity {
+                    chat.last_activity = lm.timestamp;
+                }
             }
         }
 
@@ -828,6 +838,27 @@ impl AppState {
         });
     }
 
+    /// Compute the effective most recent timestamp for a chat across all sources:
+    /// 1. Messages loaded in `self.messages` (using canonical or direct JID lookup)
+    /// 2. `chat.last_message` preview
+    /// 3. `chat.last_activity`
+    pub fn get_chat_latest_timestamp(&self, chat: &Chat) -> chrono::DateTime<chrono::Utc> {
+        let mut best = chat.last_activity;
+        if let Some(lm) = &chat.last_message {
+            if lm.timestamp > best {
+                best = lm.timestamp;
+            }
+        }
+        if let Some(msgs) = self.get_chat_messages(&chat.jid) {
+            if let Some(last_msg) = msgs.iter().map(|m| m.timestamp).max() {
+                if last_msg > best {
+                    best = last_msg;
+                }
+            }
+        }
+        best
+    }
+
     pub fn filtered_chats(&self) -> Vec<&Chat> {
         let mut chats: Vec<_> = self.chats.values().collect();
         
@@ -852,14 +883,14 @@ impl AppState {
             });
         }
         
-        // Sort: pinned first, then by last activity (newest first)
+        // Sort: pinned first, then by latest message / activity (newest first)
         chats.sort_by(|a, b| {
             match (a.is_pinned, b.is_pinned) {
                 (true, false) => std::cmp::Ordering::Less,
                 (false, true) => std::cmp::Ordering::Greater,
                 _ => {
-                    let ts_a = a.last_message.as_ref().map(|m| m.timestamp).unwrap_or(a.last_activity);
-                    let ts_b = b.last_message.as_ref().map(|m| m.timestamp).unwrap_or(b.last_activity);
+                    let ts_a = self.get_chat_latest_timestamp(a);
+                    let ts_b = self.get_chat_latest_timestamp(b);
                     match ts_b.cmp(&ts_a) {
                         std::cmp::Ordering::Equal => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
                         other => other,

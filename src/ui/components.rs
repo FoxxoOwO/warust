@@ -184,14 +184,16 @@ impl<'a> Widget for ChatItem<'a> {
                 Color32::WHITE,
             );
             
-            let display_ts = self.chat.last_message.as_ref().map(|m| m.timestamp)
-                .or_else(|| {
-                    if self.chat.last_activity > chrono::DateTime::<chrono::Utc>::UNIX_EPOCH {
-                        Some(self.chat.last_activity)
-                    } else {
-                        None
-                    }
-                });
+            let display_ts = {
+                let mut best = None;
+                if self.chat.last_activity > chrono::DateTime::<chrono::Utc>::UNIX_EPOCH {
+                    best = Some(self.chat.last_activity);
+                }
+                if let Some(lm) = &self.chat.last_message {
+                    best = Some(best.map_or(lm.timestamp, |b| b.max(lm.timestamp)));
+                }
+                best
+            };
 
             if let Some(ts) = display_ts {
                 let time_str = format_timestamp(ts);

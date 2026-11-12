@@ -203,8 +203,14 @@ impl BackendHandle {
 
 static FETCHING_INITIAL_HISTORY: AtomicBool = AtomicBool::new(false);
 
-/// Automatically load the first 20 messages for every conversation upon startup.
-async fn auto_fetch_initial_messages(client: &Arc<Client>, state: &SharedState) {
+/// Automatically load the first 20 messages for each conversation.
+/// If `force` is false, it only runs on the FIRST login (when `initial_history_fetched` is false).
+async fn auto_fetch_initial_messages(client: &Arc<Client>, state: &SharedState, force: bool) {
+    if !force && state.read().initial_history_fetched {
+        debug!("Initial 20-message history already fetched on first login; skipping.");
+        return;
+    }
+
     if FETCHING_INITIAL_HISTORY.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -221,7 +227,7 @@ async fn auto_fetch_initial_messages(client: &Arc<Client>, state: &SharedState) 
         return;
     }
 
-    info!("Starting auto-fetch of initial 20 messages for {} conversations", chats_to_fetch.len());
+    info!("Starting auto-fetch of initial 20 messages for {} conversations (first login: {})", chats_to_fetch.len(), !force);
 
     for chat_jid in chats_to_fetch {
         let needs_fetch = {
@@ -237,6 +243,15 @@ async fn auto_fetch_initial_messages(client: &Arc<Client>, state: &SharedState) 
             tokio::time::sleep(Duration::from_millis(350)).await;
         }
     }
+
+    {
+        let mut s = state.write();
+        s.initial_history_fetched = true;
+        s.consolidate_canonical_chats();
+    }
+    let _ = crate::storage::persist_state(state).await;
+
+    FETCHING_INITIAL_HISTORY.store(false, Ordering::SeqCst);
     info!("Completed auto-fetching initial 20 messages for conversations");
 }
 
@@ -351,16 +366,20 @@ pub async fn spawn_backend(state: SharedState) -> Result<BackendHandle> {
         .with_backend(store)
         .on_qr_code({
             let tx = tx_status.clone();
+            let state = state_clone.clone();
             move |code, timeout| {
                 info!("QR code generated: {} chars, valid for {}s", code.len(), timeout.as_secs());
+                state.write().initial_history_fetched = false;
                 let _ = tx.send(ConnectionStatus::QrCode(code.to_string()));
                 async {}
             }
         })
         .on_pair_code({
             let tx = tx_status.clone();
+            let state = state_clone.clone();
             move |code, timeout| {
                 info!("Pair code generated: {}, valid for {}s", code, timeout.as_secs());
+                state.write().initial_history_fetched = false;
                 let _ = tx.send(ConnectionStatus::PairCode(code.to_string()));
                 async {}
             }
@@ -448,8 +467,8 @@ pub async fn spawn_backend(state: SharedState) -> Result<BackendHandle> {
                         let _ = crate::storage::persist_state(&state_clone2).await;
                     }
 
-                    // Automatically load the first 20 messages from each conversation upon startup
-                    auto_fetch_initial_messages(&client_clone, &state_clone2).await;
+                    // Automatically load the first 20 messages from each conversation on first login
+                    auto_fetch_initial_messages(&client_clone, &state_clone2, false).await;
                 });
 
                 async {}
@@ -457,7 +476,9 @@ pub async fn spawn_backend(state: SharedState) -> Result<BackendHandle> {
         })
         .on_logged_out({
             let tx = tx_status.clone();
+            let state = state_clone.clone();
             move |_| {
+                state.write().initial_history_fetched = false;
                 let _ = tx.send(ConnectionStatus::Disconnected);
                 warn!("Logged out from WhatsApp");
                 async {}
@@ -1296,7 +1317,7 @@ async fn handle_event(
                 let client_clone = client.clone();
                 let state_clone = state.clone();
                 tokio::spawn(async move {
-                    auto_fetch_initial_messages(&client_clone, &state_clone).await;
+                    auto_fetch_initial_messages(&client_clone, &state_clone, false).await;
                 });
             } else {
                 let tx = tx_status.clone();
@@ -1314,7 +1335,7 @@ async fn handle_event(
                         }
                     });
                     if was_syncing {
-                        auto_fetch_initial_messages(&client_clone, &state_clone).await;
+                        auto_fetch_initial_messages(&client_clone, &state_clone, false).await;
                     }
                 });
             }
@@ -2690,7 +2711,7 @@ async fn handle_command(
                 }
                 crate::avatars::sync_all_avatars(&client, &state_clone, true).await;
                 FETCHING_INITIAL_HISTORY.store(false, Ordering::SeqCst);
-                auto_fetch_initial_messages(&client, &state_clone).await;
+                auto_fetch_initial_messages(&client, &state_clone, true).await;
             });
         }
         

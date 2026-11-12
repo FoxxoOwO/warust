@@ -20,6 +20,8 @@ struct PersistedAppState {
     scheduled_messages: Vec<crate::state::ScheduledMessage>,
     #[serde(default)]
     preferences: crate::state::UserPreferences,
+    #[serde(default)]
+    initial_history_fetched: bool,
 }
 
 fn get_storage_path() -> PathBuf {
@@ -61,6 +63,7 @@ async fn persist_state_inner(state: &SharedState, only_if_dirty: bool) -> Result
             lid_to_pn: s.lid_to_pn.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             scheduled_messages: s.scheduled_messages.clone(),
             preferences: s.preferences.clone(),
+            initial_history_fetched: s.initial_history_fetched,
         }
     };
     let data = serde_json::to_string(&persisted)?;
@@ -158,6 +161,7 @@ pub async fn load_state() -> Result<AppState> {
                 state.self_name = persisted.self_name;
                 state.scheduled_messages = persisted.scheduled_messages;
                 state.preferences = persisted.preferences;
+                state.initial_history_fetched = persisted.initial_history_fetched;
                 state.clean_stray_reactions();
                 state.consolidate_canonical_chats();
                 info!("Loaded and consolidated UI state with {} chats from {:?}", state.chats.len(), path);
@@ -208,6 +212,7 @@ mod tests {
                 lid_to_pn: s.lid_to_pn.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
                 scheduled_messages: s.scheduled_messages.clone(),
                 preferences: s.preferences.clone(),
+                initial_history_fetched: s.initial_history_fetched,
             }
         };
         let json = serde_json::to_string_pretty(&persisted).expect("Serialization must succeed");
