@@ -1,6 +1,7 @@
 //! Backend task - runs whatsapp-rust Bot and handles commands
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use anyhow::Result;
 use chrono::Utc;
@@ -198,6 +199,45 @@ impl BackendHandle {
         }
         Ok(())
     }
+}
+
+static FETCHING_INITIAL_HISTORY: AtomicBool = AtomicBool::new(false);
+
+/// Automatically load the first 20 messages for every conversation upon startup.
+async fn auto_fetch_initial_messages(client: &Arc<Client>, state: &SharedState) {
+    if FETCHING_INITIAL_HISTORY.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    // Give background tasks and handshake a brief moment to stabilize
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let chats_to_fetch: Vec<Jid> = {
+        let s = state.read();
+        s.filtered_chats().iter().map(|c| s.canonical_jid(&c.jid)).collect()
+    };
+
+    if chats_to_fetch.is_empty() {
+        FETCHING_INITIAL_HISTORY.store(false, Ordering::SeqCst);
+        return;
+    }
+
+    info!("Starting auto-fetch of initial 20 messages for {} conversations", chats_to_fetch.len());
+
+    for chat_jid in chats_to_fetch {
+        let needs_fetch = {
+            let s = state.read();
+            s.get_chat_messages(&chat_jid).map_or(0, |m| m.len()) < 20
+        };
+
+        if needs_fetch {
+            debug!("Auto-fetching initial 20 messages for {}", chat_jid);
+            if let Err(e) = client.fetch_message_history(&chat_jid, "", false, 0, 20).await {
+                debug!("Failed auto-fetch history for {}: {}", chat_jid, e);
+            }
+            tokio::time::sleep(Duration::from_millis(350)).await;
+        }
+    }
+    info!("Completed auto-fetching initial 20 messages for conversations");
 }
 
 /// Spawn the backend task
@@ -407,6 +447,9 @@ pub async fn spawn_backend(state: SharedState) -> Result<BackendHandle> {
                         }
                         let _ = crate::storage::persist_state(&state_clone2).await;
                     }
+
+                    // Automatically load the first 20 messages from each conversation upon startup
+                    auto_fetch_initial_messages(&client_clone, &state_clone2).await;
                 });
 
                 async {}
@@ -907,7 +950,7 @@ fn is_jid_group(jid: &Jid) -> bool {
 
 async fn handle_event(
     event: Arc<Event>,
-    _client: Arc<Client>,
+    client: Arc<Client>,
     state: SharedState,
     tx_status: watch::Sender<ConnectionStatus>,
     call_manager: Arc<CallManager>,
@@ -1250,11 +1293,18 @@ async fn handle_event(
             // Mark connected immediately if 100%, or set up auto-settle debounce
             if progress >= 100 {
                 let _ = tx_status.send(ConnectionStatus::Connected);
+                let client_clone = client.clone();
+                let state_clone = state.clone();
+                tokio::spawn(async move {
+                    auto_fetch_initial_messages(&client_clone, &state_clone).await;
+                });
             } else {
                 let tx = tx_status.clone();
+                let client_clone = client.clone();
+                let state_clone = state.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
-                    let _ = tx.send_if_modified(|status| {
+                    let was_syncing = tx.send_if_modified(|status| {
                         if matches!(status, ConnectionStatus::Syncing(_)) {
                             info!("History sync quiescent, setting status to Connected");
                             *status = ConnectionStatus::Connected;
@@ -1263,6 +1313,9 @@ async fn handle_event(
                             false
                         }
                     });
+                    if was_syncing {
+                        auto_fetch_initial_messages(&client_clone, &state_clone).await;
+                    }
                 });
             }
         }
@@ -1330,7 +1383,7 @@ async fn handle_event(
                 handle_incoming_message(
                     (*inbound.info).clone(),
                     (*inbound.message).clone(),
-                    _client.clone(),
+                    client.clone(),
                     state.clone(),
                     tx_status.clone(),
                 ).await;
@@ -1536,7 +1589,7 @@ async fn handle_event(
         Event::PictureUpdate(pic_update) => {
             debug!("Picture update for {}", pic_update.jid);
             let jid = state.read().canonical_jid(&pic_update.jid.to_non_ad());
-            let client = _client.clone();
+            let client = client.clone();
             tokio::spawn(async move {
                 crate::avatars::fetch_avatar(&client, &jid, true).await;
             });
@@ -2586,12 +2639,12 @@ async fn handle_command(
                     }
                 };
                 // Auto-fetch history from primary phone via PDO if chat has few messages
-                if msg_count < 10 {
+                if msg_count < 20 {
                     let client = client.clone();
                     let target = target_jid.clone();
                     tokio::spawn(async move {
                         info!("Requesting on-demand history for {} via PDO", target);
-                        if let Err(e) = client.fetch_message_history(&target, &oldest_id, from_me, timestamp_ms, 50).await {
+                        if let Err(e) = client.fetch_message_history(&target, &oldest_id, from_me, timestamp_ms, 20).await {
                             debug!("On-demand history request for {}: {}", target, e);
                         }
                     });
@@ -2636,6 +2689,8 @@ async fn handle_command(
                     let _ = client.contacts().get_user_info(&pn_jids).await;
                 }
                 crate::avatars::sync_all_avatars(&client, &state_clone, true).await;
+                FETCHING_INITIAL_HISTORY.store(false, Ordering::SeqCst);
+                auto_fetch_initial_messages(&client, &state_clone).await;
             });
         }
         
