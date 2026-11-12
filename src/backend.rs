@@ -255,6 +255,20 @@ async fn auto_fetch_initial_messages(client: &Arc<Client>, state: &SharedState, 
     info!("Completed auto-fetching initial 20 messages for conversations");
 }
 
+/// Helper to determine the active SQLite database path for the current session.
+fn get_session_db_path(data_dir: &std::path::Path) -> (std::path::PathBuf, String) {
+    let session_file = data_dir.join("current_session.txt");
+    if let Ok(name) = std::fs::read_to_string(&session_file) {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            let path = data_dir.join(trimmed);
+            return (path.clone(), path.to_string_lossy().to_string());
+        }
+    }
+    let default_path = data_dir.join("whatsapp.db");
+    (default_path.clone(), default_path.to_string_lossy().to_string())
+}
+
 /// Create a Bot instance with SQLite store, wire event handlers, and spawn its supervision loop.
 async fn create_and_spawn_bot(
     db_path_str: &str,
@@ -275,7 +289,11 @@ async fn create_and_spawn_bot(
             let state = state_clone.clone();
             move |code, timeout| {
                 info!("QR code generated: {} chars, valid for {}s", code.len(), timeout.as_secs());
-                state.write().initial_history_fetched = false;
+                {
+                    let mut s = state.write();
+                    s.initial_history_fetched = false;
+                    s.connection = ConnectionStatus::QrCode(code.to_string());
+                }
                 let _ = tx.send(ConnectionStatus::QrCode(code.to_string()));
                 async {}
             }
@@ -285,7 +303,11 @@ async fn create_and_spawn_bot(
             let state = state_clone.clone();
             move |code, timeout| {
                 info!("Pair code generated: {}, valid for {}s", code, timeout.as_secs());
-                state.write().initial_history_fetched = false;
+                {
+                    let mut s = state.write();
+                    s.initial_history_fetched = false;
+                    s.connection = ConnectionStatus::PairCode(code.to_string());
+                }
                 let _ = tx.send(ConnectionStatus::PairCode(code.to_string()));
                 async {}
             }
@@ -384,8 +406,12 @@ async fn create_and_spawn_bot(
             let tx = tx_status_clone.clone();
             let state = state_clone.clone();
             move |_| {
-                state.write().initial_history_fetched = false;
-                let _ = tx.send(ConnectionStatus::Disconnected);
+                let mut s = state.write();
+                s.initial_history_fetched = false;
+                if s.self_jid.is_some() {
+                    s.connection = ConnectionStatus::Disconnected;
+                    let _ = tx.send(ConnectionStatus::Disconnected);
+                }
                 warn!("Logged out from WhatsApp");
                 async {}
             }
@@ -419,6 +445,8 @@ async fn create_and_spawn_bot(
             }
         });
 
+    state.write().connection = ConnectionStatus::Connecting;
+    let _ = tx_status_clone.send(ConnectionStatus::Connecting);
     let bot = builder.build().await?;
     Ok(bot.spawn())
 }
@@ -428,17 +456,26 @@ pub async fn spawn_backend(state: SharedState) -> Result<BackendHandle> {
     let (tx_command, mut rx_command) = mpsc::unbounded_channel::<Command>();
     let (tx_status, rx_status) = watch::channel(ConnectionStatus::Disconnected);
     
-    // Build the bot
-    let db_path = dirs::data_dir()
+    // Determine data directory and session database path
+    let data_dir = dirs::data_dir()
         .unwrap_or_else(|| std::env::current_dir().unwrap())
-        .join("warust")
-        .join("whatsapp.db");
-    
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)?;
+        .join("warust");
+    std::fs::create_dir_all(&data_dir)?;
+
+    let (db_path, db_path_str) = get_session_db_path(&data_dir);
+
+    // Clean up older session database files that aren't the current active one
+    let current_file_name = db_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    if let Ok(entries) = std::fs::read_dir(&data_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                if (name.starts_with("whatsapp_") || name == "whatsapp.db") && !name.starts_with(&current_file_name) {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+        }
     }
-    // SqliteStore expects a file path, not a sqlite:// URL
-    let db_path_str = db_path.to_string_lossy().to_string();
     
     use whatsapp_rust::wacore::store::traits::{AppSyncStore, DeviceStore, ProtocolStore};
 
@@ -537,6 +574,7 @@ pub async fn spawn_backend(state: SharedState) -> Result<BackendHandle> {
         }
     });
 
+    let active_db_path = Arc::new(tokio::sync::RwLock::new(db_path_str.clone()));
     let bot_handle = create_and_spawn_bot(&db_path_str, &state, &tx_status, &call_manager).await?;
     let active_client = Arc::new(tokio::sync::RwLock::new(bot_handle.client()));
     let bot_handle_arc = Arc::new(tokio::sync::Mutex::new(Some(bot_handle)));
@@ -547,7 +585,8 @@ pub async fn spawn_backend(state: SharedState) -> Result<BackendHandle> {
     let state_for_cmds = state.clone();
     let tx_status_for_cmds = tx_status.clone();
     let call_mgr_for_cmds = call_manager.clone();
-    let db_path_for_cmds = db_path_str.clone();
+    let active_db_path_cmds = active_db_path.clone();
+    let data_dir_cmds = data_dir.clone();
     
     tokio::spawn(async move {
         while let Some(cmd) = rx_command.recv().await {
@@ -555,7 +594,8 @@ pub async fn spawn_backend(state: SharedState) -> Result<BackendHandle> {
                 cmd,
                 &active_client_cmds,
                 &bot_handle_cmds,
-                &db_path_for_cmds,
+                &active_db_path_cmds,
+                &data_dir_cmds,
                 &state_for_cmds,
                 &tx_status_for_cmds,
                 &call_mgr_for_cmds,
@@ -1683,7 +1723,8 @@ async fn handle_command(
     cmd: Command,
     active_client: &Arc<tokio::sync::RwLock<Arc<Client>>>,
     bot_handle_arc: &Arc<tokio::sync::Mutex<Option<whatsapp_rust::bot::BotHandle>>>,
-    db_path_str: &str,
+    active_db_path: &Arc<tokio::sync::RwLock<String>>,
+    data_dir: &std::path::Path,
     state: &SharedState,
     tx_status: &watch::Sender<ConnectionStatus>,
     call_manager: &Arc<CallManager>,
@@ -2707,8 +2748,9 @@ async fn handle_command(
         Command::RefreshChats => {
             let client = client.clone();
             let state_clone = state.clone();
-            let db_path_str = db_path_str.to_string();
+            let active_db_path = active_db_path.clone();
             tokio::spawn(async move {
+                let db_path_str = active_db_path.read().await.clone();
                 info!("Refreshing chats and resetting app state sync versions to force fresh snapshot");
                 if let Ok(store) = SqliteStore::new(&db_path_str).await {
                     use whatsapp_rust::wacore::store::traits::AppSyncStore;
@@ -2799,7 +2841,8 @@ async fn handle_command(
             info!("Logout requested: deregistering companion session...");
             let client = client.clone();
             let bot_handle_arc = bot_handle_arc.clone();
-            let db_path_str = db_path_str.to_string();
+            let active_db_path = active_db_path.clone();
+            let data_dir = data_dir.to_path_buf();
             let state = state.clone();
             let tx_status = tx_status.clone();
             let call_manager = call_manager.clone();
@@ -2810,25 +2853,24 @@ async fn handle_command(
                 info!("Sending logout IQ to WhatsApp server...");
                 client.logout().await;
 
-                // 2. Abort running bot instance so file locks and network connections are released
+                // 2. Shut down and abort running bot instance
                 if let Some(h) = bot_handle_arc.lock().await.take() {
+                    h.client().disconnect().await;
                     h.abort();
                 }
 
-                // 3. Small pause to ensure background socket & DB handles are dropped
-                tokio::time::sleep(Duration::from_millis(400)).await;
+                // 3. Small pause to ensure background sockets drop
+                tokio::time::sleep(Duration::from_millis(300)).await;
 
-                // 4. Delete SQLite database files
-                let db_path = std::path::PathBuf::from(&db_path_str);
-                let _ = std::fs::remove_file(&db_path);
-                let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
-                let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+                // 4. Create a completely brand new session database
+                let new_session_name = format!("whatsapp_{}.db", Utc::now().timestamp_millis());
+                let new_db_path = data_dir.join(&new_session_name);
+                let new_db_path_str = new_db_path.to_string_lossy().to_string();
+                let _ = std::fs::write(data_dir.join("current_session.txt"), &new_session_name);
+                *active_db_path.write().await = new_db_path_str.clone();
 
                 // 5. Delete cached UI state
-                let ui_state_path = dirs::data_dir()
-                    .unwrap_or_else(|| std::env::current_dir().unwrap())
-                    .join("warust")
-                    .join("ui_state.json");
+                let ui_state_path = data_dir.join("ui_state.json");
                 let _ = std::fs::remove_file(&ui_state_path);
 
                 // 6. Reset in-memory state
@@ -2847,9 +2889,9 @@ async fn handle_command(
                 }
                 let _ = tx_status.send(ConnectionStatus::Connecting);
 
-                // 7. Spawn fresh bot instance with clean DB to generate new pairing QR code
+                // 7. Spawn fresh bot instance with brand new, empty DB to generate new pairing QR code
                 match create_and_spawn_bot(
-                    &db_path_str,
+                    &new_db_path_str,
                     &state,
                     &tx_status,
                     &call_manager,
@@ -2857,10 +2899,13 @@ async fn handle_command(
                     Ok(new_handle) => {
                         *active_client.write().await = new_handle.client();
                         *bot_handle_arc.lock().await = Some(new_handle);
-                        info!("Fresh bot spawned after logout; waiting for new pairing QR code");
+                        info!("Fresh bot spawned after logout with database {}; waiting for new pairing QR code", new_session_name);
                     }
                     Err(e) => {
                         error!("Failed to spawn fresh bot after logout: {}", e);
+                        let err_msg = format!("Nepodařilo se vytvořit novou relaci: {}", e);
+                        state.write().connection = ConnectionStatus::Error(err_msg.clone());
+                        let _ = tx_status.send(ConnectionStatus::Error(err_msg));
                     }
                 }
             });
