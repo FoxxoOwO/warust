@@ -44,13 +44,11 @@ pub fn show_qr_pairing(ui: &mut Ui, state: &SharedState, backend: &BackendHandle
                     
                     let texture = ui.ctx().load_texture("qr_code", color_image, Default::default());
                     
-                    egui::Frame::new()
-                        .fill(Color32::WHITE)
-                        .corner_radius(egui::CornerRadius::same(12))
-                        .inner_margin(egui::Margin::same(16))
-                        .show(ui, |ui| {
-                            ui.add(egui::Image::new(&texture).fit_to_exact_size(Vec2::splat(256.0)));
-                        });
+                    let card_size = Vec2::splat(280.0);
+                    let (rect, _resp) = ui.allocate_exact_size(card_size, egui::Sense::hover());
+                    ui.painter().rect_filled(rect, egui::CornerRadius::same(16), Color32::WHITE);
+                    let img_rect = egui::Rect::from_center_size(rect.center(), Vec2::splat(256.0));
+                    ui.put(img_rect, egui::Image::new(&texture).fit_to_exact_size(Vec2::splat(256.0)));
                 }
                 
                 ui.add_space(24.0);
@@ -65,14 +63,18 @@ pub fn show_qr_pairing(ui: &mut Ui, state: &SharedState, backend: &BackendHandle
                 ui.add_space(16.0);
                 
                 ui.label(RichText::new("Or link with phone number").font(FontId::proportional(16.0)).strong());
-                ui.add_space(8.0);
+                ui.add_space(10.0);
                 
                 ui.horizontal(|ui| {
+                    let total_width = 380.0;
+                    let left_pad = (ui.available_width() - total_width).max(0.0) * 0.5;
+                    ui.add_space(left_pad);
+
                     let mut phone = pair_phone_number.clone();
                     let response = ui.add(
                         TextEdit::singleline(&mut phone)
                             .hint_text("Phone number (e.g. 15551234567)")
-                            .desired_width(250.0)
+                            .desired_width(260.0)
                             .font(FontId::proportional(14.0))
                     );
                     if response.changed() {
