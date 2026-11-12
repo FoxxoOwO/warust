@@ -1,4 +1,5 @@
 use std::sync::mpsc::{channel, Receiver};
+#[cfg(target_os = "windows")]
 use tray_item::{IconSource, TrayItem};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8,16 +9,16 @@ pub enum TrayMessage {
 }
 
 pub struct SystemTray {
+    #[cfg(target_os = "windows")]
     _tray: TrayItem,
     pub rx: Receiver<TrayMessage>,
 }
 
 impl SystemTray {
+    #[cfg(target_os = "windows")]
     pub fn new() -> Result<Self, tray_item::TIError> {
         let (tx, rx) = channel::<TrayMessage>();
 
-        // Under Windows, Resource("app-icon") or Resource("APP-ICON") or default binary icon
-        // If resource icon fails, Resource("") or fallback is supported
         let icon = IconSource::Resource("app-icon");
         let mut tray = TrayItem::new("Warust", icon)?;
 
@@ -35,5 +36,11 @@ impl SystemTray {
         });
 
         Ok(Self { _tray: tray, rx })
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    pub fn new() -> Result<Self, anyhow::Error> {
+        let (_tx, rx) = channel::<TrayMessage>();
+        Ok(Self { rx })
     }
 }

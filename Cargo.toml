@@ -57,9 +57,11 @@ glow = "0.14"
 
 # --- Development ---
 console_error_panic_hook = { version = "0.1", optional = true }
+
+[target.'cfg(windows)'.dependencies]
 tray-item = "0.10.0"
 
-[build-dependencies]
+[target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
 
 [dev-dependencies]
