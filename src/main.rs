@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 //! Warust - WhatsApp Desktop Client
 //!
 //! A native WhatsApp client built with Rust, egui, and whatsapp-rust.
