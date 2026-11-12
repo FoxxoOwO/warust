@@ -255,12 +255,178 @@ async fn auto_fetch_initial_messages(client: &Arc<Client>, state: &SharedState, 
     info!("Completed auto-fetching initial 20 messages for conversations");
 }
 
+/// Create a Bot instance with SQLite store, wire event handlers, and spawn its supervision loop.
+async fn create_and_spawn_bot(
+    db_path_str: &str,
+    state: &SharedState,
+    tx_status: &watch::Sender<ConnectionStatus>,
+    call_manager: &Arc<CallManager>,
+) -> Result<whatsapp_rust::bot::BotHandle> {
+    let store = SqliteStore::new(db_path_str).await?;
+
+    let state_clone = state.clone();
+    let tx_status_clone = tx_status.clone();
+    let call_manager_clone = call_manager.clone();
+
+    let builder = Bot::builder()
+        .with_backend(store)
+        .on_qr_code({
+            let tx = tx_status_clone.clone();
+            let state = state_clone.clone();
+            move |code, timeout| {
+                info!("QR code generated: {} chars, valid for {}s", code.len(), timeout.as_secs());
+                state.write().initial_history_fetched = false;
+                let _ = tx.send(ConnectionStatus::QrCode(code.to_string()));
+                async {}
+            }
+        })
+        .on_pair_code({
+            let tx = tx_status_clone.clone();
+            let state = state_clone.clone();
+            move |code, timeout| {
+                info!("Pair code generated: {}, valid for {}s", code, timeout.as_secs());
+                state.write().initial_history_fetched = false;
+                let _ = tx.send(ConnectionStatus::PairCode(code.to_string()));
+                async {}
+            }
+        })
+        .on_connected({
+            let tx = tx_status_clone.clone();
+            let state = state_clone.clone();
+            move |client| {
+                let _ = tx.send(ConnectionStatus::Connected);
+                info!("WhatsApp connected!");
+                
+                // Update self JID
+                if let Some(jid) = client.pn().or(client.lid()) {
+                    let mut s = state.write();
+                    s.self_jid = Some(jid);
+                }
+
+                // Trigger background sync for contacts (CriticalUnblockLow, RegularLow, and CriticalBlock)
+                let client_clone = client.clone();
+                let state_clone2 = state.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+                    info!("Triggering AppStateSync for contacts and address book");
+                    let _ = client_clone.process_sync_task(whatsapp_rust::sync_task::MajorSyncTask::AppStateSync {
+                        name: whatsapp_rust::wacore::appstate::patch_decode::WAPatchName::CriticalUnblockLow,
+                        full_sync: true,
+                    }).await;
+                    let _ = client_clone.process_sync_task(whatsapp_rust::sync_task::MajorSyncTask::AppStateSync {
+                        name: whatsapp_rust::wacore::appstate::patch_decode::WAPatchName::RegularLow,
+                        full_sync: true,
+                    }).await;
+                    let _ = client_clone.process_sync_task(whatsapp_rust::sync_task::MajorSyncTask::AppStateSync {
+                        name: whatsapp_rust::wacore::appstate::patch_decode::WAPatchName::CriticalBlock,
+                        full_sync: true,
+                    }).await;
+
+                    let pn_jids: Vec<Jid> = {
+                        let s = state_clone2.read();
+                        s.lid_to_pn.values().cloned().take(50).collect()
+                    };
+                    if !pn_jids.is_empty() {
+                        if let Ok(user_infos) = client_clone.contacts().get_user_info(&pn_jids).await {
+                            let mut s = state_clone2.write();
+                            let mut changed = false;
+                            for (jid, info) in user_infos {
+                                if let Some(vn) = info.verified_name {
+                                    if let Some(vname) = vn.name {
+                                        if crate::util::is_real_name(&vname) {
+                                            let c = s.contacts.entry(jid.clone()).or_insert_with(|| crate::state::Contact::new(jid.clone(), None));
+                                            c.verified_name = Some(vname.clone());
+                                            if c.name.is_none() {
+                                                c.name = Some(vname.clone());
+                                                if let Some(chat) = s.chats.get_mut(&jid) {
+                                                    chat.name = vname;
+                                                }
+                                                changed = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if changed {
+                                s.consolidate_canonical_chats();
+                            }
+                        }
+                    }
+                    crate::avatars::sync_all_avatars(&client_clone, &state_clone2, false).await;
+
+                    info!("Fetching participating groups...");
+                    if let Ok(groups) = client_clone.groups().get_participating().await {
+                        info!("Found {} participating groups", groups.len());
+                        {
+                            let mut s = state_clone2.write();
+                            for (jid, meta) in groups {
+                                let group_name = if !meta.subject.is_empty() {
+                                    meta.subject
+                                } else {
+                                    "Skupinový chat".to_string()
+                                };
+                                let chat = s.get_or_create_chat(jid, group_name, true);
+                                chat.is_group = true;
+                            }
+                            s.consolidate_canonical_chats();
+                        }
+                        let _ = crate::storage::persist_state(&state_clone2).await;
+                    }
+
+                    // Automatically load the first 20 messages from each conversation on first login
+                    auto_fetch_initial_messages(&client_clone, &state_clone2, false).await;
+                });
+
+                async {}
+            }
+        })
+        .on_logged_out({
+            let tx = tx_status_clone.clone();
+            let state = state_clone.clone();
+            move |_| {
+                state.write().initial_history_fetched = false;
+                let _ = tx.send(ConnectionStatus::Disconnected);
+                warn!("Logged out from WhatsApp");
+                async {}
+            }
+        })
+        .on_message({
+            let state = state_clone.clone();
+            let tx_status = tx_status_clone.clone();
+            move |ctx| {
+                let state = state.clone();
+                let tx_status = tx_status.clone();
+                // Clone needed fields to avoid lifetime issues
+                let info = ctx.info.clone();
+                let message = (*ctx.message).clone();
+                let client = ctx.client.clone();
+                async move {
+                    handle_incoming_message(info, message, client, state, tx_status).await;
+                }
+            }
+        })
+        .on_event({
+            let state = state_clone.clone();
+            let tx_status = tx_status_clone.clone();
+            let call_mgr = call_manager_clone.clone();
+            move |event: Arc<Event>, client: Arc<Client>| {
+                let state = state.clone();
+                let tx_status = tx_status.clone();
+                let call_mgr = call_mgr.clone();
+                async move {
+                    handle_event(event, client, state, tx_status, call_mgr).await;
+                }
+            }
+        });
+
+    let bot = builder.build().await?;
+    Ok(bot.spawn())
+}
+
 /// Spawn the backend task
 pub async fn spawn_backend(state: SharedState) -> Result<BackendHandle> {
     let (tx_command, mut rx_command) = mpsc::unbounded_channel::<Command>();
     let (tx_status, rx_status) = watch::channel(ConnectionStatus::Disconnected);
-    
-    let state_clone = state.clone();
     
     // Build the bot
     let db_path = dirs::data_dir()
@@ -355,164 +521,13 @@ pub async fn spawn_backend(state: SharedState) -> Result<BackendHandle> {
         let _ = crate::storage::persist_state(&state).await;
     }
 
-    let store_clone = store.clone();
     let call_manager = Arc::new(CallManager {
         incoming_calls: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         active_handle: tokio::sync::Mutex::new(None),
         mic_tx: tokio::sync::Mutex::new(None),
         video_tx: tokio::sync::Mutex::new(None),
     });
-    let builder = Bot::builder()
-        .with_backend(store)
-        .on_qr_code({
-            let tx = tx_status.clone();
-            let state = state_clone.clone();
-            move |code, timeout| {
-                info!("QR code generated: {} chars, valid for {}s", code.len(), timeout.as_secs());
-                state.write().initial_history_fetched = false;
-                let _ = tx.send(ConnectionStatus::QrCode(code.to_string()));
-                async {}
-            }
-        })
-        .on_pair_code({
-            let tx = tx_status.clone();
-            let state = state_clone.clone();
-            move |code, timeout| {
-                info!("Pair code generated: {}, valid for {}s", code, timeout.as_secs());
-                state.write().initial_history_fetched = false;
-                let _ = tx.send(ConnectionStatus::PairCode(code.to_string()));
-                async {}
-            }
-        })
-        .on_connected({
-            let tx = tx_status.clone();
-            let state = state_clone.clone();
-            move |client| {
-                let _ = tx.send(ConnectionStatus::Connected);
-                info!("WhatsApp connected!");
-                
-                // Update self JID
-                if let Some(jid) = client.pn().or(client.lid()) {
-                    let mut s = state.write();
-                    s.self_jid = Some(jid);
-                }
 
-                // Trigger background sync for contacts (CriticalUnblockLow, RegularLow, and CriticalBlock)
-                let client_clone = client.clone();
-                let state_clone2 = state.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
-                    info!("Triggering AppStateSync for contacts and address book");
-                    let _ = client_clone.process_sync_task(whatsapp_rust::sync_task::MajorSyncTask::AppStateSync {
-                        name: whatsapp_rust::wacore::appstate::patch_decode::WAPatchName::CriticalUnblockLow,
-                        full_sync: true,
-                    }).await;
-                    let _ = client_clone.process_sync_task(whatsapp_rust::sync_task::MajorSyncTask::AppStateSync {
-                        name: whatsapp_rust::wacore::appstate::patch_decode::WAPatchName::RegularLow,
-                        full_sync: true,
-                    }).await;
-                    let _ = client_clone.process_sync_task(whatsapp_rust::sync_task::MajorSyncTask::AppStateSync {
-                        name: whatsapp_rust::wacore::appstate::patch_decode::WAPatchName::CriticalBlock,
-                        full_sync: true,
-                    }).await;
-
-                    let pn_jids: Vec<Jid> = {
-                        let s = state_clone2.read();
-                        s.lid_to_pn.values().cloned().take(50).collect()
-                    };
-                    if !pn_jids.is_empty() {
-                        if let Ok(user_infos) = client_clone.contacts().get_user_info(&pn_jids).await {
-                            let mut s = state_clone2.write();
-                            let mut changed = false;
-                            for (jid, info) in user_infos {
-                                if let Some(vn) = info.verified_name {
-                                    if let Some(vname) = vn.name {
-                                        if crate::util::is_real_name(&vname) {
-                                            let c = s.contacts.entry(jid.clone()).or_insert_with(|| crate::state::Contact::new(jid.clone(), None));
-                                            c.verified_name = Some(vname.clone());
-                                            if c.name.is_none() {
-                                                c.name = Some(vname.clone());
-                                                if let Some(chat) = s.chats.get_mut(&jid) {
-                                                    chat.name = vname;
-                                                }
-                                                changed = true;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            if changed {
-                                s.consolidate_canonical_chats();
-                            }
-                        }
-                    }
-                    crate::avatars::sync_all_avatars(&client_clone, &state_clone2, false).await;
-
-                    info!("Fetching participating groups...");
-                    if let Ok(groups) = client_clone.groups().get_participating().await {
-                        info!("Found {} participating groups", groups.len());
-                        {
-                            let mut s = state_clone2.write();
-                            for (jid, meta) in groups {
-                                let group_name = if !meta.subject.is_empty() {
-                                    meta.subject
-                                } else {
-                                    "Skupinový chat".to_string()
-                                };
-                                let chat = s.get_or_create_chat(jid, group_name, true);
-                                chat.is_group = true;
-                            }
-                            s.consolidate_canonical_chats();
-                        }
-                        let _ = crate::storage::persist_state(&state_clone2).await;
-                    }
-
-                    // Automatically load the first 20 messages from each conversation on first login
-                    auto_fetch_initial_messages(&client_clone, &state_clone2, false).await;
-                });
-
-                async {}
-            }
-        })
-        .on_logged_out({
-            let tx = tx_status.clone();
-            let state = state_clone.clone();
-            move |_| {
-                state.write().initial_history_fetched = false;
-                let _ = tx.send(ConnectionStatus::Disconnected);
-                warn!("Logged out from WhatsApp");
-                async {}
-            }
-        })
-        .on_message({
-            let state = state_clone.clone();
-            let tx_status = tx_status.clone();
-            move |ctx| {
-                let state = state.clone();
-                let tx_status = tx_status.clone();
-                // Clone needed fields to avoid lifetime issues
-                let info = ctx.info.clone();
-                let message = (*ctx.message).clone();
-                let client = ctx.client.clone();
-                async move {
-                    handle_incoming_message(info, message, client, state, tx_status).await;
-                }
-            }
-        })
-        .on_event({
-            let state = state_clone.clone();
-            let tx_status = tx_status.clone();
-            let call_mgr = call_manager.clone();
-            move |event: Arc<Event>, client: Arc<Client>| {
-                let state = state.clone();
-                let tx_status = tx_status.clone();
-                let call_mgr = call_mgr.clone();
-                async move {
-                    handle_event(event, client, state, tx_status, call_mgr).await;
-                }
-            }
-        });
-    
     // Log status transitions for debugging
     let mut rx_status_log = tx_status.subscribe();
     tokio::spawn(async move {
@@ -522,21 +537,29 @@ pub async fn spawn_backend(state: SharedState) -> Result<BackendHandle> {
         }
     });
 
-    let bot = builder.build().await?;
-    let bot_handle = bot.spawn();
-    let client = bot_handle.client();
+    let bot_handle = create_and_spawn_bot(&db_path_str, &state, &tx_status, &call_manager).await?;
+    let active_client = Arc::new(tokio::sync::RwLock::new(bot_handle.client()));
     let bot_handle_arc = Arc::new(tokio::sync::Mutex::new(Some(bot_handle)));
     
     // Spawn command handler
-    let client_for_cmds = client.clone();
+    let active_client_cmds = active_client.clone();
+    let bot_handle_cmds = bot_handle_arc.clone();
     let state_for_cmds = state.clone();
     let tx_status_for_cmds = tx_status.clone();
-    let store_for_cmds = store_clone.clone();
     let call_mgr_for_cmds = call_manager.clone();
+    let db_path_for_cmds = db_path_str.clone();
     
     tokio::spawn(async move {
         while let Some(cmd) = rx_command.recv().await {
-            if let Err(e) = handle_command(cmd, &client_for_cmds, &state_for_cmds, &tx_status_for_cmds, &store_for_cmds, &call_mgr_for_cmds).await {
+            if let Err(e) = handle_command(
+                cmd,
+                &active_client_cmds,
+                &bot_handle_cmds,
+                &db_path_for_cmds,
+                &state_for_cmds,
+                &tx_status_for_cmds,
+                &call_mgr_for_cmds,
+            ).await {
                 error!("Command handling error: {}", e);
             }
         }
@@ -556,7 +579,7 @@ pub async fn spawn_backend(state: SharedState) -> Result<BackendHandle> {
 
     // Periodic scheduled message dispatcher
     let state_for_scheduled = state.clone();
-    let client_for_scheduled = client.clone();
+    let active_client_sched = active_client.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
@@ -577,9 +600,10 @@ pub async fn spawn_backend(state: SharedState) -> Result<BackendHandle> {
             for (id, to, text) in due_items {
                 info!("Sending scheduled message {} to {}", id, to);
                 let wa_msg = wa::Message::text(text.clone());
-                match client_for_scheduled.send_message(to.clone(), wa_msg).await {
+                let client_now = active_client_sched.read().await.clone();
+                match client_now.send_message(to.clone(), wa_msg).await {
                     Ok(res) => {
-                        let sender = client_for_scheduled.pn().or(client_for_scheduled.lid()).unwrap_or_else(|| to.clone());
+                        let sender = client_now.pn().or(client_now.lid()).unwrap_or_else(|| to.clone());
                         let sent_msg = Message::new_text(
                             res.message_id,
                             to.clone(),
@@ -1657,12 +1681,14 @@ async fn handle_event(
 
 async fn handle_command(
     cmd: Command,
-    client: &Arc<Client>,
+    active_client: &Arc<tokio::sync::RwLock<Arc<Client>>>,
+    bot_handle_arc: &Arc<tokio::sync::Mutex<Option<whatsapp_rust::bot::BotHandle>>>,
+    db_path_str: &str,
     state: &SharedState,
     tx_status: &watch::Sender<ConnectionStatus>,
-    store: &SqliteStore,
     call_manager: &Arc<CallManager>,
 ) -> Result<()> {
+    let client = active_client.read().await.clone();
     match cmd {
         Command::DismissSyncing => {
             let _ = tx_status.send(ConnectionStatus::Connected);
@@ -2681,14 +2707,16 @@ async fn handle_command(
         Command::RefreshChats => {
             let client = client.clone();
             let state_clone = state.clone();
-            let store = store.clone();
+            let db_path_str = db_path_str.to_string();
             tokio::spawn(async move {
                 info!("Refreshing chats and resetting app state sync versions to force fresh snapshot");
-                use whatsapp_rust::wacore::store::traits::AppSyncStore;
-                let _ = store.clear_mutation_macs("critical_unblock_low").await;
-                let _ = store.set_version("critical_unblock_low", whatsapp_rust::wacore::appstate::hash::HashState::default()).await;
-                let _ = store.clear_mutation_macs("regular_low").await;
-                let _ = store.set_version("regular_low", whatsapp_rust::wacore::appstate::hash::HashState::default()).await;
+                if let Ok(store) = SqliteStore::new(&db_path_str).await {
+                    use whatsapp_rust::wacore::store::traits::AppSyncStore;
+                    let _ = store.clear_mutation_macs("critical_unblock_low").await;
+                    let _ = store.set_version("critical_unblock_low", whatsapp_rust::wacore::appstate::hash::HashState::default()).await;
+                    let _ = store.clear_mutation_macs("regular_low").await;
+                    let _ = store.set_version("regular_low", whatsapp_rust::wacore::appstate::hash::HashState::default()).await;
+                }
 
                 let _ = client.process_sync_task(whatsapp_rust::sync_task::MajorSyncTask::AppStateSync {
                     name: whatsapp_rust::wacore::appstate::patch_decode::WAPatchName::CriticalUnblockLow,
@@ -2768,7 +2796,74 @@ async fn handle_command(
         }
         
         Command::Disconnect => {
-            info!("Disconnect requested");
+            info!("Logout requested: deregistering companion session...");
+            let client = client.clone();
+            let bot_handle_arc = bot_handle_arc.clone();
+            let db_path_str = db_path_str.to_string();
+            let state = state.clone();
+            let tx_status = tx_status.clone();
+            let call_manager = call_manager.clone();
+            let active_client = active_client.clone();
+
+            tokio::spawn(async move {
+                // 1. Send logout IQ to WhatsApp servers so primary phone unlinks companion
+                info!("Sending logout IQ to WhatsApp server...");
+                client.logout().await;
+
+                // 2. Abort running bot instance so file locks and network connections are released
+                if let Some(h) = bot_handle_arc.lock().await.take() {
+                    h.abort();
+                }
+
+                // 3. Small pause to ensure background socket & DB handles are dropped
+                tokio::time::sleep(Duration::from_millis(400)).await;
+
+                // 4. Delete SQLite database files
+                let db_path = std::path::PathBuf::from(&db_path_str);
+                let _ = std::fs::remove_file(&db_path);
+                let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+                let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+
+                // 5. Delete cached UI state
+                let ui_state_path = dirs::data_dir()
+                    .unwrap_or_else(|| std::env::current_dir().unwrap())
+                    .join("warust")
+                    .join("ui_state.json");
+                let _ = std::fs::remove_file(&ui_state_path);
+
+                // 6. Reset in-memory state
+                {
+                    let mut s = state.write();
+                    s.self_jid = None;
+                    s.self_name = None;
+                    s.chats.clear();
+                    s.messages.clear();
+                    s.contacts.clear();
+                    s.lid_to_pn.clear();
+                    s.selected_chat = None;
+                    s.initial_history_fetched = false;
+                    s.connection = ConnectionStatus::Connecting;
+                    s.dirty = false;
+                }
+                let _ = tx_status.send(ConnectionStatus::Connecting);
+
+                // 7. Spawn fresh bot instance with clean DB to generate new pairing QR code
+                match create_and_spawn_bot(
+                    &db_path_str,
+                    &state,
+                    &tx_status,
+                    &call_manager,
+                ).await {
+                    Ok(new_handle) => {
+                        *active_client.write().await = new_handle.client();
+                        *bot_handle_arc.lock().await = Some(new_handle);
+                        info!("Fresh bot spawned after logout; waiting for new pairing QR code");
+                    }
+                    Err(e) => {
+                        error!("Failed to spawn fresh bot after logout: {}", e);
+                    }
+                }
+            });
         }
         
         Command::Shutdown => {
