@@ -64,13 +64,21 @@ fn show_chat_view(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Chat, 
     
     ui.separator();
     
-    // Messages area
-    show_messages_area(ui, state, chat, messages, chat_jid, backend);
-    
-    ui.separator();
-    
-    // Composer
-    show_composer(ui, state, chat_jid, backend);
+    // Bottom-up layout pins composer to the absolute bottom of the window (no empty gap)
+    ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                show_composer(ui, state, chat_jid, backend);
+            },
+        );
+        ui.separator();
+        
+        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+            show_messages_area(ui, state, chat, messages, chat_jid, backend);
+        });
+    });
 }
 
 fn show_chat_header(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Chat, backend: &crate::backend::BackendHandle) {
@@ -223,7 +231,7 @@ fn show_chat_header(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Chat
 }
 
 fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Chat, messages: &[Message], chat_jid: &Jid, backend: &crate::backend::BackendHandle) {
-    let available_height = ui.available_height() - 130.0; // Reserve space for composer
+    let available_height = ui.available_height();
     
     // Check if we should auto-scroll to bottom
     let should_scroll_to_bottom = state.auto_scroll_to_bottom;

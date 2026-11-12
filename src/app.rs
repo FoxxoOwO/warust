@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use anyhow::Result;
-use egui::{CentralPanel, FontId, Panel, RichText, Ui};
+use egui::{CentralPanel, Color32, FontId, Panel, RichText, Ui};
 use parking_lot::RwLock;
 use tracing::info;
 
@@ -176,9 +176,11 @@ impl eframe::App for WarustApp {
                     chat_list::show_chat_list(ui, &self.state, self.backend());
                 });
             
-            CentralPanel::default().show(ui, |ui| {
-                conversation::show_conversation(ui, &self.state, self.backend());
-            });
+            CentralPanel::default()
+                .frame(egui::Frame::new().fill(Color32::from_rgb(0x11, 0x1B, 0x21)))
+                .show(ui, |ui| {
+                    conversation::show_conversation(ui, &self.state, self.backend());
+                });
         }
         
         // Settings window

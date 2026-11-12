@@ -68,6 +68,14 @@ pub fn setup_theme(ctx: &egui::Context) {
 
     #[cfg(windows)]
     {
+        if let Ok(data) = std::fs::read(r"C:\Windows\Fonts\seguiemj.ttf") {
+            fonts.font_data.insert(
+                "segoe_emoji".into(),
+                Arc::new(FontData::from_owned(data)),
+            );
+            fonts.families.get_mut(&FontFamily::Proportional).unwrap().push("segoe_emoji".into());
+            fonts.families.get_mut(&FontFamily::Monospace).unwrap().push("segoe_emoji".into());
+        }
         if let Ok(data) = std::fs::read(r"C:\Windows\Fonts\seguisym.ttf") {
             fonts.font_data.insert(
                 "segoe_symbol".into(),
@@ -76,13 +84,36 @@ pub fn setup_theme(ctx: &egui::Context) {
             fonts.families.get_mut(&FontFamily::Proportional).unwrap().push("segoe_symbol".into());
             fonts.families.get_mut(&FontFamily::Monospace).unwrap().push("segoe_symbol".into());
         }
-        if let Ok(data) = std::fs::read(r"C:\Windows\Fonts\seguiemj.ttf") {
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(data) = std::fs::read("/System/Library/Fonts/Apple Color Emoji.ttc") {
             fonts.font_data.insert(
-                "segoe_emoji".into(),
+                "apple_color_emoji".into(),
                 Arc::new(FontData::from_owned(data)),
             );
-            fonts.families.get_mut(&FontFamily::Proportional).unwrap().push("segoe_emoji".into());
-            fonts.families.get_mut(&FontFamily::Monospace).unwrap().push("segoe_emoji".into());
+            fonts.families.get_mut(&FontFamily::Proportional).unwrap().push("apple_color_emoji".into());
+            fonts.families.get_mut(&FontFamily::Monospace).unwrap().push("apple_color_emoji".into());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        for path in [
+            "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+            "/usr/share/fonts/google-noto-color-emoji/NotoColorEmoji.ttf",
+            "/usr/share/fonts/noto-color-emoji/NotoColorEmoji.ttf",
+        ] {
+            if let Ok(data) = std::fs::read(path) {
+                fonts.font_data.insert(
+                    "noto_color_emoji".into(),
+                    Arc::new(FontData::from_owned(data)),
+                );
+                fonts.families.get_mut(&FontFamily::Proportional).unwrap().push("noto_color_emoji".into());
+                fonts.families.get_mut(&FontFamily::Monospace).unwrap().push("noto_color_emoji".into());
+                break;
+            }
         }
     }
 
