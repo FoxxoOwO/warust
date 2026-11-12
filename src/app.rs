@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use anyhow::Result;
-use egui::{Align, CentralPanel, Color32, FontId, Layout, Panel, ProgressBar, RichText, Ui};
+use egui::{CentralPanel, FontId, Panel, RichText, Ui};
 use parking_lot::RwLock;
 use tracing::info;
 
@@ -202,36 +202,7 @@ impl eframe::App for WarustApp {
             crate::ui::call_dialog::show_call_overlay(ctx, &self.state, backend);
         }
 
-        // Floating history sync popup toast - non-intrusive, never replaces conversations!
-        if let ConnectionStatus::Syncing(progress) = self.state.read().connection {
-            let progress_f = (progress as f32 / 100.0).clamp(0.05, 1.0);
-            let ctx = ui.ctx();
-            egui::Window::new("🔄 Synchronizace historie")
-                .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-20.0, -20.0))
-                .resizable(false)
-                .collapsible(false)
-                .title_bar(true)
-                .fixed_size(egui::vec2(280.0, 70.0))
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!("Stahování historie zpráv... ({}%)", progress))
-                                .font(FontId::proportional(12.0))
-                                .color(Color32::from_rgb(0xD1, 0xD7, 0xDB)),
-                        );
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.small_button("✕").on_hover_text("Skrýt").clicked() {
-                                if let Some(backend) = self.backend.as_ref() {
-                                    let _ = backend.send_command(crate::commands::Command::DismissSyncing);
-                                }
-                            }
-                        });
-                    });
-                    ui.add_space(4.0);
-                    ui.add(ProgressBar::new(progress_f).show_percentage().desired_width(260.0));
-                });
-        }
-        
+        // Sync runs quietly on the background without any popup toast
         // Request repaint for animations
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
     }

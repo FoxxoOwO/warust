@@ -1,6 +1,6 @@
 //! QR Pairing Screen
 
-use egui::{Color32, FontId, ProgressBar, RichText, Ui, Vec2, TextEdit};
+use egui::{Color32, FontId, RichText, Ui, Vec2, TextEdit};
 use qrcode::QrCode;
 use image::Luma;
 
@@ -132,17 +132,12 @@ pub fn show_qr_pairing(ui: &mut Ui, state: &SharedState, backend: &BackendHandle
             });
         }
         
-        ConnectionStatus::Syncing(progress) => {
-            let progress_f = (*progress as f32 / 100.0).clamp(0.08, 1.0);
+        ConnectionStatus::Syncing(_) => {
             ui.vertical_centered(|ui| {
                 ui.add_space(100.0);
-                ui.label("Syncing chat history...");
+                ui.spinner();
                 ui.add_space(16.0);
-                ui.add(ProgressBar::new(progress_f).show_percentage().desired_width(300.0));
-                ui.add_space(16.0);
-                if ui.button("Continue to chats").clicked() {
-                    let _ = backend.send_command(crate::commands::Command::DismissSyncing);
-                }
+                ui.label(RichText::new("Dokončování přihlášení...").font(FontId::proportional(20.0)).strong());
             });
         }
         
