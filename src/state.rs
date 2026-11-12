@@ -534,7 +534,7 @@ impl AppState {
             is_archived: false,
             is_pinned: false,
             mute_until: None,
-            last_activity: Utc::now(),
+            last_activity: chrono::DateTime::<Utc>::UNIX_EPOCH,
             participants: HashSet::new(),
             is_typing: false,
             typing_until: None,
@@ -772,7 +772,33 @@ impl AppState {
             }
         }
 
-        // 5. Update names of all 1-on-1 chats if a human display name is available
+        // 5. Recompute last_message and last_activity for ALL chats from their messages or existing preview
+        let lid_map = self.lid_to_pn.clone();
+        for (chat_jid, chat) in self.chats.iter_mut() {
+            let canon = if chat.is_group {
+                chat_jid.clone()
+            } else {
+                lid_map.get(chat_jid).cloned().unwrap_or_else(|| chat_jid.clone())
+            };
+            if let Some(msgs) = self.messages.get(&canon) {
+                if let Some(latest) = msgs.iter().rev().find(|m| !is_reaction_only(&m.text)) {
+                    chat.last_message = Some(MessagePreview {
+                        text: latest.text.clone(),
+                        timestamp: latest.timestamp,
+                        from_me: latest.from_me,
+                        status: latest.status,
+                        media_type: latest.media_type,
+                    });
+                    chat.last_activity = latest.timestamp;
+                } else if let Some(last_any) = msgs.last() {
+                    chat.last_activity = last_any.timestamp;
+                }
+            } else if let Some(lm) = &chat.last_message {
+                chat.last_activity = lm.timestamp;
+            }
+        }
+
+        // 6. Update names of all 1-on-1 chats if a human display name is available
         let updates: Vec<(Jid, String)> = self.chats.iter()
             .filter_map(|(jid, chat)| {
                 if !chat.is_group {
@@ -826,12 +852,19 @@ impl AppState {
             });
         }
         
-        // Sort: pinned first, then by last activity
+        // Sort: pinned first, then by last activity (newest first)
         chats.sort_by(|a, b| {
             match (a.is_pinned, b.is_pinned) {
                 (true, false) => std::cmp::Ordering::Less,
                 (false, true) => std::cmp::Ordering::Greater,
-                _ => b.last_activity.cmp(&a.last_activity),
+                _ => {
+                    let ts_a = a.last_message.as_ref().map(|m| m.timestamp).unwrap_or(a.last_activity);
+                    let ts_b = b.last_message.as_ref().map(|m| m.timestamp).unwrap_or(b.last_activity);
+                    match ts_b.cmp(&ts_a) {
+                        std::cmp::Ordering::Equal => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                        other => other,
+                    }
+                }
             }
         });
         
@@ -1027,7 +1060,7 @@ mod tests {
             is_archived: false,
             is_pinned: false,
             mute_until: None,
-            last_activity: Utc::now(),
+            last_activity: chrono::DateTime::<Utc>::UNIX_EPOCH,
             participants: HashSet::new(),
             is_typing: false,
             typing_until: None,
@@ -1204,5 +1237,94 @@ mod tests {
             call.ended_at = Some(Utc::now());
         }
         assert_eq!(state.active_call.as_ref().unwrap().status, CallStatus::Ended("Hovor ukončen".into()));
+    }
+
+    #[test]
+    fn test_chat_sorting_order() {
+        let mut state = AppState::new();
+        let jid_petr = "420111111111@s.whatsapp.net".parse::<Jid>().unwrap();
+        let jid_aliexpress = "420222222222@s.whatsapp.net".parse::<Jid>().unwrap();
+        let jid_vojta = "420333333333@s.whatsapp.net".parse::<Jid>().unwrap();
+        let jid_empty = "420444444444@s.whatsapp.net".parse::<Jid>().unwrap();
+
+        let base_time = chrono::DateTime::from_timestamp(1700000000, 0).unwrap();
+
+        // Chat Petr: pinned, message at base_time + 100
+        state.get_or_create_chat(jid_petr.clone(), "Petr".into(), false);
+        state.chats.get_mut(&jid_petr).unwrap().is_pinned = true;
+        state.add_message(Message::new_text(
+            "m1".into(),
+            jid_petr.clone(),
+            jid_petr.clone(),
+            "Ahoj".into(),
+            base_time + chrono::Duration::seconds(100),
+            false,
+            MessageStatus::Read,
+            None,
+            None,
+        ));
+
+        // Chat AliExpress: unpinned, message at base_time + 200 (newer than Petr, but Petr is pinned!)
+        state.get_or_create_chat(jid_aliexpress.clone(), "AliExpress".into(), false);
+        state.add_message(Message::new_text(
+            "m2".into(),
+            jid_aliexpress.clone(),
+            jid_aliexpress.clone(),
+            "Objednavka".into(),
+            base_time + chrono::Duration::seconds(200),
+            false,
+            MessageStatus::Read,
+            None,
+            None,
+        ));
+
+        // Chat Vojta: unpinned, message at base_time + 50 (older than AliExpress)
+        state.get_or_create_chat(jid_vojta.clone(), "Vojta".into(), false);
+        state.add_message(Message::new_text(
+            "m3".into(),
+            jid_vojta.clone(),
+            jid_vojta.clone(),
+            "Cau".into(),
+            base_time + chrono::Duration::seconds(50),
+            false,
+            MessageStatus::Read,
+            None,
+            None,
+        ));
+
+        // Chat Empty: unpinned, no messages (should be at the very bottom)
+        state.get_or_create_chat(jid_empty.clone(), "Empty Contact".into(), false);
+
+        state.consolidate_canonical_chats();
+        let chats = state.filtered_chats();
+
+        // 1. Petr (pinned) MUST be first
+        assert_eq!(chats[0].name, "Petr");
+        // 2. AliExpress (newer message) MUST be second
+        assert_eq!(chats[1].name, "AliExpress");
+        // 3. Vojta (older message) MUST be third
+        assert_eq!(chats[2].name, "Vojta");
+        // 4. Empty contact (no messages) MUST be last
+        assert_eq!(chats[3].name, "Empty Contact");
+
+        // Now Vojta sends a new message at base_time + 300 -> Vojta must jump above AliExpress!
+        state.add_message(Message::new_text(
+            "m4".into(),
+            jid_vojta.clone(),
+            jid_vojta.clone(),
+            "Nova zprava".into(),
+            base_time + chrono::Duration::seconds(300),
+            false,
+            MessageStatus::Read,
+            None,
+            None,
+        ));
+        state.consolidate_canonical_chats();
+        let updated = state.filtered_chats();
+
+        assert_eq!(updated[0].name, "Petr"); // still pinned
+        assert_eq!(updated[1].name, "Vojta"); // now newer than AliExpress!
+        assert_eq!(updated[2].name, "AliExpress");
+        assert_eq!(updated[3].name, "Empty Contact");
     }
 }

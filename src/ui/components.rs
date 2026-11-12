@@ -184,8 +184,17 @@ impl<'a> Widget for ChatItem<'a> {
                 Color32::WHITE,
             );
             
-            if let Some(preview) = &self.chat.last_message {
-                let time_str = format_timestamp(preview.timestamp);
+            let display_ts = self.chat.last_message.as_ref().map(|m| m.timestamp)
+                .or_else(|| {
+                    if self.chat.last_activity > chrono::DateTime::<chrono::Utc>::UNIX_EPOCH {
+                        Some(self.chat.last_activity)
+                    } else {
+                        None
+                    }
+                });
+
+            if let Some(ts) = display_ts {
+                let time_str = format_timestamp(ts);
                 painter.text(
                     egui::pos2(rect.max.x - padding, time_y),
                     egui::Align2::RIGHT_TOP,
@@ -301,11 +310,16 @@ impl<'a> Widget for ChatItem<'a> {
             
             // Pinned icon
             if self.chat.is_pinned {
+                let pin_x = if self.chat.unread_count > 0 {
+                    rect.max.x - padding - 28.0
+                } else {
+                    rect.max.x - padding
+                };
                 painter.text(
-                    egui::pos2(text_x - 20.0, rect.center().y),
-                    egui::Align2::LEFT_CENTER,
+                    egui::pos2(pin_x, preview_y + 2.0),
+                    egui::Align2::RIGHT_TOP,
                     "📌",
-                    FontId::proportional(16.0),
+                    FontId::proportional(13.0),
                     chat_list::PINNED_ICON,
                 );
             }

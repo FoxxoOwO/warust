@@ -949,7 +949,16 @@ async fn handle_event(
             {
                 let mut batch_messages = Vec::new();
                 let mut new_reactions = Vec::new();
-                let mut new_chats = Vec::new();
+                struct HistoryChatSyncInfo {
+                    jid: Jid,
+                    name: String,
+                    is_group: bool,
+                    timestamp: Option<chrono::DateTime<chrono::Utc>>,
+                    is_pinned: bool,
+                    unread_count: u32,
+                    is_archived: bool,
+                }
+                let mut new_chats: Vec<HistoryChatSyncInfo> = Vec::new();
                 let mut new_mappings = Vec::new();
                 let mut new_contacts = Vec::new();
                 let mut new_pushnames = Vec::new();
@@ -1041,7 +1050,22 @@ async fn handle_event(
                         new_contacts.push((chat_jid.clone(), chat_name.clone()));
                     }
 
-                    new_chats.push((chat_jid.clone(), chat_name, is_group));
+                    let conv_ts = conv.last_msg_timestamp
+                        .or(conv.conversation_timestamp)
+                        .and_then(|ts| chrono::DateTime::from_timestamp(ts as i64, 0));
+                    let is_pinned = conv.pinned.unwrap_or(0) > 0;
+                    let unread_count = conv.unread_count.unwrap_or(0);
+                    let is_archived = conv.archived.unwrap_or(false);
+
+                    new_chats.push(HistoryChatSyncInfo {
+                        jid: chat_jid.clone(),
+                        name: chat_name,
+                        is_group,
+                        timestamp: conv_ts,
+                        is_pinned,
+                        unread_count,
+                        is_archived,
+                    });
                     
                     for msg in &conv.messages {
                         // msg.message is MessageField<WebMessageInfo>
@@ -1184,9 +1208,23 @@ async fn handle_event(
                             c.name = Some(pn);
                         }
                     }
-                    for (jid, name, is_group) in new_chats {
-                        let resolved_name = s.resolve_display_name(&jid).unwrap_or(name);
-                        s.get_or_create_chat(jid, resolved_name, is_group);
+                    for item in new_chats {
+                        let resolved_name = s.resolve_display_name(&item.jid).unwrap_or(item.name);
+                        let chat = s.get_or_create_chat(item.jid, resolved_name, item.is_group);
+                        if item.is_pinned {
+                            chat.is_pinned = true;
+                        }
+                        if item.is_archived {
+                            chat.is_archived = true;
+                        }
+                        if item.unread_count > 0 {
+                            chat.unread_count = item.unread_count;
+                        }
+                        if let Some(ts) = item.timestamp {
+                            if ts > chat.last_activity {
+                                chat.last_activity = ts;
+                            }
+                        }
                     }
                     s.add_messages_batch(batch_messages);
                     for (chat_jid, target_id, sender, emoji) in new_reactions {
