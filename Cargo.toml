@@ -26,7 +26,7 @@ whatsapp-rust = { version = "0.7.0", default-features = false, features = [
 ] }
 
 # --- UI ---
-eframe = { version = "0.37", default-features = false, features = ["wgpu", "persistence", "glow"] }
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "persistence", "glow", "x11", "wayland"] }
 egui = "0.37"
 egui_extras = "0.37"
 epaint = { version = "0.37", features = ["color_fonts"] }

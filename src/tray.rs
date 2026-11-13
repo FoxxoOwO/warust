@@ -19,7 +19,11 @@ impl SystemTray {
     pub fn new() -> Result<Self, tray_item::TIError> {
         let (tx, rx) = channel::<TrayMessage>();
 
-        let icon = IconSource::Resource("app-icon");
+        // `build.rs` embeds assets/app-icon.ico through `winres::set_icon`, which
+        // writes it into the .rc as `1 ICON "..."` - a numeric resource ID, not a
+        // name. LoadImageW only resolves numeric IDs when they are written as
+        // "#<id>", otherwise it reports ERROR_RESOURCE_NAME_NOT_FOUND (1812).
+        let icon = IconSource::Resource("#1");
         let mut tray = TrayItem::new("Warust", icon)?;
 
         let tx_show = tx.clone();

@@ -43,6 +43,8 @@ Designed as a high-performance alternative to resource-heavy Electron applicatio
 
 ### Rich Media & Attachments
 * **Images & Photos**: Embedded previews with asynchronous thumbnail caching and full-resolution view.
+* **Video Playback**: In-app player in the chat bubble - the message is decoded by ffmpeg and streamed as frames, with its audio track played alongside, a pause/resume toggle and a scrubbable timeline showing position and total length.
+* **Voice Notes & Audio**: In-app playback with waveform progress and seek support. WhatsApp's Opus voice notes are transcoded through ffmpeg (no native Opus build step needed).
 * **Videos, Documents & Voice Notes**: File transfer, inline indicators, and caption rendering.
 * **Profile Avatars**: Background fetching and caching of user and group profile pictures.
 
@@ -108,6 +110,15 @@ Warust utilizes a decoupled client-server architecture inside a single native bi
 
 * [Rust 1.80+](https://rustup.rs/) (stable toolchain)
 * Operating System: Windows 10/11, Linux, or macOS
+* [ffmpeg](https://ffmpeg.org/) for audio/video playback (WhatsApp voice notes are Opus, and video needs a decoder; there is no pure-Rust fallback).
+
+  **Release bundles already include `ffmpeg` and `ffprobe` next to the executable** - nothing to install. The app looks for them in this order:
+
+  1. `WARUST_FFMPEG` / `WARUST_FFPROBE` environment variables
+  2. a sibling binary in the same directory as `warust` (how the releases ship)
+  3. `ffmpeg` / `ffprobe` on `PATH`
+
+  Without ffmpeg the app still runs, but voice notes and videos fall back to the system player.
 
 ### Installation & Build
 

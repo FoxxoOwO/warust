@@ -6,6 +6,8 @@
 
 mod app;
 pub mod notifications;
+pub mod audio;
+pub mod video;
 pub mod autostart;
 mod backend;
 mod commands;
@@ -50,6 +52,9 @@ fn main() -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(1500));
         return Ok(());
     }
+    // Resolve ffmpeg once up front so the log states which binary will be used
+    // (bundled next to the exe, or found on PATH) before any media is played.
+    crate::audio::ffmpeg_available();
 
     let start_in_tray = std::env::args().any(|a| a == "--tray" || a == "--minimized");
 

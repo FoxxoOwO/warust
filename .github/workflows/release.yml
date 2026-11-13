@@ -31,10 +31,12 @@ jobs:
             asset_suffix: linux-x86_64.tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
+            ffmpeg_arch: arm64
             artifact_name: warust
             asset_suffix: macos-arm64.tar.gz
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
+            ffmpeg_arch: amd64
             artifact_name: warust
             asset_suffix: macos-x86_64.tar.gz
 
@@ -55,23 +57,97 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config libasound2-dev libx11-dev libxext-dev libxrandr-dev libxi-dev libxcursor-dev libvulkan-dev
+          sudo apt-get install -y libssl-dev pkg-config libasound2-dev libxkbcommon-dev libx11-dev libxext-dev libxrandr-dev libxi-dev libxcursor-dev libvulkan-dev
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
+
+      # --- ffmpeg -------------------------------------------------------------
+      # Voice notes are Opus and video needs a decoder; there is no pure-Rust
+      # fallback, so every bundle ships static ffmpeg + ffprobe next to the
+      # executable (the app prefers siblings over PATH - see audio.rs).
+
+      - name: Bundle ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o ffmpeg.zip \
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+          unzip -q ffmpeg.zip
+          bin=$(dirname "$(find . -name ffmpeg.exe -print -quit)")
+          dest="target/${{ matrix.target }}/release"
+          cp "$bin/ffmpeg.exe" "$bin/ffprobe.exe" "$dest/"
+
+      - name: Bundle ffmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o ffmpeg.tar.xz \
+            "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+          tar -xf ffmpeg.tar.xz
+          bin=$(dirname "$(find . -name ffmpeg -type f -print -quit)")
+          install -m 755 "$bin/ffmpeg" "$bin/ffprobe" "target/${{ matrix.target }}/release/"
+
+      - name: Bundle ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          arch="${{ matrix.ffmpeg_arch }}"
+          for tool in ffmpeg ffprobe; do
+            curl -fsSL --retry 3 -L -o "$tool.zip" \
+              "https://ffmpeg.martin-riedl.de/redirect/latest/macos/${arch}/release/${tool}.zip"
+            unzip -q -o "$tool.zip" -d "$tool-dir"
+            install -m 755 "$tool-dir/$tool" "target/${{ matrix.target }}/release/$tool"
+          done
+          chmod +x "target/${{ matrix.target }}/release/ffmpeg" "target/${{ matrix.target }}/release/ffprobe"
+
+      - name: Verify bundled ffmpeg
+        shell: bash
+        run: |
+          set -euo pipefail
+          dest="target/${{ matrix.target }}/release"
+          exe=""
+          [ -f "$dest/warust.exe" ] && exe=".exe"
+          "$dest/ffmpeg$exe" -version | head -n 1
+          "$dest/ffprobe$exe" -version | head -n 1
+
+      # --- packaging ----------------------------------------------------------
+
+      - name: Write third-party notice
+        shell: bash
+        run: |
+          cat > target/${{ matrix.target }}/release/FFMPEG-NOTICE.txt <<'EOF'
+          This package bundles ffmpeg and ffprobe.
+
+          ffmpeg is licensed under the GNU Lesser General Public License (LGPL)
+          version 2.1 or later, and in some builds the GNU General Public License
+          (GPL). It is an independent executable invoked as a separate process,
+          not linked into Warust.
+
+          Source code: https://ffmpeg.org/download.html
+          License:     https://ffmpeg.org/legal.html
+
+          Prebuilt binaries are obtained from:
+            Windows: https://github.com/BtbN/FFmpeg-Builds
+            Linux:   https://johnvansickle.com/ffmpeg/
+            macOS:   https://ffmpeg.martin-riedl.de/
+          EOF
 
       - name: Package Windows artifact
         if: runner.os == 'Windows'
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          7z a "../../../warust-${VERSION}-${{ matrix.asset_suffix }}" ${{ matrix.artifact_name }}
+          7z a "../../../warust-${VERSION}-${{ matrix.asset_suffix }}" \
+            ${{ matrix.artifact_name }} ffmpeg.exe ffprobe.exe FFMPEG-NOTICE.txt
 
       - name: Package Unix artifact
         if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          tar -czvf "../../../warust-${VERSION}-${{ matrix.asset_suffix }}" ${{ matrix.artifact_name }}
+          tar -czvf "../../../warust-${VERSION}-${{ matrix.asset_suffix }}" \
+            ${{ matrix.artifact_name }} ffmpeg ffprobe FFMPEG-NOTICE.txt
 
       - name: Upload artifact to GitHub Release
         uses: softprops/action-gh-release@v2

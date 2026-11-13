@@ -107,6 +107,12 @@ pub fn format_file_size(bytes: u64) -> String {
     }
 }
 
+/// Surface an audio playback failure (missing codec, no output device, ...).
+pub fn report_playback_error(ctx: &egui::Context, message: String) {
+    crate::audio::set_error(message);
+    ctx.request_repaint();
+}
+
 /// Open a media file in the default system viewer
 pub fn open_file(path: &Path) {
     #[cfg(windows)]
