@@ -96,6 +96,9 @@ pub struct Message {
     pub status: MessageStatus,
     pub reply_to: Option<String>,
     pub ephemeral_expiration: Option<u32>,
+    /// Set once the sender edits the message after it was sent.
+    #[serde(default)]
+    pub edited: bool,
     #[serde(default)]
     pub reactions: Vec<Reaction>,
     // Media fields
@@ -133,6 +136,7 @@ impl Message {
             status,
             reply_to,
             ephemeral_expiration,
+            edited: false,
             reactions: Vec::new(),
             media_type: None,
             media_path: None,
@@ -325,6 +329,8 @@ pub struct AppState {
     pub auto_scroll_to_bottom: bool,
     pub composer_text: String,
     pub replying_to: Option<Message>,
+    /// Id of the own message currently being edited in the composer.
+    pub editing_message: Option<String>,
     pub pair_phone_number: String,
     pub show_new_chat_dialog: bool,
     pub new_chat_input: String,
@@ -401,6 +407,7 @@ impl Default for AppState {
             auto_scroll_to_bottom: true,
             composer_text: String::new(),
             replying_to: None,
+            editing_message: None,
             pair_phone_number: String::new(),
             show_new_chat_dialog: false,
             new_chat_input: String::new(),
@@ -934,6 +941,72 @@ impl AppState {
         false
     }
 
+    /// Apply an edit to an already-stored message.
+    ///
+    /// WhatsApp keeps the original timestamp and id for an edit, so only the
+    /// body and the `edited` marker change. Returns false when the target is not
+    /// in the local store (e.g. it predates this install).
+    pub fn apply_edit(&mut self, chat_jid: &Jid, target_msg_id: &str, new_text: &str) -> bool {
+        let canon_chat = self.canonical_jid(chat_jid);
+        let applied = match self.messages.get_mut(&canon_chat) {
+            Some(msgs) => match msgs.iter_mut().find(|m| m.id == target_msg_id) {
+                Some(msg) => {
+                    msg.text = new_text.to_string();
+                    msg.edited = true;
+                    true
+                }
+                None => false,
+            },
+            None => false,
+        };
+        if applied {
+            self.dirty = true;
+            self.refresh_preview(&canon_chat);
+        }
+        applied
+    }
+
+    /// Rebuild a chat's list preview (and its LID alias) from the newest
+    /// non-reaction message.
+    fn refresh_preview(&mut self, canon_chat: &Jid) {
+        let latest = match self
+            .messages
+            .get(canon_chat)
+            .and_then(|msgs| msgs.iter().rev().find(|m| !is_reaction_only(&m.text)))
+        {
+            Some(latest) => latest.clone(),
+            None => return,
+        };
+        let preview = MessagePreview {
+            text: latest.text.clone(),
+            timestamp: latest.timestamp,
+            from_me: latest.from_me,
+            status: latest.status,
+            media_type: latest.media_type,
+        };
+        let aliases: Vec<Jid> = self
+            .lid_to_pn
+            .iter()
+            .filter(|(_, pn)| *pn == canon_chat)
+            .map(|(lid, _)| lid.clone())
+            .collect();
+        if let Some(chat) = self.chats.get_mut(canon_chat) {
+            chat.last_message = Some(preview.clone());
+        }
+        for lid in aliases {
+            if let Some(chat) = self.chats.get_mut(&lid) {
+                chat.last_message = Some(preview.clone());
+            }
+        }
+    }
+
+    /// Leaves edit mode, dropping both the id and the composer text.
+    pub fn cancel_edit(&mut self) {
+        if self.editing_message.take().is_some() {
+            self.composer_text.clear();
+        }
+    }
+
     pub fn resolve_display_name(&self, jid: &Jid) -> Option<String> {
         use crate::util::is_real_name;
 
@@ -1362,5 +1435,100 @@ mod tests {
         assert_eq!(updated[1].name, "Vojta"); // now newer than AliExpress!
         assert_eq!(updated[2].name, "AliExpress");
         assert_eq!(updated[3].name, "Empty Contact");
+    }
+    fn text_message(id: &str, jid: &Jid, body: &str, secs: i64) -> Message {
+        Message::new_text(
+            id.into(),
+            jid.clone(),
+            jid.clone(),
+            body.into(),
+            Utc::now() + chrono::Duration::seconds(secs),
+            true,
+            MessageStatus::Sent,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn apply_edit_rewrites_body_and_marks_edited() {
+        let mut state = AppState::new();
+        let jid = Jid::pn("7777777777");
+        state.get_or_create_chat(jid.clone(), "Bob".into(), false);
+        state.add_message(text_message("m1", &jid, "Helo", 0));
+
+        let applied = state.apply_edit(&jid, "m1", "Hello");
+
+        assert!(applied);
+        let msg = &state.messages.get(&jid).unwrap()[0];
+        assert_eq!(msg.text, "Hello");
+        assert!(msg.edited);
+    }
+
+    #[test]
+    fn apply_edit_keeps_the_original_timestamp() {
+        let mut state = AppState::new();
+        let jid = Jid::pn("7777777778");
+        state.get_or_create_chat(jid.clone(), "Bob".into(), false);
+        state.add_message(text_message("m1", &jid, "before", 0));
+        let before = state.messages.get(&jid).unwrap()[0].timestamp;
+
+        state.apply_edit(&jid, "m1", "after");
+
+        assert_eq!(state.messages.get(&jid).unwrap()[0].timestamp, before);
+    }
+
+    #[test]
+    fn apply_edit_refreshes_the_chat_preview() {
+        let mut state = AppState::new();
+        let jid = Jid::pn("7777777779");
+        state.get_or_create_chat(jid.clone(), "Bob".into(), false);
+        state.add_message(text_message("m1", &jid, "typographical error", 0));
+
+        state.apply_edit(&jid, "m1", "fixed text");
+
+        let preview = state.chats.get(&jid).unwrap().last_message.as_ref().unwrap();
+        assert_eq!(preview.text, "fixed text");
+    }
+
+    #[test]
+    fn apply_edit_ignores_unknown_message() {
+        let mut state = AppState::new();
+        let jid = Jid::pn("7777777780");
+        state.get_or_create_chat(jid.clone(), "Bob".into(), false);
+        state.add_message(text_message("m1", &jid, "kept", 0));
+
+        assert!(!state.apply_edit(&jid, "does-not-exist", "nope"));
+        assert_eq!(state.messages.get(&jid).unwrap()[0].text, "kept");
+        assert!(!state.messages.get(&jid).unwrap()[0].edited);
+    }
+
+    #[test]
+    fn cancel_edit_clears_the_composer_only_in_edit_mode() {
+        let mut state = AppState::new();
+        state.composer_text = "draft".into();
+
+        // Not editing: cancelling must not throw the draft away.
+        state.cancel_edit();
+        assert_eq!(state.composer_text, "draft");
+
+        state.editing_message = Some("m1".into());
+        state.cancel_edit();
+        assert!(state.editing_message.is_none());
+        assert!(state.composer_text.is_empty());
+    }
+
+    #[test]
+    fn legacy_state_without_edited_field_loads_as_unedited() {
+        let jid = Jid::pn("7777777781");
+        let msg = text_message("m1", &jid, "old", 0);
+        let mut value = serde_json::to_value(&msg).unwrap();
+        // State persisted before the edit feature shipped has no `edited` key.
+        value.as_object_mut().unwrap().remove("edited");
+
+        let restored: Message = serde_json::from_value(value).unwrap();
+
+        assert!(!restored.edited);
+        assert_eq!(restored.text, "old");
     }
 }

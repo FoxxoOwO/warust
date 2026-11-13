@@ -236,6 +236,7 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
     // Check if we should auto-scroll to bottom
     let should_scroll_to_bottom = state.auto_scroll_to_bottom;
     let mut selected_reply: Option<usize> = None;
+    let mut selected_edit: Option<String> = None;
     let mut message_to_delete = None;
     let mut selected_reaction: Option<(String, String)> = None;
     let mut view_reactions_id: Option<String> = None;
@@ -303,6 +304,9 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
                         .on_reply(|_id| {
                             selected_reply = Some(idx);
                         })
+                        .on_edit(|id| {
+                            selected_edit = Some(id.to_string());
+                        })
                         .on_delete(|id| {
                             message_to_delete = Some(id.to_string());
                         })
@@ -336,6 +340,15 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
         
     if let Some(idx) = selected_reply {
         state.replying_to = messages.get(idx).cloned();
+    }
+    // Entering edit mode loads the original body into the composer and drops any
+    // pending reply: an edit rewrites one stanza, it cannot also quote another.
+    if let Some(id) = selected_edit {
+        if let Some(msg) = messages.iter().find(|m| m.id == id) {
+            state.composer_text = msg.text.clone();
+            state.replying_to = None;
+            state.editing_message = Some(id);
+        }
     }
     if let Some(id) = message_to_delete {
         let _ = backend.send_command(Command::DeleteMessageForMe {
@@ -442,6 +455,29 @@ fn show_composer(ui: &mut Ui, state: &mut AppState, chat_jid: &Jid, backend: &cr
         ui.add_space(2.0);
     }
     
+    // Edit banner: an active edit owns the composer until it is sent or cancelled.
+    let mut cancel_edit = false;
+    if state.editing_message.is_some() {
+        Frame::new()
+            .fill(Color32::from_rgb(0x1A, 0x26, 0x2C))
+            .inner_margin(Margin::symmetric(14, 6))
+            .corner_radius(egui::CornerRadius::same(6))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("✎").font(FontId::proportional(14.0)).color(Color32::from_rgb(0x00, 0xA8, 0x84)));
+                    ui.label(RichText::new("Upravit zprávu").font(FontId::proportional(12.0)).strong().color(Color32::from_rgb(0x00, 0xA8, 0x84)));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("✕").clicked() {
+                            cancel_edit = true;
+                        }
+                    });
+                });
+            });
+    }
+    if cancel_edit {
+        state.cancel_edit();
+    }
+
     // Replying preview bar if replying to a message
     let mut cancel_reply = false;
     if let Some(reply_msg) = &state.replying_to {
@@ -552,7 +588,9 @@ fn show_composer(ui: &mut Ui, state: &mut AppState, chat_jid: &Jid, backend: &cr
                 }
 
                 // Text input - takes most space
-                let hint = if state.pending_attachment.is_some() {
+                let hint = if state.editing_message.is_some() {
+                    "Upravit zprávu..."
+                } else if state.pending_attachment.is_some() {
                     "Přidat popisek..."
                 } else {
                     "Napište zprávu..."
@@ -592,6 +630,22 @@ fn show_composer(ui: &mut Ui, state: &mut AppState, chat_jid: &Jid, backend: &cr
                 
                 if (enter_pressed || send_btn.clicked()) && can_send {
                     let text = state.composer_text.trim().to_string();
+
+                    // An active edit rewrites the original stanza instead of
+                    // sending a second one, so no reply/attachment is involved.
+                    if let Some(message_id) = state.editing_message.clone() {
+                        if !text.is_empty() {
+                            let _ = backend.send_command(Command::EditText {
+                                to: chat_jid.clone(),
+                                message_id,
+                                text,
+                            });
+                        }
+                        state.editing_message = None;
+                        state.composer_text.clear();
+                        return;
+                    }
+
                     let reply_to = state.replying_to.take().map(|m| m.id);
                     
                     if let Some(file_path) = state.pending_attachment.take() {

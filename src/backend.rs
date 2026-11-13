@@ -719,11 +719,42 @@ async fn handle_incoming_message(
         return;
     }
 
-    // Check if this is a protocol message (revoke, ephemeral sync, etc.) without edited message
+    // Message edits: WhatsApp delivers the new body inside
+    // `protocol_message.edited_message`, keyed by the ORIGINAL message id. Adding
+    // it as a fresh message would leave a duplicate bubble, so this path only
+    // rewrites the stored message and returns.
     if let Some(pm) = base_msg.protocol_message.as_option() {
-        if !pm.edited_message.is_set() {
+        let edited = pm.edited_message.as_option();
+        let Some(edited_content) = edited else {
+            // Revoke, ephemeral sync and friends: nothing to store as a message.
+            return;
+        };
+        let target_id = pm
+            .key
+            .as_option()
+            .and_then(|k| k.id.as_deref())
+            .unwrap_or_default()
+            .to_string();
+        let new_text = extract_message_text(edited_content).to_string();
+        if target_id.is_empty() || new_text.is_empty() {
+            debug!("Ignoring malformed edit for chat {}", chat_jid);
             return;
         }
+        let canon_chat_jid = if info.source.is_group {
+            chat_jid.clone()
+        } else {
+            state.read().canonical_jid(&chat_jid)
+        };
+        let applied = {
+            let mut s = state.write();
+            s.apply_edit(&canon_chat_jid, &target_id, &new_text)
+        };
+        debug!(
+            "Edit for message {} in {} (applied={})",
+            target_id, canon_chat_jid, applied
+        );
+        let _ = crate::storage::persist_state(&state).await;
+        return;
     }
 
     // Extract text content
@@ -1817,6 +1848,29 @@ async fn handle_command(
         
         Command::SendMessage { to, message } => {
             client.send_message(to, message).await?;
+        }
+
+        Command::EditText { to, message_id, text } => {
+            let edited = client
+                .edit_message(to.clone(), message_id.clone(), wa::Message::text(text.clone()))
+                .await;
+            match edited {
+                Ok(_) => {
+                    // The guard must die before the await, or the whole command
+                    // future stops being `Send` and tokio::spawn rejects it.
+                    let applied = {
+                        let mut s = state.write();
+                        s.apply_edit(&to, &message_id, &text)
+                    };
+                    if applied {
+                        debug!("Edited message {} in {}", message_id, to);
+                    } else {
+                        debug!("Edited message {} is not in the local store", message_id);
+                    }
+                    crate::storage::persist_state(state).await?;
+                }
+                Err(e) => error!("Failed to edit message {}: {}", message_id, e),
+            }
         }
         
         Command::SendMedia { chat_jid, file_path, caption, reply_to } => {
