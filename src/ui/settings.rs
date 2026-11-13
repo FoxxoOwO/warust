@@ -215,6 +215,26 @@ fn show_notifications_settings(ui: &mut Ui, s: &mut crate::state::AppState) {
         ui.checkbox(&mut s.preferences.show_previews, "Zobrazovat náhled textu v oznámení");
         ui.add_space(4.0);
         ui.checkbox(&mut s.preferences.desktop_notifications, "Povolit systémová oznámení na ploše Windows");
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("Vyzkoušet oznámení").clicked() {
+                let shown = crate::notifications::show_toast(
+                    "Warust",
+                    "Takto vypadá oznámení o nové zprávě.",
+                );
+                crate::notifications::play_sound();
+                if !shown {
+                    tracing::warn!(
+                        "test notification failed; the OS notification service is unavailable"
+                    );
+                }
+            }
+            ui.label(
+                RichText::new("Oznámení se nezobrazují, když je okno aktivní.")
+                    .font(FontId::proportional(11.0))
+                    .color(Color32::from_rgb(0x86, 0x96, 0xA0)),
+            );
+        });
     });
 }
 

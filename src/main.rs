@@ -5,6 +5,7 @@
 //! A native WhatsApp client built with Rust, egui, and whatsapp-rust.
 
 mod app;
+pub mod notifications;
 pub mod autostart;
 mod backend;
 mod commands;
@@ -36,6 +37,19 @@ fn main() -> Result<()> {
         .init();
 
     tracing::info!("Starting Warust v{}", env!("CARGO_PKG_VERSION"));
+
+
+    // Diagnostic: fire one toast and exit, so notification support can be
+    // verified on a machine without sending a real message.
+    if std::env::args().any(|a| a == "--test-notification") {
+        // Exercise the real path, including the focus gate and rate limiter,
+        // by pretending the window is in the background.
+        crate::notifications::set_window_focused(false);
+        let ok = crate::notifications::notify("Warust", "Testovací oznámení funguje.", true);
+        tracing::info!("test notification result: {ok}");
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        return Ok(());
+    }
 
     let start_in_tray = std::env::args().any(|a| a == "--tray" || a == "--minimized");
 
