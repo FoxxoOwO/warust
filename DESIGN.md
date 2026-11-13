@@ -32,7 +32,7 @@
 ```toml
 [package]
 name = "warust"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 
 [dependencies]
