@@ -1317,3 +1317,36 @@ fn video_timeline(ui: &egui::Ui, message_id: &str, media_rect: egui::Rect) -> bo
     }
     used
 }
+
+#[cfg(test)]
+mod timeline_tests {
+    use super::*;
+
+    fn render(width: f32, height: f32, message_id: &str) -> bool {
+        let ctx = egui::Context::default();
+        let mut used = false;
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(10.0, 10.0),
+                egui::vec2(width, height),
+            );
+            used = video_timeline(ui, message_id, rect);
+        });
+        // Nothing is uploading textures in a headless test.
+        output.textures_delta.clear();
+        used
+    }
+
+    /// The timeline runs on every frame while a video is open, so it must not
+    /// panic or claim input when nothing is playing / nothing is hovered.
+    #[test]
+    fn timeline_renders_without_an_open_player() {
+        assert!(!render(220.0, 160.0, "no-such-message"));
+    }
+
+    /// Very narrow bubbles cannot fit a track; it must degrade to just the button.
+    #[test]
+    fn timeline_degrades_on_narrow_bubbles() {
+        assert!(!render(120.0, 80.0, "narrow"));
+    }
+}
