@@ -531,6 +531,9 @@ impl<'a> Widget for MessageBubble<'a> {
         let row_size = Vec2::new(ui.available_width(), row_height);
         let (row_rect, response) = ui.allocate_exact_size(row_size, Sense::click());
         
+        let mut audio_clicked = false;
+        let mut video_scrub_used = false;
+
         let bubble_rect = if self.is_own {
             egui::Rect::from_min_size(
                 egui::pos2(row_rect.max.x - bubble_width - 8.0, row_rect.min.y + 2.0),
@@ -673,7 +676,32 @@ impl<'a> Widget for MessageBubble<'a> {
                         }
                     }
                     crate::state::MediaType::Video => {
-                        if let Some((ref tex, _)) = cached_texture {
+                        let live_frame = if crate::video::is_open_for(&self.message.id) {
+                            crate::video::texture(ui.ctx(), &self.message.id)
+                        } else {
+                            None
+                        };
+                        if let Some(live) = live_frame {
+                            // Decoded frames stream in at source fps; keep asking for repaints
+                            // while the player is running, then normal frames take over.
+                            egui::Image::new(egui::load::SizedTexture::new(live.id(), media_size))
+                                .corner_radius(8.0)
+                                .paint_at(ui, media_rect);
+                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+                            if crate::video::is_paused() {
+                                painter.circle_filled(media_rect.center(), 22.0, Color32::from_black_alpha(150));
+                                painter.text(
+                                    media_rect.center() + Vec2::new(1.5, 0.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    "\u{25B6}",
+                                    FontId::proportional(16.0),
+                                    Color32::WHITE,
+                                );
+                            }
+                            if media_rect.height() > 60.0 {
+                                video_scrub_used |= video_timeline(ui, &self.message.id, media_rect);
+                            }
+                        } else if let Some((ref tex, _)) = cached_texture {
                             egui::Image::new(egui::load::SizedTexture::new(tex.id(), media_size))
                                 .corner_radius(8.0)
                                 .paint_at(ui, media_rect);
@@ -745,27 +773,82 @@ impl<'a> Widget for MessageBubble<'a> {
                     }
                     crate::state::MediaType::Audio | crate::state::MediaType::Voice => {
                         painter.rect_filled(media_rect, 8.0, Color32::from_black_alpha(45));
-                        
-                        let btn_center = media_rect.min + Vec2::new(22.0, media_rect.height() / 2.0);
-                        painter.circle_filled(btn_center, 15.0, Color32::from_rgb(0x00, 0xA8, 0x84));
+
+                        let is_current = is_downloaded && crate::audio::is_playing(&self.message.id);
+                        let mid_y = media_rect.min.y + media_rect.height() / 2.0;
+                        let btn_center = egui::pos2(media_rect.min.x + 22.0, mid_y);
+                        painter.circle_filled(btn_center, 15.0, crate::theme::ACCENT);
                         painter.text(
-                            btn_center + Vec2::new(if is_downloaded { 1.0 } else { 0.0 }, 0.0),
+                            btn_center,
                             egui::Align2::CENTER_CENTER,
-                            if is_downloaded { "▶" } else { "⬇" },
-                            FontId::proportional(13.0),
+                            if !is_downloaded {
+                                "⬇"
+                            } else if is_current {
+                                "❚❚"
+                            } else {
+                                "▶"
+                            },
+                            FontId::proportional(if is_current { 10.0 } else { 13.0 }),
                             Color32::WHITE,
                         );
-                        
-                        let line_start = media_rect.min + Vec2::new(46.0, media_rect.height() / 2.0);
-                        let line_end = media_rect.max + Vec2::new(-60.0, -media_rect.height() / 2.0);
-                        painter.line_segment([line_start, line_end], Stroke::new(2.5, Color32::from_rgb(0x00, 0xA8, 0x84)));
-                        
-                        let sub = if is_downloaded {
-                            "Přehrát".to_string()
-                        } else if file_len > 0 {
-                            crate::media::format_file_size(file_len)
+
+                        // Waveform bars double as the progress indicator while playing.
+                        let track_left = media_rect.min.x + 46.0;
+                        let track_right = media_rect.max.x - 52.0;
+                        let frac = if is_current {
+                            match crate::audio::duration() {
+                                Some(total) if total.as_secs_f32() > 0.0 => {
+                                    (crate::audio::position().as_secs_f32() / total.as_secs_f32())
+                                        .clamp(0.0, 1.0)
+                                }
+                                _ => 0.0,
+                            }
                         } else {
-                            "Hlasová zpráva".to_string()
+                            0.0
+                        };
+                        let bars = 26;
+                        for i in 0..bars {
+                            let t = i as f32 / (bars - 1) as f32;
+                            let x = track_left + (track_right - track_left) * t;
+                            // Deterministic pseudo-waveform so bubbles look consistent.
+                            let seed = ((i as f32 * 12.9898 + 78.233).sin() * 43758.5453).fract().abs();
+                            let h = 3.0 + 9.0 * seed;
+                            let played = is_current && t <= frac;
+                            painter.line_segment(
+                                [
+                                    egui::pos2(x, mid_y - h / 2.0),
+                                    egui::pos2(x, mid_y + h / 2.0),
+                                ],
+                                Stroke::new(
+                                    2.0,
+                                    if !is_downloaded {
+                                        Color32::from_rgb(0x4a, 0x5c, 0x66)
+                                    } else if played {
+                                        crate::theme::ACCENT
+                                    } else {
+                                        Color32::from_rgb(0x86, 0x96, 0xA0)
+                                    },
+                                ),
+                            );
+                        }
+
+                        let sub = if !is_downloaded {
+                            if file_len > 0 {
+                                crate::media::format_file_size(file_len)
+                            } else {
+                                "Hlasová zpráva".to_string()
+                            }
+                        } else if is_current {
+                            match crate::audio::duration() {
+                                Some(total) => format!(
+                                    "{} / {}",
+                                    crate::audio::format_duration(crate::audio::position()),
+                                    crate::audio::format_duration(total)
+                                ),
+                                None => crate::audio::format_duration(crate::audio::position()),
+                            }
+                        } else {
+                            "Přehrát".to_string()
                         };
                         painter.text(
                             media_rect.max + Vec2::new(-8.0, -media_rect.height() / 2.0),
@@ -774,6 +857,28 @@ impl<'a> Widget for MessageBubble<'a> {
                             FontId::proportional(10.0),
                             Color32::from_rgb(0x86, 0x96, 0xA0),
                         );
+
+                        // Clickable play/stop target over the round button.
+                        let hit = egui::Rect::from_center_size(
+                            btn_center,
+                            Vec2::splat(34.0),
+                        );
+                        let play_resp = ui.interact(
+                            hit,
+                            ui.scope_id().with(("bubble-audio", self.message.id.as_str())),
+                            Sense::click(),
+                        );
+                        if play_resp.clicked() {
+                            audio_clicked = true;
+                        }
+                        if play_resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+
+                        if is_current {
+                            ui.ctx()
+                                .request_repaint_after(std::time::Duration::from_millis(60));
+                        }
                     }
                 }
 
@@ -912,17 +1017,41 @@ impl<'a> Widget for MessageBubble<'a> {
         }
         
         // Handle click on media
-        if response.clicked() {
-            if let Some(ref path_str) = self.message.media_path {
-                let p = std::path::PathBuf::from(path_str);
-                if p.exists() {
-                    crate::media::open_file(&p);
-                } else if let Some(ref f) = self.on_download {
-                    f(&self.message.id);
+        let is_audio_bubble = matches!(
+            self.message.media_type,
+            Some(crate::state::MediaType::Audio) | Some(crate::state::MediaType::Voice)
+        );
+        let is_video_bubble = matches!(self.message.media_type, Some(crate::state::MediaType::Video));
+        if (response.clicked() && !video_scrub_used) || audio_clicked {
+            match self.message.media_path.as_ref() {
+                Some(path_str) => {
+                    let p = std::path::PathBuf::from(path_str);
+                    if !p.exists() {
+                        if let Some(ref f) = self.on_download {
+                            f(&self.message.id);
+                        }
+                    } else if is_audio_bubble {
+                        if let Err(e) = crate::audio::toggle(&self.message.id, &p) {
+                            crate::media::report_playback_error(ui.ctx(), e);
+                        }
+                        ui.ctx().request_repaint();
+                    } else if is_video_bubble {
+                        // Play in-app; falls back to the OS player only if ffmpeg is absent.
+                        if let Err(e) = crate::video::toggle(&self.message.id, &p) {
+                            crate::media::report_playback_error(ui.ctx(), e);
+                            crate::media::open_file(&p);
+                        }
+                        ui.ctx().request_repaint();
+                    } else {
+                        crate::media::open_file(&p);
+                    }
                 }
-            } else if self.message.media_type.is_some() {
-                if let Some(ref f) = self.on_download {
-                    f(&self.message.id);
+                None => {
+                    if self.message.media_type.is_some() {
+                        if let Some(ref f) = self.on_download {
+                            f(&self.message.id);
+                        }
+                    }
                 }
             }
         }
@@ -1068,5 +1197,156 @@ impl Widget for QrDisplay {
         }
         
         response
+    }
+}
+
+/// Overlay timeline (play/pause, progress, time, scrubbing) drawn on top of the
+/// video player that is currently open in a bubble.
+///
+/// Returns true when the pointer was used here, so the enclosing bubble does not
+/// also interpret the same click as play/pause.
+fn video_timeline(ui: &egui::Ui, message_id: &str, media_rect: egui::Rect) -> bool {
+    const BAR_HEIGHT: f32 = 26.0;
+
+    let bar = egui::Rect::from_min_max(
+        egui::pos2(media_rect.left(), media_rect.bottom() - BAR_HEIGHT),
+        media_rect.max,
+    );
+    let painter = ui.painter();
+    painter.rect_filled(
+        bar,
+        egui::CornerRadius { nw: 0, ne: 0, sw: 8, se: 8 },
+        Color32::from_black_alpha(150),
+    );
+
+    let paused = crate::video::is_paused();
+    let position = crate::video::position();
+    let total = crate::video::duration();
+    let progress = crate::video::progress();
+
+    // Play / pause.
+    let button = egui::Rect::from_center_size(
+        egui::pos2(bar.left() + 15.0, bar.center().y),
+        Vec2::splat(22.0),
+    );
+    let button_resp = ui.interact(
+        button,
+        ui.scope_id().with((message_id, "video-toggle")),
+        egui::Sense::click(),
+    );
+    if button_resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if button_resp.clicked() {
+        if paused {
+            crate::video::resume();
+        } else {
+            crate::video::pause();
+        }
+    }
+    painter.text(
+        button.center(),
+        egui::Align2::CENTER_CENTER,
+        if paused { "\u{25B6}" } else { "\u{23F8}" },
+        FontId::proportional(13.0),
+        Color32::WHITE,
+    );
+
+    // Elapsed / total, right aligned.
+    let label = format!(
+        "{} / {}",
+        crate::audio::format_duration(position),
+        total
+            .map(crate::audio::format_duration)
+            .unwrap_or_else(|| "--:--".to_string()),
+    );
+    let galley = painter.layout_no_wrap(
+        label,
+        FontId::proportional(9.5),
+        Color32::from_rgb(0xDF, 0xE5, 0xE7),
+    );
+    let label_width = galley.size().x;
+    let label_left = bar.right() - 8.0 - label_width;
+    painter.galley(
+        egui::pos2(label_left, bar.center().y - galley.size().y / 2.0),
+        galley,
+        Color32::WHITE,
+    );
+
+    // Seek track.
+    let track = egui::Rect::from_min_max(
+        egui::pos2(button.right() + 9.0, bar.center().y - 2.0),
+        egui::pos2(label_left - 10.0, bar.center().y + 2.0),
+    );
+    if track.width() < 24.0 {
+        return button_resp.clicked();
+    }
+
+    painter.rect_filled(track, 2.0, Color32::from_white_alpha(55));
+    let filled = egui::Rect::from_min_max(
+        track.min,
+        egui::pos2(track.left() + track.width() * progress, track.max.y),
+    );
+    painter.rect_filled(filled, 2.0, crate::theme::ACCENT);
+    painter.circle_filled(
+        egui::pos2(track.left() + track.width() * progress, track.center().y),
+        4.5,
+        Color32::WHITE,
+    );
+
+    let hit = track.expand2(Vec2::new(0.0, 8.0));
+    let resp = ui.interact(
+        hit,
+        ui.scope_id().with((message_id, "video-track")),
+        egui::Sense::click_and_drag(),
+    );
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    let mut used = button_resp.clicked();
+    if (resp.clicked() || resp.dragged()) && total.is_some() {
+        if let (Some(pointer), Some(len)) = (resp.interact_pointer_pos(), total) {
+            let fraction = ((pointer.x - track.left()) / track.width()).clamp(0.0, 1.0);
+            crate::video::seek(len.mul_f32(fraction));
+            used = true;
+        }
+    }
+    if used {
+        ui.ctx().request_repaint();
+    }
+    used
+}
+
+#[cfg(test)]
+mod timeline_tests {
+    use super::*;
+
+    fn render(width: f32, height: f32, message_id: &str) -> bool {
+        let ctx = egui::Context::default();
+        let mut used = false;
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(10.0, 10.0),
+                egui::vec2(width, height),
+            );
+            used = video_timeline(ui, message_id, rect);
+        });
+        // Nothing is uploading textures in a headless test.
+        output.textures_delta.clear();
+        used
+    }
+
+    /// The timeline runs on every frame while a video is open, so it must not
+    /// panic or claim input when nothing is playing / nothing is hovered.
+    #[test]
+    fn timeline_renders_without_an_open_player() {
+        assert!(!render(220.0, 160.0, "no-such-message"));
+    }
+
+    /// Very narrow bubbles cannot fit a track; it must degrade to just the button.
+    #[test]
+    fn timeline_degrades_on_narrow_bubbles() {
+        assert!(!render(120.0, 80.0, "narrow"));
     }
 }

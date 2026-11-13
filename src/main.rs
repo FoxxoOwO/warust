@@ -5,6 +5,8 @@
 //! A native WhatsApp client built with Rust, egui, and whatsapp-rust.
 
 mod app;
+pub mod audio;
+pub mod video;
 pub mod autostart;
 mod backend;
 mod commands;
@@ -36,6 +38,10 @@ fn main() -> Result<()> {
         .init();
 
     tracing::info!("Starting Warust v{}", env!("CARGO_PKG_VERSION"));
+
+    // Resolve ffmpeg once up front so the log states which binary will be used
+    // (bundled next to the exe, or found on PATH) before any media is played.
+    crate::audio::ffmpeg_available();
 
     let start_in_tray = std::env::args().any(|a| a == "--tray" || a == "--minimized");
 
