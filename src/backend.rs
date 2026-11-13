@@ -825,6 +825,50 @@ async fn handle_incoming_message(
         }
     }
     
+    // Desktop notification / chime for messages the user is not looking at.
+    // Muted chats stay silent; previews honour the privacy preference.
+    if !from_me {
+        let (title, muted, desktop, sound, show_previews) = {
+            let s = state.read();
+            let canon = if info.source.is_group {
+                chat_jid.clone()
+            } else {
+                s.canonical_jid(&chat_jid)
+            };
+            let title = s
+                .chats
+                .get(&canon)
+                .map(|c| c.name.clone())
+                .or_else(|| s.resolve_display_name(&canon))
+                .unwrap_or_else(|| crate::util::format_jid(&canon));
+            let muted = s
+                .chats
+                .get(&canon)
+                .and_then(|c| c.mute_until)
+                .is_some_and(|until| until > Utc::now());
+            (
+                title,
+                muted,
+                s.preferences.desktop_notifications,
+                s.preferences.sound_notifications,
+                s.preferences.show_previews,
+            )
+        };
+
+        if !muted {
+            let body = if show_previews {
+                crate::notifications::preview(&text)
+            } else {
+                "Nová zpráva".to_string()
+            };
+            if desktop {
+                crate::notifications::notify(&title, &body, sound);
+            } else if sound {
+                crate::notifications::play_sound();
+            }
+        }
+    }
+
     // Auto-send read receipt for non-own messages
     if !from_me {
         let client = client.clone();

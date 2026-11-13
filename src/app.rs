@@ -73,6 +73,10 @@ impl WarustApp {
 
 impl eframe::App for WarustApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        // Track focus so incoming messages only toast when the user is elsewhere.
+        let focused = ui.input(|i| i.viewport().focused).unwrap_or(true);
+        crate::notifications::set_window_focused(focused);
+
         // Handle system tray messages
         if let Some(tray) = &self.tray {
             while let Ok(msg) = tray.rx.try_recv() {

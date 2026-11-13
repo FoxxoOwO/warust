@@ -23,6 +23,12 @@ Designed as a high-performance alternative to resource-heavy Electron applicatio
 * **Contact Resolution**: Merges Phone Number (PN) and LID (Linked Identity) conversations into unified chats with contact names.
 * **QR & Pair Code Login**: Log in by scanning the QR code or pair using an 8-character verification code sent to your phone number.
 
+### Notifications
+* **Desktop Toasts**: Native OS notifications for incoming messages, with the sender name and a one-line preview. Run `warust --test-notification` to verify the OS accepts them.
+* **Notification Chime**: A short two-tone sound synthesized at runtime, so nothing extra ships with the build.
+* **Quiet When Focused**: Toasts and the chime are suppressed while the window is active, and muted chats stay silent.
+* **Privacy Aware**: Turn off message previews in *Settings -> Notifications* to show only "Nová zpráva".
+
 ### Voice & Video Calls (VoIP)
 * **Native VoIP Support**: Integrates WhatsApp call signaling with MLOW audio codec and WebRTC DataChannels.
 * **Incoming Call Overlay**: Ringing popup with caller avatar, name, and Accept / Decline controls.
