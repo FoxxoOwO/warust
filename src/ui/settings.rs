@@ -260,7 +260,7 @@ fn show_storage_settings(ui: &mut Ui, _s: &mut crate::state::AppState, backend: 
     setting_card(ui, "Verze aplikace", |ui| {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Warust:").strong());
-            ui.monospace(option_env!("CARGO_PKG_VERSION").unwrap_or("0.1.0"));
+            ui.monospace(option_env!("CARGO_PKG_VERSION").unwrap_or("0.1.1"));
         });
         ui.horizontal(|ui| {
             ui.label(RichText::new("whatsapp-rust:").strong());
