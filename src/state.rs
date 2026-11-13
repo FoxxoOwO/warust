@@ -242,6 +242,10 @@ pub struct UserPreferences {
     pub sound_notifications: bool,
     pub show_previews: bool,
     pub desktop_notifications: bool,
+    /// One-time migration marker: `desktop_notifications` used to be a dead
+    /// toggle, so a persisted `false` does not express a real choice.
+    #[serde(default)]
+    pub notifications_default_applied: bool,
     pub auto_download_photos: bool,
     pub auto_download_videos: bool,
     pub auto_download_docs: bool,
@@ -261,7 +265,8 @@ impl Default for UserPreferences {
             enter_is_send: true,
             sound_notifications: true,
             show_previews: true,
-            desktop_notifications: false,
+            desktop_notifications: true,
+            notifications_default_applied: true,
             auto_download_photos: true,
             auto_download_videos: false,
             auto_download_docs: false,

@@ -24,6 +24,22 @@ struct PersistedAppState {
     initial_history_fetched: bool,
 }
 
+/// `desktop_notifications` shipped as a dead toggle defaulting to `false`, so a
+/// persisted `false` is not a real user choice. Flip it on exactly once; after
+/// the marker is stored, later loads respect whatever the user picked.
+/// Returns `true` when the value changed.
+fn apply_notification_default(preferences: &mut crate::state::UserPreferences) -> bool {
+    if preferences.notifications_default_applied {
+        return false;
+    }
+    preferences.notifications_default_applied = true;
+    if preferences.desktop_notifications {
+        return false;
+    }
+    preferences.desktop_notifications = true;
+    true
+}
+
 fn get_storage_path() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| std::env::current_dir().unwrap())
@@ -110,6 +126,15 @@ pub async fn load_state() -> Result<AppState> {
                     }
                     state.contacts.insert(contact.jid.clone(), contact);
                 }
+                // `desktop_notifications` defaulted to false while the toggle
+                // did nothing. Flip it on once so notifications actually work
+                // for existing installs, then leave the user's choice alone.
+                let mut preferences = persisted.preferences;
+                if apply_notification_default(&mut preferences) {
+                    state.dirty = true;
+                }
+                state.preferences = preferences;
+
                 for mut chat in persisted.chats {
                     if let Some(name) = state.resolve_display_name(&chat.jid) {
                         chat.name = name;
@@ -160,7 +185,6 @@ pub async fn load_state() -> Result<AppState> {
                 }
                 state.self_name = persisted.self_name;
                 state.scheduled_messages = persisted.scheduled_messages;
-                state.preferences = persisted.preferences;
                 state.initial_history_fetched = persisted.initial_history_fetched;
                 state.clean_stray_reactions();
                 state.consolidate_canonical_chats();
@@ -185,6 +209,7 @@ pub async fn load_state() -> Result<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::UserPreferences;
 
     #[tokio::test]
     async fn test_persist_and_load_state() {
@@ -221,5 +246,29 @@ mod tests {
         let loaded: PersistedAppState = serde_json::from_str(&std::fs::read_to_string(&test_path).unwrap()).unwrap();
         assert_eq!(loaded.chats.len(), 1);
         assert_eq!(loaded.self_name.as_deref(), Some("Tester"));
+    }
+
+    #[test]
+    fn enables_desktop_notifications_for_legacy_state_once() {
+        let mut prefs = UserPreferences {
+            desktop_notifications: false,
+            notifications_default_applied: false,
+            ..Default::default()
+        };
+        assert!(apply_notification_default(&mut prefs));
+        assert!(prefs.desktop_notifications);
+        assert!(prefs.notifications_default_applied);
+
+        // A second pass must not override a user who later turns it off.
+        prefs.desktop_notifications = false;
+        assert!(!apply_notification_default(&mut prefs));
+        assert!(!prefs.desktop_notifications);
+    }
+
+    #[test]
+    fn leaves_fresh_defaults_untouched() {
+        let mut prefs = UserPreferences::default();
+        assert!(prefs.desktop_notifications);
+        assert!(!apply_notification_default(&mut prefs));
     }
 }
