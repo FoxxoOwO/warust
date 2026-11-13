@@ -26,7 +26,7 @@ whatsapp-rust = { version = "0.7.0", default-features = false, features = [
 ] }
 
 # --- UI ---
-eframe = { version = "0.37", default-features = false, features = ["wgpu", "persistence", "glow"] }
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "persistence", "glow", "x11", "wayland"] }
 egui = "0.37"
 egui_extras = "0.37"
 epaint = { version = "0.37", features = ["color_fonts"] }
@@ -58,6 +58,7 @@ glow = "0.14"
 
 # --- Development ---
 console_error_panic_hook = { version = "0.1", optional = true }
+rodio = { version = "0.23", default-features = false, features = ["playback", "mp3", "mp4", "vorbis", "wav", "flac"] }
 
 [target.'cfg(windows)'.dependencies]
 tray-item = "0.10.0"

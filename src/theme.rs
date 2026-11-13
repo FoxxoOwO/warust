@@ -3,6 +3,9 @@
 use std::sync::Arc;
 use egui::{Color32, FontData, FontDefinitions, FontFamily, Theme};
 
+/// WhatsApp green used for accents (play buttons, progress, active states).
+pub const ACCENT: Color32 = Color32::from_rgb(0x00, 0xA8, 0x84);
+
 /// Setup the Warust theme (WhatsApp-like dark mode with green accent)
 pub fn setup_theme(ctx: &egui::Context) {
     let mut style = (*ctx.style_of(Theme::Dark)).clone();

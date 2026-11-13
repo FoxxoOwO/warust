@@ -19,6 +19,7 @@ pub struct WarustApp {
     runtime: tokio::runtime::Runtime,
     show_settings: bool,
     tray: Option<crate::tray::SystemTray>,
+    playback_error: Option<(String, std::time::Instant)>,
 }
 
 impl WarustApp {
@@ -61,6 +62,7 @@ impl WarustApp {
             runtime,
             show_settings: false,
             tray,
+            playback_error: None,
         })
     }
     
@@ -202,6 +204,33 @@ impl eframe::App for WarustApp {
             crate::ui::schedule_dialog::show_scheduled_manager(ctx, &self.state, backend);
             crate::ui::conversation::show_reaction_detail_modal(ctx, &self.state, backend);
             crate::ui::call_dialog::show_call_overlay(ctx, &self.state, backend);
+        }
+
+        // Surface audio playback failures (missing ffmpeg, no output device...)
+        if let Some(err) = crate::audio::take_error() {
+            self.playback_error = Some((err, std::time::Instant::now()));
+        }
+        if let Some((msg, at)) = self.playback_error.take() {
+            if at.elapsed() < std::time::Duration::from_secs(8) {
+                egui::Area::new(egui::Id::unique("playback_error_toast"))
+                    .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -28.0))
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::new()
+                            .fill(Color32::from_rgb(0x3A, 0x1E, 0x22))
+                            .corner_radius(8.0)
+                            .inner_margin(egui::Margin::symmetric(12, 8))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(format!("⚠ Přehrávání: {msg}"))
+                                        .color(Color32::from_rgb(0xF2, 0x8B, 0x82))
+                                        .font(FontId::proportional(12.0)),
+                                );
+                            });
+                    });
+                self.playback_error = Some((msg, at));
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(300));
+            }
         }
 
         // Sync runs quietly on the background without any popup toast
