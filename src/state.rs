@@ -85,6 +85,13 @@ pub struct Reaction {
     pub sender: Jid,
 }
 
+/// `true` for the default, so the common case can be omitted from the file.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Serde default for the `edited` marker; `skip_serializing_if` keeps the
+/// ~2000-byte-per-message JSON from carrying a `false` on every row.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub id: String,
@@ -94,23 +101,37 @@ pub struct Message {
     pub timestamp: DateTime<Utc>,
     pub from_me: bool,
     pub status: MessageStatus,
+    // Everything below is optional and omitted when absent. Before this, every
+    // row carried ten `"media_...":null` keys, which dominated the file size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ephemeral_expiration: Option<u32>,
     /// Set once the sender edits the message after it was sent.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub edited: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reactions: Vec<Reaction>,
     // Media fields
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_type: Option<MediaType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_direct_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_key: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_file_sha256: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_file_enc_sha256: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_file_length: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_mimetype: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_caption: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_jpeg_thumbnail: Option<Vec<u8>>,
 }
 

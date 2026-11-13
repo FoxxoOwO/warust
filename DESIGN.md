@@ -385,15 +385,32 @@ pub fn setup_theme(ctx: &egui::Context) {
 
 ### 6.2 Co ukládá naše aplikace (AppState → disk)
 
+Stav je rozdělený do dvou vrstev, aby příchozí zpráva v jednom chatu
+ nepřepisovala celou historii:
+
 ```
-warust.db (naše SQLite, oddělené od whatsapp-rust)
-├── chats (jid, name, last_msg_id, unread, archived, pinned, mute_until)
-├── messages (id, chat_jid, sender_jid, text, ts, from_me, status, reply_to)
-├── contacts (jid, push_name, verified_name, pic_url, is_business)
-└── settings (key, value)  // theme, notifications, auto_download_media
+warust/
+├── ui_state.json        # ~80 kB: chats, contacts, preferences, identity, scheduled
+└── messages/
+    ├── <fnv1a(jid)>.json  # historie jednoho chatu
+    └── ...                # jeden soubor na konverzaci
 ```
 
-> **Důvod oddělení**: `whatsapp-rust` store je opaque, nechceme měnit jeho schéma. Naše DB je pro UI rychlé dotazy (seřazení chatů, fulltext search, unread counts).
+- **Proč ne SQLite**: UI stav je malý a čte se celý při startu; JSON se snáz
+  ladí a `whatsapp-rust` už jeden SQLite soubor vlastní (viz 6.1), takže by
+  vznikla dvě schémata, která se musí držet v synchronu.
+- **Proč rozdělené soubory**: 1,8 MB v jednom souboru znamenalo přepis všeho
+  při každé změně. Teď se přepisuje jen soubor chatu, který se skutečně změnil
+  (porovnání FNV-1a hashe serializovaných bytů), a `ui_state.json` jen když se
+  změní seznam chatů, kontakty nebo nastavení.
+- **Chybějící pole se neserializují** (`skip_serializing_if`) — dřív každý
+  řádek nesl deset klíčů `"media_...":null`, což byla třetina objemu.
+- **Migrace**: starší verze měly historii vnořenou v `ui_state.json`; při
+  načtení se přesune do `messages/` a jednou se přepíše.
+- **Odolnost**: poškozený soubor se přejmenuje na `*.json.corrupt` a zbytek
+  stavu se načte; zápis jde přes `<soubor>.json.tmp` + `rename`.
+
+> **Důvod oddělení**: `whatsapp-rust` store je opaque, nechceme měnit jeho schéma. Náš stav je pro UI rychlé dotazy (seřazení chatů, fulltext search, unread counts).
 
 ### 6.3 Sync strategie
 
@@ -401,7 +418,7 @@ warust.db (naše SQLite, oddělené od whatsapp-rust)
 |------|-------------|
 | Server → App | HistorySync event (bootstrap) + live Messages events |
 | App → Server | `send_text`, `mark_as_read`, `archive_chat`, `pin_chat` (IQ) |
-| UI ↔ Disk | Periodický flush (5s) + okamžitý flush u klíčových změn (send, read) |
+| UI ↔ Disk | Dirty flag + periodický flush (5 s) + okamžitý flush u klíčových změn (send, read) |
 
 ## 7. Modulární struktura projektu
 
