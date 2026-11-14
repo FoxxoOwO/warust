@@ -26,6 +26,12 @@ pub enum Command {
         to: Jid,
         message: whatsapp_rust::waproto::whatsapp::Message,
     },
+    /// Rewrite the body of an already-sent message (`Client::edit_message`).
+    EditText {
+        to: Jid,
+        message_id: String,
+        text: String,
+    },
     SendMedia {
         chat_jid: Jid,
         file_path: std::path::PathBuf,
@@ -243,6 +249,10 @@ impl Command {
     
     pub fn send_text_reply(to: Jid, text: String, reply_to: String) -> Self {
         Self::SendText { to, text, reply_to: Some(reply_to) }
+    }
+
+    pub fn edit_text(to: Jid, message_id: String, text: String) -> Self {
+        Self::EditText { to, message_id, text }
     }
     
     pub fn mark_as_read(chat_jid: Jid, message_ids: Vec<String>) -> Self {

@@ -338,6 +338,7 @@ pub struct MessageBubble<'a> {
     pub show_sender_name: bool,
     pub sender_name: Option<&'a str>,
     pub on_reply: Option<Box<dyn FnOnce(&'a str) + 'a>>,
+    pub on_edit: Option<Box<dyn FnOnce(&'a str) + 'a>>,
     pub on_delete: Option<Box<dyn FnOnce(&'a str) + 'a>>,
     pub on_download: Option<Box<dyn Fn(&'a str) + 'a>>,
     pub on_react: Option<Box<dyn FnOnce(&'a str, &'a str) + 'a>>,
@@ -353,6 +354,7 @@ impl<'a> MessageBubble<'a> {
             show_sender_name: false,
             sender_name: None,
             on_reply: None,
+            on_edit: None,
             on_delete: None,
             on_download: None,
             on_react: None,
@@ -374,6 +376,11 @@ impl<'a> MessageBubble<'a> {
 
     pub fn on_delete(mut self, f: impl FnOnce(&'a str) + 'a) -> Self {
         self.on_delete = Some(Box::new(f));
+        self
+    }
+
+    pub fn on_edit(mut self, f: impl FnOnce(&'a str) + 'a) -> Self {
+        self.on_edit = Some(Box::new(f));
         self
     }
 
@@ -917,7 +924,12 @@ impl<'a> Widget for MessageBubble<'a> {
             painter.text(
                 egui::pos2(bubble_rect.max.x - bubble_padding.x, bubble_rect.max.y - bubble_padding.y),
                 egui::Align2::RIGHT_BOTTOM,
-                format!("{}{}", time_str, status_text),
+                format!(
+                    "{}{}{}",
+                    if self.message.edited { "upraveno · " } else { "" },
+                    time_str,
+                    status_text
+                ),
                 FontId::proportional(10.0),
                 time_color,
             );
@@ -1110,6 +1122,17 @@ impl<'a> Widget for MessageBubble<'a> {
                     f(&self.message.id);
                 }
                 ui.close();
+            }
+            // Only plain text can be rewritten in place; media captions and
+            // system-ish bubbles have no editable body.
+            if self.is_own && self.message.media_type.is_none() && !self.message.text.is_empty() {
+                let mut on_edit = self.on_edit;
+                if ui.button("Upravit").clicked() {
+                    if let Some(f) = on_edit.take() {
+                        f(&self.message.id);
+                    }
+                    ui.close();
+                }
             }
             if ui.button("Copy").clicked() {
                 ui.copy_text(self.message.text.clone());
@@ -1348,5 +1371,49 @@ mod timeline_tests {
     #[test]
     fn timeline_degrades_on_narrow_bubbles() {
         assert!(!render(120.0, 80.0, "narrow"));
+    }
+}
+
+#[cfg(test)]
+mod bubble_tests {
+    use super::*;
+    use crate::state::{Message, MessageStatus};
+
+    fn message(body: &str, from_me: bool) -> Message {
+        let jid = whatsapp_rust::wacore_binary::Jid::pn("420777888999");
+        Message::new_text(
+            "msg-1".into(),
+            jid.clone(),
+            jid,
+            body.to_string(),
+            chrono::Utc::now(),
+            from_me,
+            MessageStatus::Sent,
+            None,
+            None,
+        )
+    }
+
+    fn render(message: &Message, is_own: bool) {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            ui.set_max_width(360.0);
+            MessageBubble::new(message, is_own).ui(ui);
+        });
+        output.textures_delta.clear();
+    }
+
+    /// The edit marker is painted into the already-measured meta row, so a long
+    /// body must still lay out without panicking.
+    #[test]
+    fn edited_bubble_renders() {
+        let mut msg = message("opravený text", true);
+        msg.edited = true;
+        render(&msg, true);
+    }
+
+    #[test]
+    fn unedited_bubble_renders() {
+        render(&message("plain", false), false);
     }
 }

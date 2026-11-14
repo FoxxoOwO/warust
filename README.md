@@ -21,6 +21,7 @@ Designed as a high-performance alternative to resource-heavy Electron applicatio
 * **Instant Responsive UI**: Built with immediate-mode GUI (`egui 0.37`), low latency, and 60+ FPS scrolling.
 * **Chat Management**: Pin/unpin chats, mute notifications, archive chats, mark as read/unread, and clear conversations.
 * **Contact Resolution**: Merges Phone Number (PN) and LID (Linked Identity) conversations into unified chats with contact names.
+* **Message Editing**: Rewrite an already-sent message from the bubble menu; the original timestamp is kept and the bubble is marked *upraveno*. Edits arriving from other devices rewrite the stored message instead of adding a duplicate.
 * **QR & Pair Code Login**: Log in by scanning the QR code or pair using an 8-character verification code sent to your phone number.
 
 ### Notifications
