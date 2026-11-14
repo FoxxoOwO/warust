@@ -179,13 +179,26 @@ impl<'a> Widget for ChatItem<'a> {
         let height = 72.0;
         let desired_size = Vec2::new(ui.available_width(), height);
         let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click());
-        
-        if self.is_selected {
-            ui.painter().rect_filled(rect, 0.0, chat_list::SELECTED);
-        } else if response.hovered() {
-            ui.painter().rect_filled(rect, 0.0, chat_list::HOVER);
-        } else {
-            ui.painter().rect_filled(rect, 0.0, chat_list::BACKGROUND);
+
+        // Hover and selection cross-fade instead of snapping between three
+        // hard-coded fills, and the accent bar grows out of the left edge with
+        // the selection so a chat switch reads as one movement.
+        let row_id = egui::Id::unique(("chat_row", self.chat.jid.to_string()));
+        let hover = crate::ui::animations::hover_t(ui.ctx(), row_id.with("hover"), response.hovered());
+        let selected = crate::ui::animations::hover_t(ui.ctx(), row_id.with("selected"), self.is_selected);
+        let fill = crate::ui::animations::lerp_color(
+            crate::ui::animations::lerp_color(chat_list::BACKGROUND, chat_list::HOVER, hover),
+            chat_list::SELECTED,
+            selected,
+        );
+        ui.painter().rect_filled(rect, 0.0, fill);
+        if selected > 0.01 {
+            let bar = egui::Rect::from_center_size(
+                egui::pos2(rect.min.x + 2.0, rect.center().y),
+                Vec2::new(3.0, rect.height() * selected),
+            );
+            ui.painter()
+                .rect_filled(bar, 2.0, crate::ui::animations::fade_color(crate::theme::ACCENT, selected));
         }
         
         if ui.is_rect_visible(rect) {
@@ -404,7 +417,10 @@ pub struct MessageBubble<'a> {
     pub selection_mode: bool,
     pub selected: bool,
     /// Briefly tinted and outlined, e.g. after jumping here from search.
-    pub highlight: bool,
+    /// A 0..1 intensity, so the tint can fade in and back out.
+    pub highlight: f32,
+    /// Fade-in progress for a bubble that just arrived; 1.0 means fully there.
+    pub entrance: f32,
     /// Fired with the option name when a poll option row is clicked.
     pub on_poll_option: Option<Box<dyn FnOnce(String) + 'a>>,
     /// Fired by the "Hlasovat" button of a multi-choice poll.
@@ -436,7 +452,8 @@ impl<'a> MessageBubble<'a> {
             is_pinned: false,
             selection_mode: false,
             selected: false,
-            highlight: false,
+            highlight: 0.0,
+            entrance: 1.0,
             on_poll_option: None,
             on_poll_submit: None,
             poll_draft: Vec::new(),
@@ -492,8 +509,15 @@ impl<'a> MessageBubble<'a> {
         self
     }
 
-    pub fn highlight(mut self, on: bool) -> Self {
-        self.highlight = on;
+    pub fn highlight(mut self, amount: f32) -> Self {
+        self.highlight = amount.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Fade a bubble that just arrived in. Takes an already eased 0..1 and only
+    /// touches opacity, so the bubble never moves its neighbours.
+    pub fn entrance(mut self, amount: f32) -> Self {
+        self.entrance = amount.clamp(0.0, 1.0);
         self
     }
 
@@ -755,6 +779,12 @@ impl<'a> Widget for MessageBubble<'a> {
         let row_height = bubble_height + if has_reactions { 14.0 } else { 4.0 };
         let row_size = Vec2::new(ui.available_width(), row_height);
         let (row_rect, response) = ui.allocate_exact_size(row_size, Sense::click());
+
+        // A bubble that just arrived fades in where it will stay; the row was
+        // already measured, so nothing under it shifts while it appears.
+        if self.entrance < 1.0 {
+            ui.set_opacity(self.entrance);
+        }
         
         let mut audio_clicked = false;
         let mut video_scrub_used = false;
@@ -1387,17 +1417,31 @@ impl<'a> Widget for MessageBubble<'a> {
         
         // Selection mode swallows the click, so tapping a bubble ticks it
         // instead of opening, playing or downloading the attachment.
-        if self.selection_mode || self.highlight {
-            if self.highlight || self.selected {
-                ui.painter().rect_filled(
+        if self.selection_mode || self.highlight > 0.0 {
+            if self.highlight > 0.0 || self.selected {
+                let painter = ui.painter();
+                // A ticked message keeps the steady tint it always had; the jump
+                // flash rides on top of it and lets go as it fades.
+                let tint = if self.selected { 1.0 } else { self.highlight };
+                painter.rect_filled(
                     bubble_rect,
                     egui::CornerRadius::same(9),
-                    Color32::from_rgba_unmultiplied(0x00, 0xA8, 0x84, 0x24),
+                    crate::ui::animations::fade_color(
+                        Color32::from_rgb(0x00, 0xA8, 0x84),
+                        tint * 0.14,
+                    ),
                 );
-                ui.painter().rect_stroke(
-                    bubble_rect.expand(1.0),
+                // The outline expands slightly while it fades out, which reads
+                // as the flash letting go instead of blinking off.
+                let spread = if self.selected {
+                    1.0
+                } else {
+                    1.0 + 3.0 * (1.0 - self.highlight)
+                };
+                painter.rect_stroke(
+                    bubble_rect.expand(spread),
                     egui::CornerRadius::same(10),
-                    egui::Stroke::new(2.0, crate::theme::ACCENT),
+                    egui::Stroke::new(2.0, crate::ui::animations::fade_color(crate::theme::ACCENT, tint)),
                     egui::StrokeKind::Outside,
                 );
             }
@@ -1851,6 +1895,23 @@ mod bubble_tests {
                 MessageBubble::new(&message("tick me", false), false)
                     .selection_mode(true)
                     .selected(selected)
+                    .ui(ui);
+            });
+            output.textures_delta.clear();
+        }
+    }
+
+    /// The jump flash and the arrival fade are intensities, so partial values
+    /// have to lay out as happily as 0.0 and 1.0 do.
+    #[test]
+    fn animated_bubble_states_render() {
+        let ctx = egui::Context::default();
+        for step in [0.0, 0.35, 1.0] {
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                ui.set_max_width(360.0);
+                MessageBubble::new(&message("flash me", false), false)
+                    .highlight(step)
+                    .entrance(step)
                     .ui(ui);
             });
             output.textures_delta.clear();

@@ -43,6 +43,9 @@ impl WarustApp {
             crate::backend::spawn_backend(state_clone).await
         })?;
 
+        // Check for updates in the background (honours the preference flag).
+        crate::updater::spawn_periodic_check(state.clone());
+
         // Initialize system tray icon if enabled
         let tray = if run_in_tray {
             match crate::tray::SystemTray::new() {
@@ -158,6 +161,11 @@ impl eframe::App for WarustApp {
                         self.show_settings = true;
                     }
 
+                    // Update-available badge
+                    if crate::ui::update_dialog::update_badge(ui, &self.state) {
+                        self.state.write().show_update_dialog = true;
+                    }
+
                     // Scheduled messages manager button
                     let pending_scheduled = self.state.read().scheduled_messages.iter()
                         .filter(|m| m.status == crate::state::ScheduledStatus::Pending)
@@ -254,7 +262,7 @@ impl eframe::App for WarustApp {
             crate::ui::call_dialog::show_call_overlay(ctx, &self.state, backend);
             // Above the call overlay: a view-once payload is the most modal thing there is.
             crate::ui::view_once_modal::show_view_once_modal(ctx, &self.state, backend);
-            crate::ui::view_once_modal::show_view_once_modal(ctx, &self.state, backend);
+            crate::ui::update_dialog::show_update_dialog(ctx, &self.state);
         }
 
         // Surface audio playback failures (missing ffmpeg, no output device...)

@@ -61,6 +61,17 @@ fn show_welcome_screen(ui: &mut Ui, _state: &AppState) {
 fn show_chat_view(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Chat, messages: &[Message], chat_jid: &Jid, backend: &crate::backend::BackendHandle) {
     let selecting = !state.selected_messages.is_empty();
 
+    // Switching chats used to snap the whole pane into place. A short fade makes
+    // the swap read as one movement; the id is the chat, so it plays once.
+    let appear = crate::ui::animations::entrance(
+        ui.ctx(),
+        egui::Id::unique(("chat_view", chat_jid.to_string())),
+        crate::ui::animations::MEDIUM,
+    );
+    if appear < 1.0 {
+        ui.set_opacity(appear);
+    }
+
     // The info panel spans the full height on the right, so it has to claim its
     // space before the header and message area do.
     if state.show_chat_info {
@@ -92,23 +103,17 @@ fn show_chat_view(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Chat, 
     // Above the history, below the header — the same slot WhatsApp uses.
     show_pinned_banner(ui, state, messages, chat_jid, backend);
 
-    // Bottom-up layout pins composer to the absolute bottom of the window (no empty gap)
-    ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-        if !selecting {
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), 0.0),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    show_composer(ui, state, chat_jid, backend);
-                },
-            );
-            ui.separator();
-        }
-        
-        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-            show_messages_area(ui, state, chat, messages, chat_jid, backend);
-        });
-    });
+    // The composer is its own bottom panel: a bottom-up layout with a zero-sized
+    // child let the history paint over it, because the child reported no height.
+    if !selecting {
+        egui::Panel::bottom("composer_bar")
+            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(0, 0)))
+            .show(ui, |ui| {
+                show_composer(ui, state, chat_jid, backend);
+            });
+    }
+
+    show_messages_area(ui, state, chat, messages, chat_jid, backend);
 }
 
 /// Bulk-action bar shown in place of the chat header while messages are ticked.
@@ -491,7 +496,19 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
     let open_emoji_picker_id = std::rc::Rc::new(std::cell::RefCell::new(None));
     let to_open_picker = open_emoji_picker_id.clone();
     
+    // Bubbles that are new this frame fade in instead of popping; only the tail
+    // of the history is tracked, which is where incoming messages land.
+    const ARRIVALS_WINDOW: usize = 30;
+    let arrivals_id = egui::Id::unique(("conv_arrivals", chat_jid.to_string()));
+    crate::ui::animations::track_arrivals(
+        ui.ctx(),
+        arrivals_id,
+        messages.iter().map(|m| m.id.as_str()),
+        ARRIVALS_WINDOW,
+    );
+
     ScrollArea::vertical()
+        .animated(true)
         .auto_shrink([false, false])
         .stick_to_bottom(should_scroll_to_bottom)
         .max_height(available_height)
@@ -549,6 +566,23 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
                         .jump_target
                         .as_ref()
                         .is_some_and(|target| target.message_id == msg.id);
+                    // The flash fades in and back out on its own, so the tint is
+                    // an intensity rather than a flag.
+                    let jump_flash = if jump_here {
+                        state
+                            .jump_target
+                            .as_ref()
+                            .map_or(0.0, |target| target.intensity())
+                    } else {
+                        0.0
+                    };
+                    let arrival = crate::ui::animations::arrival_alpha(
+                        ui.ctx(),
+                        arrivals_id,
+                        &msg.id,
+                        crate::ui::animations::MEDIUM,
+                        0.015,
+                    );
                     let draft_for_msg = if draft_owner
                         .as_ref()
                         .is_some_and(|(id, _)| id == &msg.id)
@@ -615,7 +649,8 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
                                 *view_once_handle.borrow_mut() = Some(msg_id.clone());
                             }
                         })
-                        .highlight(jump_here)
+                        .highlight(jump_flash)
+                        .entrance(arrival)
                         .me(me_jid.as_str())
                         .poll_draft(draft_for_msg)
                         .on_poll_option({
@@ -645,8 +680,7 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
                                 target.scrolled = true;
                             }
                         }
-                        ui.ctx()
-                            .request_repaint_after(std::time::Duration::from_millis(300));
+                        ui.ctx().request_repaint();
                     }
 
                     ui.add_space(2.0);

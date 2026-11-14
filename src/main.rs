@@ -22,6 +22,7 @@ mod storage;
 mod theme;
 pub mod tray;
 mod ui;
+mod updater;
 mod util;
 mod vcard;
 

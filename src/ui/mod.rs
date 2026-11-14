@@ -14,6 +14,7 @@ pub mod export_dialog;
 pub mod search_dialog;
 pub mod palette;
 pub mod sticker_dialog;
+pub mod update_dialog;
 pub mod view_once_modal;
 pub mod schedule_dialog;
 pub mod call_dialog;
@@ -89,6 +90,10 @@ pub fn open_chat(state: &mut AppState, jid: &Jid, backend: &BackendHandle) {
 /// go before the dialog that raised them.
 pub fn close_topmost_dialog(state: &mut AppState) -> bool {
     if state.confirm.take().is_some() {
+        return true;
+    }
+    if state.show_update_dialog {
+        state.show_update_dialog = false;
         return true;
     }
     if state.show_command_palette {
