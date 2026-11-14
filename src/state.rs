@@ -1570,8 +1570,118 @@ impl AppState {
 
 pub type SharedState = Arc<RwLock<AppState>>;
 
+// ── @zmínky ────────────────────────────────────────────────────────────────
+
+/// The `@` token currently being typed in the composer, if there is one.
+pub fn active_mention_query(text: &str) -> Option<&str> {
+    let at = text.rfind('@')?;
+    let tail = &text[at + 1..];
+    if tail.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(tail)
+}
+
+/// Rewrites the in-progress `@` token into a complete mention of `name`.
+pub fn apply_mention(text: &mut String, name: &str) {
+    if let Some(at) = text.rfind('@') {
+        text.truncate(at);
+    }
+    text.push('@');
+    text.push_str(name);
+    text.push(' ');
+}
+
+/// Participants matching the in-progress `@` token, alphabetical, capped.
+pub fn mention_suggestions<'a>(text: &str, people: &'a [(Jid, String)]) -> Vec<&'a (Jid, String)> {
+    let Some(query) = active_mention_query(text) else {
+        return Vec::new();
+    };
+    let needle = query.to_lowercase();
+    let mut found: Vec<&(Jid, String)> = people
+        .iter()
+        .filter(|(_, name)| name.to_lowercase().starts_with(&needle))
+        .collect();
+    found.sort_by_key(|(_, name)| name.to_lowercase());
+    found.truncate(6);
+    found
+}
+
+/// JIDs whose `@Jméno` token stands in `text`, in order of appearance.
+///
+/// WhatsApp expects the mentioned JIDs in `ContextInfo.mentioned_jid`; the server
+/// does not derive them from the body, so the client has to. A name only counts
+/// when the character after it is not a word character, otherwise `@Ann` would
+/// also match inside `@Anna`.
+pub fn collect_mentions(text: &str, people: &[(Jid, String)]) -> Vec<Jid> {
+    let mut hits: Vec<(usize, Jid)> = Vec::new();
+    for (jid, name) in people {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let needle = format!("@{name}");
+        for (pos, _) in text.match_indices(&needle) {
+            let after = text[pos + needle.len()..].chars().next();
+            if after.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                continue;
+            }
+            hits.push((pos, jid.clone()));
+        }
+    }
+    hits.sort_by_key(|(pos, _)| *pos);
+    hits.dedup_by(|later, earlier| later.1 == earlier.1);
+    hits.into_iter().map(|(_, jid)| jid).collect()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mention_query_only_lives_inside_an_unfinished_token() {
+        assert_eq!(active_mention_query("ahoj @Pe"), Some("Pe"));
+        assert_eq!(active_mention_query("ahoj @"), Some(""));
+        assert_eq!(active_mention_query("ahoj @Petr "), None);
+        assert_eq!(active_mention_query("bez zminky"), None);
+    }
+
+    #[test]
+    fn applying_a_mention_replaces_the_partial_token() {
+        let mut text = "ahoj @Pe".to_string();
+        apply_mention(&mut text, "Petr Novak");
+        assert_eq!(text, "ahoj @Petr Novak ");
+    }
+
+    #[test]
+    fn suggestions_are_filtered_alphabetically_and_capped() {
+        let people = vec![
+            (Jid::pn("111"), "Petr".to_string()),
+            (Jid::pn("222"), "Pavla".to_string()),
+            (Jid::pn("333"), "Anna".to_string()),
+        ];
+        let found: Vec<String> = mention_suggestions("ahoj @P", &people)
+            .iter()
+            .map(|(_, name)| name.clone())
+            .collect();
+        assert_eq!(found, vec!["Pavla".to_string(), "Petr".to_string()]);
+        assert_eq!(mention_suggestions("ahoj @", &people).len(), 3);
+        assert!(mention_suggestions("ahoj", &people).is_empty());
+    }
+
+    #[test]
+    fn collected_mentions_follow_text_order_and_skip_prefix_names() {
+        let people = vec![
+            (Jid::pn("111"), "Ann".to_string()),
+            (Jid::pn("222"), "Anna".to_string()),
+        ];
+        // `@Anna` must not drag `Ann` along, and order follows the text.
+        assert_eq!(
+            collect_mentions("@Anna a @Ann", &people),
+            vec![Jid::pn("222"), Jid::pn("111")]
+        );
+        assert!(collect_mentions("bez zminek", &people).is_empty());
+    }
+
+
     use super::*;
 
     #[test]

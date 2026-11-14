@@ -694,12 +694,12 @@ impl<'a> Widget for MessageBubble<'a> {
 
         let has_text = !display_text.trim().is_empty();
         let galley = if has_text {
-            Some(ui.painter().layout(
-                display_text,
+            Some(ui.painter().layout_job(mention_layout_job(
+                display_text.as_str(),
                 crate::theme::message_font(font_size),
                 text_color,
                 text_wrap_width,
-            ))
+            )))
         } else {
             None
         };
@@ -1929,4 +1929,49 @@ mod preview_tests {
             "Reakce"
         );
     }
+}
+
+/// Lays out message text, tinting `@jméno` tokens the way WhatsApp does.
+///
+/// The token is only a display cue here — what actually goes on the wire is
+/// `ContextInfo.mentioned_jid`, built when the message is sent.
+fn mention_layout_job(
+    text: &str,
+    font: egui::FontId,
+    color: egui::Color32,
+    wrap_width: f32,
+) -> egui::text::LayoutJob {
+    let plain = egui::TextFormat {
+        font_id: font.clone(),
+        color,
+        ..Default::default()
+    };
+    let accent = egui::TextFormat {
+        font_id: font.clone(),
+        color: crate::theme::ACCENT,
+        ..Default::default()
+    };
+
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = wrap_width;
+
+    let mut rest = text;
+    while let Some(at) = rest.find('@') {
+        if at > 0 {
+            job.append(&rest[..at], 0.0, plain.clone());
+        }
+        let after = &rest[at + 1..];
+        let len = after.find(|c: char| c.is_whitespace()).unwrap_or(after.len());
+        if len == 0 {
+            job.append("@", 0.0, plain.clone());
+            rest = after;
+            continue;
+        }
+        job.append(&format!("@{}", &after[..len]), 0.0, accent.clone());
+        rest = &after[len..];
+    }
+    if !rest.is_empty() {
+        job.append(rest, 0.0, plain);
+    }
+    job
 }

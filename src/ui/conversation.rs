@@ -1116,6 +1116,49 @@ fn show_composer(ui: &mut Ui, state: &mut AppState, chat_jid: &Jid, backend: &cr
         return;
     }
 
+    // @zmínky: while the user types a name after `@`, offer matching members.
+    let mention_people_list = mention_people(state, chat_jid);
+    let suggestions: Vec<(Jid, String)> =
+        crate::state::mention_suggestions(&state.composer_text, &mention_people_list)
+            .into_iter()
+            .cloned()
+            .collect();
+    if !suggestions.is_empty() {
+        let mut picked: Option<String> = None;
+        Frame::new()
+            .fill(Color32::from_rgb(0x1A, 0x26, 0x2C))
+            .inner_margin(Margin::symmetric(12, 6))
+            .corner_radius(egui::CornerRadius::same(6))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new("@")
+                            .font(FontId::proportional(12.0))
+                            .color(crate::theme::ACCENT),
+                    );
+                    for (_, name) in &suggestions {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(name.clone())
+                                        .font(FontId::proportional(12.0))
+                                        .color(Color32::WHITE),
+                                )
+                                .frame(false),
+                            )
+                            .clicked()
+                        {
+                            picked = Some(name.clone());
+                        }
+                    }
+                });
+            });
+        ui.add_space(2.0);
+        if let Some(name) = picked {
+            crate::state::apply_mention(&mut state.composer_text, &name);
+        }
+    }
+
     Frame::new()
         .fill(Color32::from_rgb(0x1F, 0x2C, 0x34))
         .inner_margin(Margin::symmetric(16, 10))
@@ -1268,10 +1311,17 @@ fn show_composer(ui: &mut Ui, state: &mut AppState, chat_jid: &Jid, backend: &cr
                             view_once,
                         });
                     } else {
-                        let _ = backend.send_command(Command::SendText { 
-                            to: chat_jid.clone(), 
-                            text, 
+                        let people = mention_people(state, chat_jid);
+                        let mentioned_jid: Vec<String> =
+                            crate::state::collect_mentions(&text, &people)
+                                .into_iter()
+                                .map(|jid| jid.to_string())
+                                .collect();
+                        let _ = backend.send_command(Command::SendText {
+                            to: chat_jid.clone(),
+                            text,
                             reply_to,
+                            mentioned_jid,
                         });
                     }
                     state.composer_text.clear();
@@ -1458,4 +1508,21 @@ mod tests {
         msg.media_type = None;
         assert_eq!(pinned_preview(&msg), "Zpráva");
     }
+}
+
+/// Group members as `(jid, jméno)` pairs — the pool both for `@` suggestions
+/// and for turning a finished body back into `mentioned_jid`.
+fn mention_people(state: &AppState, chat_jid: &Jid) -> Vec<(Jid, String)> {
+    let Some(chat) = state.chats.get(chat_jid) else {
+        return Vec::new();
+    };
+    if !chat.is_group {
+        return Vec::new();
+    }
+    let me = state.self_jid.clone();
+    chat.participants
+        .iter()
+        .filter(|jid| me.as_ref() != Some(*jid))
+        .filter_map(|jid| state.resolve_display_name(jid).map(|name| (jid.clone(), name)))
+        .collect()
 }
