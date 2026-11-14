@@ -6,6 +6,45 @@ use crate::theme::{bubble, chat_list, status};
 use crate::util::{format_timestamp, format_message_time, initials, truncate};
 
 /// Status indicator icon
+/// Chat-list preview text for a message, with WhatsApp's media markers.
+///
+/// The backend already labels uncaptioned media (`"📷 Image"`), so only the
+/// plain-caption case needs an icon prefix here.
+fn preview_label(preview: &crate::state::MessagePreview) -> String {
+    use crate::state::MediaType;
+
+    let text = preview.text.trim();
+    if text.starts_with("[Reaction]") {
+        return "Reakce".to_string();
+    }
+
+    let icon = match preview.media_type {
+        Some(MediaType::Image) => "📷",
+        Some(MediaType::Video) => "📹",
+        Some(MediaType::Audio) | Some(MediaType::Voice) => "🎤",
+        Some(MediaType::Document) => "📄",
+        Some(MediaType::Sticker) => "🎨",
+        None => "",
+    };
+
+    if text.is_empty() || text == "[Protocol Message]" {
+        return if icon.is_empty() {
+            "Zpráva".to_string()
+        } else {
+            format!("{} Zpráva", icon)
+        };
+    }
+
+    let already_labelled = ["📷", "📹", "🎤", "🎵", "📄", "🎨"]
+        .iter()
+        .any(|prefix| text.starts_with(prefix));
+    if icon.is_empty() || already_labelled {
+        text.to_string()
+    } else {
+        format!("{} {}", icon, text)
+    }
+}
+
 pub fn status_icon(ui: &mut Ui, status: crate::state::MessageStatus, size: f32) {
     let (icon, color) = match status {
         crate::state::MessageStatus::Sending => ("⏳", status::SENDING),
@@ -227,13 +266,7 @@ impl<'a> Widget for ChatItem<'a> {
                 );
                 ui.ctx().request_repaint();
             } else if let Some(preview) = &self.chat.last_message {
-                let clean_text = if preview.text == "[Protocol Message]" || preview.text.is_empty() {
-                    "Zpráva".to_string()
-                } else if preview.text.starts_with("[Reaction]") {
-                    "Reakce".to_string()
-                } else {
-                    preview.text.clone()
-                };
+                let clean_text = preview_label(preview);
 
                 let preview_text = if preview.from_me {
                     format!("You: {}", truncate(&clean_text, 40))
@@ -1488,4 +1521,76 @@ mod bubble_tests {
         }
     }
 
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::preview_label;
+    use crate::state::{MediaType, MessagePreview, MessageStatus};
+    use chrono::Utc;
+
+    fn preview(text: &str, media_type: Option<MediaType>) -> MessagePreview {
+        MessagePreview {
+            text: text.to_string(),
+            timestamp: Utc::now(),
+            from_me: false,
+            status: MessageStatus::Sent,
+            media_type,
+        }
+    }
+
+    #[test]
+    fn plain_text_is_untouched() {
+        assert_eq!(preview_label(&preview("ahoj", None)), "ahoj");
+    }
+
+    #[test]
+    fn empty_text_without_media_is_a_generic_message() {
+        assert_eq!(preview_label(&preview("", None)), "Zpráva");
+        assert_eq!(
+            preview_label(&preview("[Protocol Message]", None)),
+            "Zpráva"
+        );
+    }
+
+    #[test]
+    fn empty_text_with_media_names_the_type() {
+        assert_eq!(
+            preview_label(&preview("", Some(MediaType::Image))),
+            "📷 Zpráva"
+        );
+        assert_eq!(
+            preview_label(&preview("[Protocol Message]", Some(MediaType::Voice))),
+            "🎤 Zpráva"
+        );
+    }
+
+    #[test]
+    fn media_caption_gets_one_icon_prefix() {
+        assert_eq!(
+            preview_label(&preview("ahoj", Some(MediaType::Image))),
+            "📷 ahoj"
+        );
+    }
+
+    #[test]
+    fn already_labelled_media_is_not_prefixed_twice() {
+        // The backend turns caption-less media into "📷 Image" and friends.
+        assert_eq!(
+            preview_label(&preview("📷 Image", Some(MediaType::Image))),
+            "📷 Image"
+        );
+        assert_eq!(
+            preview_label(&preview("🎤 Voice Message", Some(MediaType::Voice))),
+            "🎤 Voice Message"
+        );
+    }
+
+    #[test]
+    fn reactions_are_named_not_rendered_as_payload() {
+        assert_eq!(
+            preview_label(&preview("[Reaction] 👍", None)),
+            "Reakce"
+        );
+    }
 }

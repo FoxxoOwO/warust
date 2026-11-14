@@ -61,6 +61,24 @@ fn show_welcome_screen(ui: &mut Ui, _state: &AppState) {
 fn show_chat_view(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Chat, messages: &[Message], chat_jid: &Jid, backend: &crate::backend::BackendHandle) {
     let selecting = !state.selected_messages.is_empty();
 
+    // The info panel spans the full height on the right, so it has to claim its
+    // space before the header and message area do.
+    if state.show_chat_info {
+        egui::Panel::right("chat_info_panel")
+            .resizable(true)
+            .default_size(320.0)
+            .min_size(260.0)
+            .max_size(420.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(crate::theme::chat_list::BACKGROUND)
+                    .inner_margin(egui::Margin::symmetric(10, 4)),
+            )
+            .show(ui, |ui| {
+                crate::ui::chat_info::show(ui, state, chat, backend);
+            });
+    }
+
     // While messages are ticked the header turns into the bulk-action bar and
     // the composer is hidden: sending a draft mid-selection would be surprising.
     if selecting {
@@ -227,13 +245,38 @@ fn show_chat_header(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Chat
                     ui.close();
                 }
                 let is_muted = chat.is_muted();
-                if ui.button(if is_muted { "🔔 Unmute notifications" } else { "🔕 Mute notifications" }).clicked() {
-                    let cmd = if is_muted {
-                        Command::UnmuteChat { chat_jid: chat.jid.clone() }
-                    } else {
-                        Command::MuteChat { chat_jid: chat.jid.clone(), until: None }
-                    };
-                    let _ = backend.send_command(cmd);
+                // A submenu, like WhatsApp Web: mute is always a choice of
+                // duration, not a single toggle.
+                ui.menu_button(
+                    if is_muted { "🔔  Umlčení" } else { "🔕  Umlčení" },
+                    |ui| {
+                        if ui.button("Vypnout umlčení").clicked() {
+                            let _ = backend.send_command(Command::UnmuteChat {
+                                chat_jid: chat.jid.clone(),
+                            });
+                            ui.close();
+                        }
+                        for (label, hours) in [("8 hodin", 8i64), ("1 týden", 24 * 7)] {
+                            if ui.button(label).clicked() {
+                                let until = chrono::Utc::now() + chrono::Duration::hours(hours);
+                                let _ = backend.send_command(Command::MuteChat {
+                                    chat_jid: chat.jid.clone(),
+                                    until: Some(until),
+                                });
+                                ui.close();
+                            }
+                        }
+                        if ui.button("Vždy").clicked() {
+                            let _ = backend.send_command(Command::MuteChat {
+                                chat_jid: chat.jid.clone(),
+                                until: None,
+                            });
+                            ui.close();
+                        }
+                    },
+                );
+                if ui.button("ℹ  Info o chatu").clicked() {
+                    state.show_chat_info = !state.show_chat_info;
                     ui.close();
                 }
                 if ui.button("🗑 Clear messages").clicked() {
@@ -254,6 +297,21 @@ fn show_chat_header(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Chat
                     state.search_filter.scope = crate::search::SearchScope::CurrentChat;
                 }
             
+            ui.add_space(4.0);
+
+            // Chat info panel toggle
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("ℹ").font(FontId::proportional(18.0)))
+                        .frame(false)
+                        .fill(Color32::TRANSPARENT),
+                )
+                .on_hover_text("Info o chatu")
+                .clicked()
+            {
+                state.show_chat_info = !state.show_chat_info;
+            }
+
             ui.add_space(4.0);
 
             // Video call
