@@ -60,6 +60,7 @@ glow = "0.14"
 console_error_panic_hook = { version = "0.1", optional = true }
 rodio = { version = "0.23", default-features = false, features = ["playback", "mp3", "mp4", "vorbis", "wav", "flac"] }
 notify-rust = "4.19.0"
+cpal = "0.18.2"
 
 [target.'cfg(windows)'.dependencies]
 tray-item = "0.10.0"

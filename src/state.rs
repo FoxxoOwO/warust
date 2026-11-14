@@ -426,6 +426,8 @@ pub struct AppState {
     pub pair_phone_number: String,
     pub show_new_chat_dialog: bool,
     pub new_chat_input: String,
+    /// Invite link typed into the ➕ drawer to join a group.
+    pub join_link_input: String,
     pub new_chat_error: Option<String>,
     /// Group details fetched from the server on demand (description, admins,
     /// invite link). Keyed by group JID and dropped when it goes stale.
@@ -451,6 +453,9 @@ pub struct AppState {
     /// fire a request on every frame.
     #[serde(skip)]
     pub group_info_pending: HashSet<String>,
+    /// Last microphone failure, shown above the composer until it works again.
+    #[serde(skip)]
+    pub recorder_error: Option<String>,
     /// Inline editors for the group subject and description.
     #[serde(skip)]
     pub group_subject_draft: Option<(Jid, String)>,
@@ -555,6 +560,8 @@ impl Default for AppState {
             contacts_search: String::new(),
             confirm: None,
             group_info_pending: HashSet::new(),
+            recorder_error: None,
+            join_link_input: String::new(),
             group_subject_draft: None,
             group_desc_draft: None,
             lid_to_pn: HashMap::new(),

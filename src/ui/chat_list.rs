@@ -238,6 +238,38 @@ fn show_header(ui: &mut Ui, state: &mut AppState, backend: &crate::backend::Back
                 ui.add_space(6.0);
                 ui.separator();
                 ui.add_space(4.0);
+                // Joining by link lives here because it needs no contact.
+                ui.label(RichText::new("Připojit se do skupiny").font(FontId::proportional(13.0)).color(Color32::WHITE));
+                ui.add_space(4.0);
+                let mut join_requested = false;
+                ui.horizontal(|ui| {
+                    let input = ui.add(
+                        TextEdit::singleline(&mut state.join_link_input)
+                            .hint_text("https://chat.whatsapp.com/…")
+                            .desired_width(ui.available_width() - 80.0)
+                            .font(FontId::proportional(13.0))
+                    );
+                    if input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        join_requested = true;
+                    }
+                    if ui.button("Připojit").clicked() {
+                        join_requested = true;
+                    }
+                });
+                if join_requested {
+                    let code = state.join_link_input.trim().to_string();
+                    if code.is_empty() {
+                        state.new_chat_error = Some("Zadej odkaz nebo kód pozvánky".to_string());
+                    } else {
+                        let _ = backend.send_command(crate::commands::Command::JoinGroup { invite_code: code });
+                        state.join_link_input.clear();
+                        state.new_chat_error = None;
+                        state.show_new_chat_dialog = false;
+                    }
+                }
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(4.0);
                 ui.label(RichText::new("Start chat with phone number:").font(FontId::proportional(13.0)).color(Color32::WHITE));
                 ui.add_space(4.0);
                 
