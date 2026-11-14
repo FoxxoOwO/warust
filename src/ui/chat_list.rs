@@ -30,6 +30,7 @@ pub fn show_chat_list(ui: &mut Ui, state: &SharedState, backend: &crate::backend
                 let mut edit_contact_req = None;
                 let mut export_chat_req = None;
                 let mut schedule_chat_req = None;
+                let mut info_chat_req = None;
                 
                 ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -52,7 +53,7 @@ pub fn show_chat_list(ui: &mut Ui, state: &SharedState, backend: &crate::backend
                                 
                                 // Context menu
                                 response.context_menu(|ui| {
-                                    show_chat_context_menu(ui, chat, backend, &mut edit_contact_req, &mut export_chat_req, &mut schedule_chat_req);
+                                    show_chat_context_menu(ui, chat, backend, &mut edit_contact_req, &mut export_chat_req, &mut schedule_chat_req, &mut info_chat_req);
                                 });
                                 
                                 ui.add_space(1.0);
@@ -77,8 +78,16 @@ pub fn show_chat_list(ui: &mut Ui, state: &SharedState, backend: &crate::backend
                     s.show_schedule_dialog = true;
                 }
 
+                // "Contact info" selects the chat first, then opens the panel.
+                let info_requested = info_chat_req.is_some();
+                if clicked_jid.is_none() {
+                    clicked_jid = info_chat_req.take();
+                }
+
                 if let Some(jid) = clicked_jid {
                     let canon = s.canonical_jid(&jid);
+                    // Message ids only mean something inside one chat.
+                    s.selected_messages.clear();
                     s.selected_chat = Some(canon.clone());
                     let target_key = if s.chats.contains_key(&canon) { canon.clone() } else { jid.clone() };
                     if let Some(chat_mut) = s.chats.get_mut(&target_key) {
@@ -92,6 +101,10 @@ pub fn show_chat_list(ui: &mut Ui, state: &SharedState, backend: &crate::backend
                             count: 50,
                         });
                     }
+                }
+
+                if info_requested {
+                    s.show_chat_info = true;
                 }
             });
         });
@@ -228,6 +241,7 @@ fn show_header(ui: &mut Ui, state: &mut AppState, backend: &crate::backend::Back
                         let name = crate::util::format_jid(&target_jid);
                         let _ = state.get_or_create_chat(target_jid.clone(), name, false);
                         state.selected_chat = Some(target_jid.clone());
+                        state.selected_messages.clear();
                         state.show_new_chat_dialog = false;
                         state.new_chat_input.clear();
                         state.new_chat_error = None;
@@ -304,6 +318,7 @@ fn show_chat_context_menu(
     edit_contact_req: &mut Option<(whatsapp_rust::wacore_binary::Jid, String)>,
     export_chat_req: &mut Option<(whatsapp_rust::wacore_binary::Jid, String)>,
     schedule_chat_req: &mut Option<whatsapp_rust::wacore_binary::Jid>,
+    info_chat_req: &mut Option<whatsapp_rust::wacore_binary::Jid>,
 ) {
     let jid = chat.jid.clone();
 
@@ -350,15 +365,38 @@ fn show_chat_context_menu(
         ui.close();
     }
     
-    // Mute/Unmute
-    if ui.selectable_label(chat.is_muted(), if chat.is_muted() { "🔕  Unmute" } else { "🔕  Mute" }).clicked() {
-        let _ = backend.send_command(if chat.is_muted() {
-            crate::commands::Command::UnmuteChat { chat_jid: jid.clone() }
-        } else {
-            crate::commands::Command::MuteChat { chat_jid: jid.clone(), until: None }
-        });
-        ui.close();
-    }
+    // Mute notifications, with the duration choices WhatsApp offers.
+    ui.menu_button(
+        if chat.is_muted() { "🔔  Umlčení" } else { "🔕  Umlčení" },
+        |ui| {
+            if ui
+                .selectable_label(!chat.is_muted(), "Vypnout umlčení")
+                .clicked()
+            {
+                let _ = backend.send_command(crate::commands::Command::UnmuteChat {
+                    chat_jid: jid.clone(),
+                });
+                ui.close();
+            }
+            for (label, hours) in [("8 hodin", 8i64), ("1 týden", 24 * 7)] {
+                if ui.selectable_label(false, label).clicked() {
+                    let until = chrono::Utc::now() + chrono::Duration::hours(hours);
+                    let _ = backend.send_command(crate::commands::Command::MuteChat {
+                        chat_jid: jid.clone(),
+                        until: Some(until),
+                    });
+                    ui.close();
+                }
+            }
+            if ui.selectable_label(false, "Vždy").clicked() {
+                let _ = backend.send_command(crate::commands::Command::MuteChat {
+                    chat_jid: jid.clone(),
+                    until: None,
+                });
+                ui.close();
+            }
+        },
+    );
     
     ui.separator();
     
@@ -388,7 +426,7 @@ fn show_chat_context_menu(
     
     // Contact info
     if ui.selectable_label(false, "ℹ  Contact info").clicked() {
-        // TODO: Open contact info panel
+        *info_chat_req = Some(jid.clone());
         ui.close();
     }
 }

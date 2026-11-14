@@ -203,6 +203,8 @@ impl eframe::App for WarustApp {
         if let Some(backend) = self.backend.as_ref() {
             let ctx = ui.ctx();
             crate::ui::search_dialog::show_search_dialog(ctx, &self.state, backend);
+            crate::ui::forward_dialog::show_forward_dialog(ctx, &self.state, backend);
+            crate::ui::forward_dialog::show_forward_dialog(ctx, &self.state, backend);
             crate::ui::export_dialog::show_export_dialog(ctx, &self.state, backend);
             crate::ui::schedule_dialog::show_schedule_dialog(ctx, &self.state, backend);
             crate::ui::schedule_dialog::show_scheduled_manager(ctx, &self.state, backend);

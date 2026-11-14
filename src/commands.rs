@@ -38,6 +38,16 @@ pub enum Command {
         caption: Option<String>,
         reply_to: Option<String>,
     },
+    /// Relay already-sent messages into another chat (`Client::forward_message`).
+    ///
+    /// `from_chat` is where the ids live; the backend rebuilds each body from
+    /// its stored text or media file, because the original protocol envelope is
+    /// not kept around.
+    ForwardMessages {
+        to: Jid,
+        from_chat: Jid,
+        message_ids: Vec<String>,
+    },
     DownloadMedia {
         chat_jid: Jid,
         message_id: String,
@@ -189,7 +199,7 @@ pub enum Command {
         chat_jid: Jid,
         description: String,
     },
-    SetGroupEphemeral {
+    SetEphemeral {
         chat_jid: Jid,
         expiration: u32,
     },
@@ -253,6 +263,10 @@ impl Command {
 
     pub fn edit_text(to: Jid, message_id: String, text: String) -> Self {
         Self::EditText { to, message_id, text }
+    }
+
+    pub fn forward_messages(to: Jid, from_chat: Jid, message_ids: Vec<String>) -> Self {
+        Self::ForwardMessages { to, from_chat, message_ids }
     }
     
     pub fn mark_as_read(chat_jid: Jid, message_ids: Vec<String>) -> Self {

@@ -1,6 +1,7 @@
 //! UI module exports
 
 pub mod chat_list;
+pub mod chat_info;
 pub mod components;
 pub mod conversation;
 pub mod qr_pairing;
@@ -9,5 +10,6 @@ pub mod export_dialog;
 pub mod search_dialog;
 pub mod schedule_dialog;
 pub mod call_dialog;
+pub mod forward_dialog;
 pub mod animations;
 pub mod emoji;
