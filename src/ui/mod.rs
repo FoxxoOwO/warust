@@ -12,6 +12,7 @@ pub mod qr_pairing;
 pub mod settings;
 pub mod export_dialog;
 pub mod search_dialog;
+pub mod view_once_modal;
 pub mod schedule_dialog;
 pub mod call_dialog;
 pub mod forward_dialog;
@@ -39,6 +40,21 @@ pub fn open_chat(state: &mut AppState, jid: &Jid, backend: &BackendHandle) {
     }
     state.poll_draft = None;
     state.jump_target = None;
+
+    // Keep the half-written text with the chat it belongs to, and restore the
+    // new chat's own draft instead of leaking one into the other.
+    if state.selected_chat.as_ref() != Some(&canon) {
+        match state.selected_chat.clone() {
+            Some(previous) => state.stash_draft(&previous),
+            None => state.composer_text.clear(),
+        }
+        state.restore_draft(&canon);
+        state.pending_attachment = None;
+        state.send_view_once = false;
+        state.editing_message = None;
+        state.replying_to = None;
+    }
+
     state.selected_chat = Some(canon.clone());
 
     let target_key = if state.chats.contains_key(&canon) {

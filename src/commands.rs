@@ -37,6 +37,8 @@ pub enum Command {
         file_path: std::path::PathBuf,
         caption: Option<String>,
         reply_to: Option<String>,
+        /// Wrap the attachment so the recipient can open it only once.
+        view_once: bool,
     },
     /// Send a recorded voice note (already encoded to OGG/Opus by the recorder).
     SendVoiceNote {
@@ -56,6 +58,16 @@ pub enum Command {
         message_ids: Vec<String>,
     },
     DownloadMedia {
+        chat_jid: Jid,
+        message_id: String,
+    },
+    /// Fetch a view-once attachment into the media dir so the viewer can show it.
+    OpenViewOnce {
+        chat_jid: Jid,
+        message_id: String,
+    },
+    /// Drop the local copy of a view-once attachment after it was shown.
+    ConsumeViewOnce {
         chat_jid: Jid,
         message_id: String,
     },

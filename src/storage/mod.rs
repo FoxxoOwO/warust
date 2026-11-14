@@ -40,6 +40,9 @@ struct PersistedAppState {
     /// Chat jid (as a string, because JSON keys must be strings) to its pin.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pinned: HashMap<String, crate::state::PinnedMessage>,
+    /// Unsent composer text per chat, keyed the same way as `pinned`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    drafts: HashMap<String, String>,
 }
 
 /// Contents of one `messages/<hash>.json` file.
@@ -152,6 +155,11 @@ impl Store {
                     .pinned
                     .iter()
                     .map(|(jid, pin)| (jid.to_string(), pin.clone()))
+                    .collect(),
+                drafts: s
+                    .drafts
+                    .iter()
+                    .map(|(jid, text)| (jid.to_string(), text.clone()))
                     .collect(),
             };
             let mut history: Vec<(String, Vec<Message>)> = s
@@ -341,6 +349,11 @@ impl Store {
             .pinned
             .into_iter()
             .filter_map(|(jid, pin)| jid.parse::<Jid>().ok().map(|jid| (jid, pin)))
+            .collect();
+        state.drafts = persisted
+            .drafts
+            .into_iter()
+            .filter_map(|(jid, text)| jid.parse::<Jid>().ok().map(|jid| (jid, text)))
             .collect();
         state.clean_stray_reactions();
         state.consolidate_canonical_chats();
@@ -606,6 +619,7 @@ mod tests {
             preferences: UserPreferences::default(),
             initial_history_fetched: false,
             pinned: HashMap::new(),
+            drafts: HashMap::new(),
         };
         std::fs::create_dir_all(temp.path()).unwrap();
         std::fs::write(
