@@ -204,7 +204,12 @@ impl eframe::App for WarustApp {
             let ctx = ui.ctx();
             crate::ui::search_dialog::show_search_dialog(ctx, &self.state, backend);
             crate::ui::forward_dialog::show_forward_dialog(ctx, &self.state, backend);
-            crate::ui::forward_dialog::show_forward_dialog(ctx, &self.state, backend);
+            crate::ui::group_dialog::show_new_group_dialog(ctx, &self.state, backend);
+            crate::ui::group_dialog::show_add_member_dialog(ctx, &self.state, backend);
+            crate::ui::contacts_dialog::show_contacts_dialog(ctx, &self.state, backend);
+            // Last, so a confirmation always sits on top of the dialog that
+            // raised it.
+            crate::ui::confirm_dialog::show_confirm_dialog(ctx, &self.state, backend);
             crate::ui::export_dialog::show_export_dialog(ctx, &self.state, backend);
             crate::ui::schedule_dialog::show_schedule_dialog(ctx, &self.state, backend);
             crate::ui::schedule_dialog::show_scheduled_manager(ctx, &self.state, backend);

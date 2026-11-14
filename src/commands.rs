@@ -191,6 +191,10 @@ pub enum Command {
     GetGroupInviteLink {
         chat_jid: Jid,
     },
+    /// Fetch description, admin flags and settings for a group.
+    RequestGroupInfo {
+        chat_jid: Jid,
+    },
     SetGroupSubject {
         chat_jid: Jid,
         subject: String,

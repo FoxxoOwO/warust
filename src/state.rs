@@ -351,6 +351,63 @@ pub struct ForwardDialogState {
     pub search: String,
 }
 
+/// Group details that are not part of the chat row, filled by
+/// `Command::RequestGroupInfo`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GroupInfoSnapshot {
+    pub subject: String,
+    pub description: Option<String>,
+    /// Participants that may edit the group (the creator counts as one).
+    #[serde(default)]
+    pub admins: HashSet<Jid>,
+    #[serde(default)]
+    pub is_locked: bool,
+    #[serde(default)]
+    pub is_announcement: bool,
+    /// Only present after `Command::GetGroupInviteLink`.
+    pub invite_link: Option<String>,
+}
+
+impl GroupInfoSnapshot {
+    pub fn is_admin(&self, jid: &Jid) -> bool {
+        self.admins.contains(jid)
+    }
+}
+
+/// State of the "new group" dialog.
+#[derive(Debug, Clone, Default)]
+pub struct NewGroupState {
+    pub subject: String,
+    pub search: String,
+    pub selected: HashSet<Jid>,
+    pub error: Option<String>,
+}
+
+/// State of the "add member" dialog for an existing group.
+#[derive(Debug, Clone)]
+pub struct AddMemberState {
+    pub group_jid: Jid,
+    pub search: String,
+    pub selected: HashSet<Jid>,
+}
+
+/// A destructive action that asks for confirmation first.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ConfirmRequest {
+    pub title: String,
+    pub message: String,
+    pub confirm_label: String,
+    pub action: ConfirmAction,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum ConfirmAction {
+    BlockContact { jid: Jid },
+    LeaveGroup { chat_jid: Jid },
+    ClearChat { chat_jid: Jid },
+    DeleteChat { chat_jid: Jid },
+    RemoveMember { chat_jid: Jid, member: Jid },
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppState {
     pub chats: HashMap<Jid, Chat>,
@@ -370,6 +427,35 @@ pub struct AppState {
     pub show_new_chat_dialog: bool,
     pub new_chat_input: String,
     pub new_chat_error: Option<String>,
+    /// Group details fetched from the server on demand (description, admins,
+    /// invite link). Keyed by group JID and dropped when it goes stale.
+    /// Keyed by the JID's string form: serde_json object keys must be strings,
+    /// and `Jid` does not serialize as one.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub group_info: HashMap<String, GroupInfoSnapshot>,
+    /// New-group dialog, `None` when closed.
+    #[serde(skip)]
+    pub new_group: Option<NewGroupState>,
+    /// "Add member" dialog for an existing group.
+    #[serde(skip)]
+    pub add_member: Option<AddMemberState>,
+    /// Contact browser.
+    #[serde(skip)]
+    pub show_contacts_dialog: bool,
+    #[serde(skip)]
+    pub contacts_search: String,
+    /// Pending destructive action awaiting confirmation.
+    #[serde(skip)]
+    pub confirm: Option<ConfirmRequest>,
+    /// Group JIDs whose metadata we already asked for, so the panel does not
+    /// fire a request on every frame.
+    #[serde(skip)]
+    pub group_info_pending: HashSet<String>,
+    /// Inline editors for the group subject and description.
+    #[serde(skip)]
+    pub group_subject_draft: Option<(Jid, String)>,
+    #[serde(skip)]
+    pub group_desc_draft: Option<(Jid, String)>,
     pub lid_to_pn: HashMap<Jid, Jid>,
     #[serde(skip)]
     pub editing_contact: Option<(Jid, String)>,
@@ -462,6 +548,15 @@ impl Default for AppState {
             show_new_chat_dialog: false,
             new_chat_input: String::new(),
             new_chat_error: None,
+            group_info: HashMap::new(),
+            new_group: None,
+            add_member: None,
+            show_contacts_dialog: false,
+            contacts_search: String::new(),
+            confirm: None,
+            group_info_pending: HashSet::new(),
+            group_subject_draft: None,
+            group_desc_draft: None,
             lid_to_pn: HashMap::new(),
             editing_contact: None,
             scheduled_messages: Vec::new(),
@@ -1651,5 +1746,51 @@ mod selection_tests {
         let json = serde_json::to_string(&state).expect("state serializes");
         assert!(!json.contains("selected_messages"), "selection must stay out of the file");
         assert!(!json.contains("forward_dialog"), "an open dialog must not be persisted");
+    }
+
+    #[test]
+    fn transient_dialog_state_is_not_serialized() {
+        let mut state = AppState::default();
+        state.new_group = Some(NewGroupState {
+            subject: "Rodina".into(),
+            search: String::new(),
+            selected: Default::default(),
+            error: None,
+        });
+        state.show_contacts_dialog = true;
+        state.confirm = Some(ConfirmRequest {
+            title: "Smazat chat?".into(),
+            message: "Opravdu?".into(),
+            confirm_label: "Smazat".into(),
+            action: ConfirmAction::DeleteChat { chat_jid: jid() },
+        });
+
+        let json = serde_json::to_string(&state).expect("state serializes");
+        assert!(!json.contains("new_group"), "an open dialog must not be persisted");
+        assert!(!json.contains("show_contacts_dialog"), "panel state must stay transient");
+        assert!(!json.contains("confirm"), "a pending confirmation must not be persisted");
+    }
+
+    #[test]
+    fn group_snapshot_round_trips() {
+        let mut state = AppState::default();
+        let group = Jid::group("120363000000000000");
+        let mut snapshot = GroupInfoSnapshot {
+            subject: "Rodina".into(),
+            description: Some("Naše skupina".into()),
+            ..Default::default()
+        };
+        snapshot.admins.insert(jid());
+        state.group_info.insert(group.to_string(), snapshot);
+
+        let json = serde_json::to_string(&state).expect("state serializes");
+        let restored: AppState = serde_json::from_str(&json).expect("state deserializes");
+        let info = restored
+            .group_info
+            .get(&group.to_string())
+            .expect("snapshot survives");
+        assert_eq!(info.subject, "Rodina");
+        assert_eq!(info.description.as_deref(), Some("Naše skupina"));
+        assert!(info.is_admin(&jid()), "admin flags survive the round trip");
     }
 }

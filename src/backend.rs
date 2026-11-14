@@ -1870,6 +1870,41 @@ async fn handle_event(
     }
 }
 
+/// Pull a group's description, admin list and settings from the server and
+/// mirror them into the chat row (participants, subject). Groups are the only
+/// thing the UI cannot derive from message traffic, so every mutation funnels
+/// through here instead of patching the snapshot locally and drifting.
+async fn refresh_group_info(client: &Client, state: &SharedState, chat_jid: &Jid) {
+    match client.groups().get_metadata(chat_jid).await {
+        Ok(meta) => {
+            let participants: std::collections::HashSet<Jid> =
+                meta.participants.iter().map(|p| p.jid.clone()).collect();
+            let admins: std::collections::HashSet<Jid> = meta
+                .participants
+                .iter()
+                .filter(|p| p.is_admin())
+                .map(|p| p.jid.clone())
+                .collect();
+            let mut s = state.write();
+            let snapshot = s.group_info.entry(chat_jid.to_string()).or_default();
+            snapshot.subject = meta.subject.clone();
+            snapshot.description = meta.description.clone();
+            snapshot.admins = admins;
+            snapshot.is_locked = meta.is_locked;
+            snapshot.is_announcement = meta.is_announcement;
+            if let Some(chat) = s.chats.get_mut(chat_jid) {
+                chat.is_group = true;
+                chat.participants = participants;
+                if !meta.subject.is_empty() {
+                    chat.name = meta.subject.clone();
+                }
+            }
+            s.dirty = true;
+        }
+        Err(e) => warn!("group info for {} failed: {}", chat_jid, e),
+    }
+}
+
 async fn handle_command(
     cmd: Command,
     active_client: &Arc<tokio::sync::RwLock<Arc<Client>>>,
@@ -2854,9 +2889,33 @@ async fn handle_command(
                 options = options.with_participant(whatsapp_rust::wacore::iq::groups::GroupParticipantOptions::new(p.clone()));
             }
             let result = client.groups().create_group(options).await?;
-            let mut s = state.write();
-            let chat = s.get_or_create_chat(result.metadata.id.clone(), subject, true);
-            chat.is_group = true;
+            let group_jid = result.metadata.id.clone();
+            let participants: std::collections::HashSet<Jid> =
+                result.metadata.participants.iter().map(|p| p.jid.clone()).collect();
+            let admins: std::collections::HashSet<Jid> = result
+                .metadata
+                .participants
+                .iter()
+                .filter(|p| p.is_admin())
+                .map(|p| p.jid.clone())
+                .collect();
+            {
+                let mut s = state.write();
+                let chat = s.get_or_create_chat(group_jid.clone(), subject.clone(), true);
+                chat.is_group = true;
+                chat.participants = participants;
+                let snapshot = s.group_info.entry(group_jid.to_string()).or_default();
+                snapshot.subject = result.metadata.subject.clone();
+                snapshot.description = result.metadata.description.clone();
+                snapshot.admins = admins;
+                snapshot.is_locked = result.metadata.is_locked;
+                snapshot.is_announcement = result.metadata.is_announcement;
+                // Land in the new group so the user sees what they created.
+                s.selected_chat = Some(group_jid.clone());
+                s.selected_messages.clear();
+                s.dirty = true;
+            }
+            let _ = crate::storage::persist_state(&state).await;
         }
         
         Command::JoinGroup { invite_code } => {
@@ -2868,9 +2927,17 @@ async fn handle_command(
         Command::LeaveGroup { chat_jid } => {
             client.groups().leave(&chat_jid).await?;
             let mut s = state.write();
+            let key = chat_jid.to_string();
+            s.group_info.remove(&key);
+            s.group_info_pending.remove(&key);
             if let Some(chat) = s.chats.get_mut(&chat_jid) {
                 chat.is_archived = true;
             }
+            if s.selected_chat.as_ref() == Some(&chat_jid) {
+                s.selected_chat = None;
+                s.show_chat_info = false;
+            }
+            s.dirty = true;
         }
         
         Command::AddParticipants { chat_jid, participants } => {
@@ -2895,24 +2962,35 @@ async fn handle_command(
         
         Command::PromoteParticipants { chat_jid, participants } => {
             client.groups().promote_participants(&chat_jid, &participants).await?;
+            refresh_group_info(&client, state, &chat_jid).await;
         }
         
         Command::DemoteParticipants { chat_jid, participants } => {
             client.groups().demote_participants(&chat_jid, &participants).await?;
+            refresh_group_info(&client, state, &chat_jid).await;
         }
         
         Command::GetGroupInviteLink { chat_jid } => {
             let link = client.groups().get_invite_link(&chat_jid, false).await?;
             info!("Group invite link: {}", link);
+            let mut s = state.write();
+            s.group_info.entry(chat_jid.to_string()).or_default().invite_link = Some(link);
+        }
+        
+        Command::RequestGroupInfo { chat_jid } => {
+            refresh_group_info(&client, state, &chat_jid).await;
         }
         
         Command::SetGroupSubject { chat_jid, subject } => {
             let validated = GroupSubject::new(&subject)
                 .map_err(|e| anyhow::anyhow!("Invalid group subject: {}", e))?;
             client.groups().set_subject(&chat_jid, validated).await?;
-            let mut s = state.write();
-            if let Some(chat) = s.chats.get_mut(&chat_jid) {
-                chat.name = subject;
+            {
+                let mut s = state.write();
+                if let Some(chat) = s.chats.get_mut(&chat_jid) {
+                    chat.name = subject.clone();
+                }
+                s.group_info.entry(chat_jid.to_string()).or_default().subject = subject;
             }
         }
         
@@ -2920,6 +2998,9 @@ async fn handle_command(
             let validated = GroupDescription::new(&description)
                 .map_err(|e| anyhow::anyhow!("Invalid group description: {}", e))?;
             client.groups().set_description(&chat_jid, Some(validated), PreviousDescription::Resolve).await?;
+            let mut s = state.write();
+            s.group_info.entry(chat_jid.to_string()).or_default().description = Some(description);
+            s.dirty = true;
         }
         
         Command::SetEphemeral { chat_jid, expiration } => {

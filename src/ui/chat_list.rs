@@ -31,6 +31,7 @@ pub fn show_chat_list(ui: &mut Ui, state: &SharedState, backend: &crate::backend
                 let mut export_chat_req = None;
                 let mut schedule_chat_req = None;
                 let mut info_chat_req = None;
+                let mut confirm_req = None;
                 
                 ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -53,7 +54,7 @@ pub fn show_chat_list(ui: &mut Ui, state: &SharedState, backend: &crate::backend
                                 
                                 // Context menu
                                 response.context_menu(|ui| {
-                                    show_chat_context_menu(ui, chat, backend, &mut edit_contact_req, &mut export_chat_req, &mut schedule_chat_req, &mut info_chat_req);
+                                    show_chat_context_menu(ui, chat, backend, &mut edit_contact_req, &mut export_chat_req, &mut schedule_chat_req, &mut info_chat_req, &mut confirm_req);
                                 });
                                 
                                 ui.add_space(1.0);
@@ -61,6 +62,9 @@ pub fn show_chat_list(ui: &mut Ui, state: &SharedState, backend: &crate::backend
                         }
                     });
                 
+                if let Some(req) = confirm_req {
+                    s.confirm = Some(req);
+                }
                 if let Some((jid, name)) = edit_contact_req {
                     s.editing_contact = Some((jid, name));
                 }
@@ -217,6 +221,23 @@ fn show_header(ui: &mut Ui, state: &mut AppState, backend: &crate::backend::Back
             .inner_margin(Margin::same(10))
             .corner_radius(egui::CornerRadius::same(8))
             .show(ui, |ui| {
+                ui.label(RichText::new("Nová konverzace").font(FontId::proportional(13.0)).color(Color32::WHITE));
+                ui.add_space(6.0);
+                // The two ways of starting a conversation that are not a phone
+                // number live here so the ➕ button covers everything.
+                ui.horizontal(|ui| {
+                    if ui.button("👥  Nová skupina").clicked() {
+                        state.new_group = Some(crate::state::NewGroupState::default());
+                        state.show_new_chat_dialog = false;
+                    }
+                    if ui.button("📇  Kontakty").clicked() {
+                        state.show_contacts_dialog = true;
+                        state.show_new_chat_dialog = false;
+                    }
+                });
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(4.0);
                 ui.label(RichText::new("Start chat with phone number:").font(FontId::proportional(13.0)).color(Color32::WHITE));
                 ui.add_space(4.0);
                 
@@ -319,6 +340,7 @@ fn show_chat_context_menu(
     export_chat_req: &mut Option<(whatsapp_rust::wacore_binary::Jid, String)>,
     schedule_chat_req: &mut Option<whatsapp_rust::wacore_binary::Jid>,
     info_chat_req: &mut Option<whatsapp_rust::wacore_binary::Jid>,
+    confirm_req: &mut Option<crate::state::ConfirmRequest>,
 ) {
     let jid = chat.jid.clone();
 
@@ -410,15 +432,29 @@ fn show_chat_context_menu(
     
     ui.separator();
     
-    // Delete chat
+    // Delete chat. Destructive, so it asks first.
     if ui.selectable_label(false, "🗑  Delete chat").clicked() {
-        let _ = backend.send_command(crate::commands::Command::DeleteChat { chat_jid: jid.clone() });
+        *confirm_req = Some(crate::ui::confirm_dialog::request(
+            format!("Smazat chat {}?", chat.name),
+            "Chat zmizí ze seznamu; zprávy zůstanou na serveru.",
+            "Smazat",
+            crate::state::ConfirmAction::DeleteChat {
+                chat_jid: jid.clone(),
+            },
+        ));
         ui.close();
     }
     
     // Clear messages
     if ui.selectable_label(false, "🧹  Clear messages").clicked() {
-        let _ = backend.send_command(crate::commands::Command::ClearChat { chat_jid: jid.clone() });
+        *confirm_req = Some(crate::ui::confirm_dialog::request(
+            format!("Vymazat zprávy v chatu {}?", chat.name),
+            "Historie zmizí jen u tebe, ostatní ji pořád uvidí.",
+            "Vymazat",
+            crate::state::ConfirmAction::ClearChat {
+                chat_jid: jid.clone(),
+            },
+        ));
         ui.close();
     }
     
