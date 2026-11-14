@@ -59,26 +59,105 @@ fn show_welcome_screen(ui: &mut Ui, _state: &AppState) {
 }
 
 fn show_chat_view(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Chat, messages: &[Message], chat_jid: &Jid, backend: &crate::backend::BackendHandle) {
-    // Header bar
-    show_chat_header(ui, state, chat, backend);
-    
+    let selecting = !state.selected_messages.is_empty();
+
+    // The info panel spans the full height on the right, so it has to claim its
+    // space before the header and message area do.
+    if state.show_chat_info {
+        egui::Panel::right("chat_info_panel")
+            .resizable(true)
+            .default_size(320.0)
+            .min_size(260.0)
+            .max_size(420.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(crate::theme::chat_list::BACKGROUND)
+                    .inner_margin(egui::Margin::symmetric(10, 4)),
+            )
+            .show(ui, |ui| {
+                crate::ui::chat_info::show(ui, state, chat, backend);
+            });
+    }
+
+    // While messages are ticked the header turns into the bulk-action bar and
+    // the composer is hidden: sending a draft mid-selection would be surprising.
+    if selecting {
+        show_selection_bar(ui, state, chat_jid, backend);
+    } else {
+        show_chat_header(ui, state, chat, backend);
+    }
+
     ui.separator();
-    
+
+    // Above the history, below the header — the same slot WhatsApp uses.
+    show_pinned_banner(ui, state, messages, chat_jid, backend);
+
     // Bottom-up layout pins composer to the absolute bottom of the window (no empty gap)
     ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-        ui.allocate_ui_with_layout(
-            egui::vec2(ui.available_width(), 0.0),
-            egui::Layout::top_down(egui::Align::Min),
-            |ui| {
-                show_composer(ui, state, chat_jid, backend);
-            },
-        );
-        ui.separator();
+        if !selecting {
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    show_composer(ui, state, chat_jid, backend);
+                },
+            );
+            ui.separator();
+        }
         
         ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
             show_messages_area(ui, state, chat, messages, chat_jid, backend);
         });
     });
+}
+
+/// Bulk-action bar shown in place of the chat header while messages are ticked.
+fn show_selection_bar(ui: &mut Ui, state: &mut AppState, chat_jid: &Jid, _backend: &crate::backend::BackendHandle) {
+    let count = state.selected_messages.len();
+    let mut clear = false;
+    let mut open_forward = false;
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        if ui.button(RichText::new("✕").font(FontId::proportional(16.0))).clicked() {
+            clear = true;
+        }
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(format!("Vybráno: {}", count))
+                .font(FontId::proportional(15.0))
+                .color(Color32::WHITE),
+        );
+
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.add_space(8.0);
+            let forward_btn = ui.add_enabled(
+                count > 0,
+                egui::Button::new(
+                    RichText::new("↪  Přeposlat")
+                        .font(FontId::proportional(13.0))
+                        .color(Color32::from_rgb(0x0B, 0x14, 0x18)),
+                )
+                .fill(crate::theme::ACCENT)
+                .corner_radius(egui::CornerRadius::same(6)),
+            );
+            if forward_btn.clicked() {
+                open_forward = true;
+            }
+        });
+    });
+    ui.add_space(8.0);
+
+    if clear {
+        state.selected_messages.clear();
+    } else if open_forward {
+        state.forward_dialog = Some(crate::state::ForwardDialogState {
+            source_chat: chat_jid.clone(),
+            message_ids: state.selected_messages.iter().cloned().collect(),
+            search: String::new(),
+        });
+    }
 }
 
 fn show_chat_header(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Chat, backend: &crate::backend::BackendHandle) {
@@ -169,13 +248,38 @@ fn show_chat_header(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Chat
                     ui.close();
                 }
                 let is_muted = chat.is_muted();
-                if ui.button(if is_muted { "🔔 Unmute notifications" } else { "🔕 Mute notifications" }).clicked() {
-                    let cmd = if is_muted {
-                        Command::UnmuteChat { chat_jid: chat.jid.clone() }
-                    } else {
-                        Command::MuteChat { chat_jid: chat.jid.clone(), until: None }
-                    };
-                    let _ = backend.send_command(cmd);
+                // A submenu, like WhatsApp Web: mute is always a choice of
+                // duration, not a single toggle.
+                ui.menu_button(
+                    if is_muted { "🔔  Umlčení" } else { "🔕  Umlčení" },
+                    |ui| {
+                        if ui.button("Vypnout umlčení").clicked() {
+                            let _ = backend.send_command(Command::UnmuteChat {
+                                chat_jid: chat.jid.clone(),
+                            });
+                            ui.close();
+                        }
+                        for (label, hours) in [("8 hodin", 8i64), ("1 týden", 24 * 7)] {
+                            if ui.button(label).clicked() {
+                                let until = chrono::Utc::now() + chrono::Duration::hours(hours);
+                                let _ = backend.send_command(Command::MuteChat {
+                                    chat_jid: chat.jid.clone(),
+                                    until: Some(until),
+                                });
+                                ui.close();
+                            }
+                        }
+                        if ui.button("Vždy").clicked() {
+                            let _ = backend.send_command(Command::MuteChat {
+                                chat_jid: chat.jid.clone(),
+                                until: None,
+                            });
+                            ui.close();
+                        }
+                    },
+                );
+                if ui.button("ℹ  Info o chatu").clicked() {
+                    state.show_chat_info = !state.show_chat_info;
                     ui.close();
                 }
                 if ui.button("🗑 Clear messages").clicked() {
@@ -196,6 +300,21 @@ fn show_chat_header(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Chat
                     state.search_filter.scope = crate::search::SearchScope::CurrentChat;
                 }
             
+            ui.add_space(4.0);
+
+            // Chat info panel toggle
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("ℹ").font(FontId::proportional(18.0)))
+                        .frame(false)
+                        .fill(Color32::TRANSPARENT),
+                )
+                .on_hover_text("Info o chatu")
+                .clicked()
+            {
+                state.show_chat_info = !state.show_chat_info;
+            }
+
             ui.add_space(4.0);
 
             // Video call
@@ -230,13 +349,140 @@ fn show_chat_header(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Chat
     ui.add_space(8.0);
 }
 
+/// One-line summary of a pinned message, used by the banner.
+fn pinned_preview(message: &Message) -> String {
+    let text = message.text.trim();
+    if !text.is_empty() {
+        return text.to_string();
+    }
+    match message.media_type {
+        Some(crate::state::MediaType::Image) => "📷 Fotka".to_string(),
+        Some(crate::state::MediaType::Video) => "📹 Video".to_string(),
+        Some(crate::state::MediaType::Audio) => "🎵 Audio".to_string(),
+        Some(crate::state::MediaType::Voice) => "🎤 Hlasová zpráva".to_string(),
+        Some(crate::state::MediaType::Document) => "📄 Dokument".to_string(),
+        Some(crate::state::MediaType::Sticker) => "🎨 Samolepka".to_string(),
+        None => {
+            if message.poll.is_some() {
+                "📊 Anketa".to_string()
+            } else {
+                "Zpráva".to_string()
+            }
+        }
+    }
+}
+
+/// Banner with the chat's pinned message: click jumps to it, ✕ unpins.
+fn show_pinned_banner(
+    ui: &mut Ui,
+    state: &mut AppState,
+    messages: &[Message],
+    chat_jid: &Jid,
+    backend: &crate::backend::BackendHandle,
+) {
+    let Some(pin) = state
+        .pinned
+        .get(chat_jid)
+        .filter(|pin| !pin.expired())
+        .cloned()
+    else {
+        return;
+    };
+    let preview = messages
+        .iter()
+        .find(|message| message.id == pin.message_id)
+        .map(pinned_preview)
+        // The pin can outlive the message (deleted locally, not yet resynced).
+        .unwrap_or_else(|| "Připnutá zpráva už není k dispozici".to_string());
+
+    let mut jump = false;
+    let mut unpin = false;
+
+    egui::Frame::new()
+        .fill(Color32::from_rgb(0x1D, 0x28, 0x2E))
+        .inner_margin(egui::Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("📌").font(FontId::proportional(14.0)));
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new("Připnutá zpráva")
+                            .font(FontId::proportional(11.0))
+                            .color(crate::theme::ACCENT),
+                    );
+                    let label = ui.add(
+                        egui::Label::new(
+                            RichText::new(preview)
+                                .font(FontId::proportional(12.0))
+                                .color(Color32::WHITE),
+                        )
+                        .wrap_mode(egui::TextWrapMode::Truncate)
+                        .sense(egui::Sense::click()),
+                    );
+                    if label.clicked() {
+                        jump = true;
+                    }
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("✕").font(FontId::proportional(13.0)),
+                            )
+                            .frame(false),
+                        )
+                        .on_hover_text("Odepnout")
+                        .clicked()
+                    {
+                        unpin = true;
+                    }
+                });
+            });
+        });
+    ui.add_space(2.0);
+
+    if jump {
+        state.jump_target = Some(crate::state::JumpTarget::new(pin.message_id.clone()));
+    }
+    if unpin {
+        let _ = backend.send_command(Command::PinMessage {
+            chat_jid: chat_jid.clone(),
+            message_id: pin.message_id,
+            duration_secs: None,
+        });
+    }
+}
+
 fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Chat, messages: &[Message], chat_jid: &Jid, backend: &crate::backend::BackendHandle) {
     let available_height = ui.available_height();
     
-    // Check if we should auto-scroll to bottom
-    let should_scroll_to_bottom = state.auto_scroll_to_bottom;
+    // Check if we should auto-scroll to bottom. A pending jump owns the scroll
+    // position for its first frame instead.
+    let should_scroll_to_bottom = state.auto_scroll_to_bottom && state.jump_target.is_none();
+    // Shared cells, not plain locals: the bubble callbacks are `move` closures
+    // built once per message inside the scroll loop.
+    let poll_click = std::rc::Rc::new(std::cell::RefCell::new(None::<(String, String)>));
+    let poll_submit = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+    // (message id, duration) — `None` duration means "unpin".
+    let pin_action = std::rc::Rc::new(std::cell::RefCell::new(None::<(String, Option<u32>)>));
+    // message id whose view-once payload the user asked to open
+    let view_once_action = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+    let pinned_id = state
+        .pinned
+        .get(chat_jid)
+        .filter(|pin| !pin.expired())
+        .map(|pin| pin.message_id.clone());
+    let me_jid = state
+        .self_jid
+        .as_ref()
+        .map(|jid| jid.to_string())
+        .unwrap_or_default();
+    // Cloned once: `state` is borrowed again inside the bubble callbacks.
+    let draft_owner = state.poll_draft.clone();
     let mut selected_reply: Option<usize> = None;
     let mut selected_edit: Option<String> = None;
+    let mut selected_toggle: Option<String> = None;
+    let selection_active = !state.selected_messages.is_empty();
     let mut message_to_delete = None;
     let mut selected_reaction: Option<(String, String)> = None;
     let mut view_reactions_id: Option<String> = None;
@@ -299,13 +545,41 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
                     
                     let sender_name_str = sender_name.as_deref().unwrap_or("");
 
-                    MessageBubble::new(msg, is_own)
+                    let jump_here = state
+                        .jump_target
+                        .as_ref()
+                        .is_some_and(|target| target.message_id == msg.id);
+                    let draft_for_msg = if draft_owner
+                        .as_ref()
+                        .is_some_and(|(id, _)| id == &msg.id)
+                    {
+                        draft_owner
+                            .as_ref()
+                            .map(|(_, names)| names.clone())
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+
+                    // One handle pair per bubble: the callbacks are `move`.
+                    let poll_click_handle = poll_click.clone();
+                    let poll_submit_handle = poll_submit.clone();
+                    let pin_handle = pin_action.clone();
+                    let view_once_handle = view_once_action.clone();
+                    let is_pinned = pinned_id.as_deref() == Some(msg.id.as_str());
+
+                    let bubble_resp = MessageBubble::new(msg, is_own)
                         .show_sender(sender_name_str)
                         .on_reply(|_id| {
                             selected_reply = Some(idx);
                         })
                         .on_edit(|id| {
                             selected_edit = Some(id.to_string());
+                        })
+                        .selection_mode(selection_active)
+                        .selected(selection_active && state.selected_messages.contains(&msg.id))
+                        .on_select(|id| {
+                            selected_toggle = Some(id.to_string());
                         })
                         .on_delete(|id| {
                             message_to_delete = Some(id.to_string());
@@ -328,8 +602,53 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
                                 *to_open_picker.borrow_mut() = Some(id.to_string());
                             }
                         })
+                        .is_pinned(is_pinned)
+                        .on_pin({
+                            let msg_id = msg.id.clone();
+                            move |_id: &str, secs: Option<u32>| {
+                                *pin_handle.borrow_mut() = Some((msg_id.clone(), secs));
+                            }
+                        })
+                        .on_open_view_once({
+                            let msg_id = msg.id.clone();
+                            move || {
+                                *view_once_handle.borrow_mut() = Some(msg_id.clone());
+                            }
+                        })
+                        .highlight(jump_here)
+                        .me(me_jid.as_str())
+                        .poll_draft(draft_for_msg)
+                        .on_poll_option({
+                            let msg_id = msg.id.clone();
+                            move |option: String| {
+                                *poll_click_handle.borrow_mut() = Some((msg_id.clone(), option));
+                            }
+                        })
+                        .on_poll_submit({
+                            let msg_id = msg.id.clone();
+                            move || {
+                                *poll_submit_handle.borrow_mut() = Some(msg_id.clone());
+                            }
+                        })
                         .ui(ui);
-                    
+
+                    // Scroll to a jumped-to message once, then let the tint
+                    // fade on its own so the user can keep scrolling.
+                    if jump_here {
+                        let needs_scroll = state
+                            .jump_target
+                            .as_ref()
+                            .map_or(false, |target| !target.scrolled);
+                        if needs_scroll {
+                            ui.scroll_to_rect(bubble_resp.rect, Some(egui::Align::Center));
+                            if let Some(target) = state.jump_target.as_mut() {
+                                target.scrolled = true;
+                            }
+                        }
+                        ui.ctx()
+                            .request_repaint_after(std::time::Duration::from_millis(300));
+                    }
+
                     ui.add_space(2.0);
                 }
             }
@@ -338,6 +657,10 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
             ui.add_space(24.0);
         });
         
+    if let Some(id) = selected_toggle {
+        state.toggle_selected(&id);
+    }
+
     if let Some(idx) = selected_reply {
         state.replying_to = messages.get(idx).cloned();
     }
@@ -377,6 +700,138 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
             message_id: id,
         });
     }
+
+    if let Some(id) = view_once_action.borrow().clone() {
+        let _ = backend.send_command(Command::OpenViewOnce {
+            chat_jid: chat_jid.clone(),
+            message_id: id.clone(),
+        });
+        state.view_once_open = Some((chat_jid.clone(), id));
+    }
+
+    let pin_request = pin_action.borrow().clone();
+    if let Some((message_id, secs)) = pin_request {
+        let _ = backend.send_command(Command::PinMessage {
+            chat_jid: chat_jid.clone(),
+            message_id,
+            duration_secs: secs,
+        });
+    }
+
+    let clicked_option = poll_click.borrow().clone();
+    let submitted_poll = poll_submit.borrow().clone();
+    if let Some((message_id, option)) = clicked_option {
+        poll_option_clicked(state, messages, chat_jid, &message_id, &option, backend);
+    }
+    if let Some(message_id) = submitted_poll {
+        poll_submit_clicked(state, messages, chat_jid, &message_id, backend);
+    }
+
+    // The highlight is a short flash, not a mode: drop it once it has served
+    // its purpose so auto-scroll takes over again.
+    if state.jump_target.as_ref().is_some_and(|target| target.expired()) {
+        state.jump_target = None;
+    }
+}
+
+/// Click on one poll option. Single-choice polls replace the vote at once,
+/// the way WhatsApp Web does; multi-choice polls only move a tick and wait for
+/// the "Hlasovat" button.
+fn poll_option_clicked(
+    state: &mut AppState,
+    messages: &[Message],
+    chat_jid: &Jid,
+    message_id: &str,
+    option: &str,
+    backend: &crate::backend::BackendHandle,
+) {
+    let Some(poll) = messages
+        .iter()
+        .find(|m| m.id == message_id)
+        .and_then(|m| m.poll.clone())
+    else {
+        return;
+    };
+    let me = state
+        .self_jid
+        .as_ref()
+        .map(|jid| jid.to_string())
+        .unwrap_or_default();
+
+    if !poll.is_multi() {
+        // Tapping the ticked option clears the vote, like WhatsApp Web.
+        let selection = if poll.my_vote(&me).iter().any(|picked| picked == option) {
+            Vec::new()
+        } else {
+            vec![option.to_string()]
+        };
+        state.poll_draft = None;
+        send_vote(chat_jid, &poll, message_id, selection, backend);
+        return;
+    }
+
+    let limit = if poll.selectable_count == 0 {
+        poll.options.len()
+    } else {
+        poll.selectable_count as usize
+    };
+    let draft = state
+        .poll_draft
+        .get_or_insert_with(|| (message_id.to_string(), Vec::new()));
+    if draft.0 != message_id {
+        *draft = (message_id.to_string(), Vec::new());
+    }
+    let picked = &mut draft.1;
+    if let Some(pos) = picked.iter().position(|name| name == option) {
+        picked.remove(pos);
+    } else if picked.len() < limit {
+        picked.push(option.to_string());
+    }
+}
+
+/// Commit the ticks of a multi-choice poll.
+fn poll_submit_clicked(
+    state: &mut AppState,
+    messages: &[Message],
+    chat_jid: &Jid,
+    message_id: &str,
+    backend: &crate::backend::BackendHandle,
+) {
+    let Some(poll) = messages
+        .iter()
+        .find(|m| m.id == message_id)
+        .and_then(|m| m.poll.clone())
+    else {
+        return;
+    };
+    let Some((owner, selection)) = state.poll_draft.take() else {
+        return;
+    };
+    if owner != message_id || selection.is_empty() {
+        return;
+    }
+    send_vote(chat_jid, &poll, message_id, selection, backend);
+}
+
+/// Hand a vote to the backend. Polls received without a secret cannot be voted
+/// on at all: the encryption key is derived from it.
+fn send_vote(
+    chat_jid: &Jid,
+    poll: &crate::state::PollData,
+    message_id: &str,
+    selection: Vec<String>,
+    backend: &crate::backend::BackendHandle,
+) {
+    if poll.secret.is_empty() {
+        return;
+    }
+    let _ = backend.send_command(Command::VotePoll {
+        chat_jid: chat_jid.clone(),
+        message_id: message_id.to_string(),
+        poll_creator: poll.creator.clone(),
+        message_secret: poll.secret.clone(),
+        option_names: selection,
+    });
 }
 
 fn show_date_separator(ui: &mut Ui, date: chrono::NaiveDate) {
@@ -427,6 +882,81 @@ fn show_empty_chat(ui: &mut Ui, chat: &crate::state::Chat, backend: &crate::back
             }
         });
     });
+}
+
+/// Recording bar shown in place of the composer while a voice note is captured.
+fn show_recorder_bar(
+    ui: &mut Ui,
+    state: &mut AppState,
+    chat_jid: &Jid,
+    backend: &crate::backend::BackendHandle,
+) {
+    let elapsed = std::time::Duration::from_millis(crate::recorder::elapsed_ms());
+    Frame::new()
+        .fill(Color32::from_rgb(0x1F, 0x2C, 0x34))
+        .inner_margin(Margin::symmetric(16, 10))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                // Blink the dot twice a second so it reads as "live".
+                let on = (elapsed.as_millis() / 500) % 2 == 0;
+                let dot = if on {
+                    Color32::from_rgb(0xE6, 0x4A, 0x4A)
+                } else {
+                    Color32::from_rgb(0x7A, 0x2B, 0x2B)
+                };
+                ui.label(RichText::new("●").font(FontId::proportional(16.0)).color(dot));
+                ui.label(
+                    RichText::new(crate::audio::format_duration(elapsed))
+                        .font(FontId::proportional(15.0))
+                        .color(Color32::WHITE),
+                );
+                ui.label(
+                    RichText::new("Nahrávání…")
+                        .font(FontId::proportional(12.0))
+                        .color(Color32::from_rgb(0x86, 0x96, 0xA0)),
+                );
+
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let send = ui.add(
+                        egui::Button::new(
+                            RichText::new("➤")
+                                .font(FontId::proportional(22.0))
+                                .color(Color32::WHITE),
+                        )
+                        .frame(false)
+                        .fill(Color32::from_rgb(0x00, 0x80, 0x69)),
+                    );
+                    if send.on_hover_text("Odeslat hlasovou zprávu").clicked() {
+                        match crate::recorder::finish() {
+                            Ok(recording) => {
+                                state.recorder_error = None;
+                                let _ = backend.send_command(Command::SendVoiceNote {
+                                    chat_jid: chat_jid.clone(),
+                                    file_path: recording.path,
+                                    duration_seconds: (recording.duration_ms / 1000).max(1) as u32,
+                                    waveform: recording.waveform,
+                                });
+                            }
+                            Err(message) => state.recorder_error = Some(message),
+                        }
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("✕").font(FontId::proportional(18.0)),
+                            )
+                            .frame(false),
+                        )
+                        .on_hover_text("Zahodit nahrávku")
+                        .clicked()
+                    {
+                        crate::recorder::cancel();
+                    }
+                });
+            });
+        });
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(200));
 }
 
 fn show_composer(ui: &mut Ui, state: &mut AppState, chat_jid: &Jid, backend: &crate::backend::BackendHandle) {
@@ -557,6 +1087,100 @@ fn show_composer(ui: &mut Ui, state: &mut AppState, chat_jid: &Jid, backend: &cr
         state.pending_attachment = None;
     }
 
+    if let Some(message) = state.recorder_error.clone() {
+        Frame::new()
+            .fill(Color32::from_rgb(0x3A, 0x1E, 0x22))
+            .inner_margin(Margin::symmetric(14, 6))
+            .corner_radius(egui::CornerRadius::same(6))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("⚠ Mikrofon: {message}"))
+                            .font(FontId::proportional(12.0))
+                            .color(Color32::from_rgb(0xF2, 0x8B, 0x82)),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("✕").clicked() {
+                            state.recorder_error = None;
+                        }
+                    });
+                });
+            });
+        ui.add_space(2.0);
+    }
+
+    if let Some(message) = state.clipboard_error.clone() {
+        Frame::new()
+            .fill(Color32::from_rgb(0x3A, 0x1E, 0x22))
+            .inner_margin(Margin::symmetric(14, 6))
+            .corner_radius(egui::CornerRadius::same(6))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("⚠ Schránka: {message}"))
+                            .font(FontId::proportional(12.0))
+                            .color(Color32::from_rgb(0xF2, 0x8B, 0x82)),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("✕").clicked() {
+                            state.clipboard_error = None;
+                        }
+                    });
+                });
+            });
+        ui.add_space(2.0);
+    }
+
+    // While a take is running the composer row is replaced by the recorder bar,
+    // so a stray Enter cannot send text halfway through a voice note.
+    if crate::recorder::is_recording() {
+        show_recorder_bar(ui, state, chat_jid, backend);
+        return;
+    }
+
+    // @zmínky: while the user types a name after `@`, offer matching members.
+    let mention_people_list = mention_people(state, chat_jid);
+    let suggestions: Vec<(Jid, String)> =
+        crate::state::mention_suggestions(&state.composer_text, &mention_people_list)
+            .into_iter()
+            .cloned()
+            .collect();
+    if !suggestions.is_empty() {
+        let mut picked: Option<String> = None;
+        Frame::new()
+            .fill(Color32::from_rgb(0x1A, 0x26, 0x2C))
+            .inner_margin(Margin::symmetric(12, 6))
+            .corner_radius(egui::CornerRadius::same(6))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new("@")
+                            .font(FontId::proportional(12.0))
+                            .color(crate::theme::ACCENT),
+                    );
+                    for (_, name) in &suggestions {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(name.clone())
+                                        .font(FontId::proportional(12.0))
+                                        .color(Color32::WHITE),
+                                )
+                                .frame(false),
+                            )
+                            .clicked()
+                        {
+                            picked = Some(name.clone());
+                        }
+                    }
+                });
+            });
+        ui.add_space(2.0);
+        if let Some(name) = picked {
+            crate::state::apply_mention(&mut state.composer_text, &name);
+        }
+    }
+
     Frame::new()
         .fill(Color32::from_rgb(0x1F, 0x2C, 0x34))
         .inner_margin(Margin::symmetric(16, 10))
@@ -572,7 +1196,50 @@ fn show_composer(ui: &mut Ui, state: &mut AppState, chat_jid: &Jid, backend: &cr
                 if attach_btn.clicked() {
                     if let Some(path) = crate::media::pick_file() {
                         state.pending_attachment = Some(path);
+                        state.send_view_once = false;
                     }
+                }
+
+                // View-once toggle only makes sense once something is attached.
+                if state.pending_attachment.is_some() {
+                    let vo_btn = ui.add(
+                        egui::Button::new(
+                            RichText::new("1")
+                                .font(FontId::proportional(15.0))
+                                .color(if state.send_view_once { Color32::BLACK } else { crate::theme::ACCENT })
+                        )
+                        .frame(true)
+                        .fill(if state.send_view_once { crate::theme::ACCENT } else { Color32::TRANSPARENT })
+                    ).on_hover_text(if state.send_view_once {
+                        "Zobrazit jednou: příjemce uvidí médium pouze jednou"
+                    } else {
+                        "Odeslat jako zobrazení jednou"
+                    });
+                    if vo_btn.clicked() {
+                        state.send_view_once = !state.send_view_once;
+                    }
+                }
+
+                // Poll button
+                let poll_btn = ui.add(
+                    egui::Button::new(RichText::new("📊").font(FontId::proportional(18.0)))
+                        .frame(false)
+                        .fill(Color32::TRANSPARENT)
+                ).on_hover_text("Vytvořit anketu");
+
+                if poll_btn.clicked() {
+                    state.new_poll = Some(crate::state::NewPollState::new(chat_jid.clone()));
+                }
+
+                // Sticker picker button
+                let sticker_btn = ui.add(
+                    egui::Button::new(RichText::new("🎨").font(FontId::proportional(18.0)))
+                        .frame(false)
+                        .fill(Color32::TRANSPARENT)
+                ).on_hover_text("Poslat samolepku");
+
+                if sticker_btn.clicked() {
+                    state.show_sticker_picker = !state.show_sticker_picker;
                 }
 
                 // Emoji picker button
@@ -605,6 +1272,21 @@ fn show_composer(ui: &mut Ui, state: &mut AppState, chat_jid: &Jid, backend: &cr
                         .margin(egui::vec2(12.0, 10.0))
                 );
                 
+                // Ctrl+V with a picture on the clipboard becomes an attachment;
+                // plain text still pastes normally because we only look for images.
+                if response.has_focus()
+                    && ui.input(|i| i.modifiers.command && i.key_pressed(Key::V))
+                {
+                    match crate::clipboard::save_clipboard_image() {
+                        Ok(Some(path)) => {
+                            state.pending_attachment = Some(path);
+                            state.clipboard_error = None;
+                        }
+                        Ok(None) => {}
+                        Err(err) => state.clipboard_error = Some(err),
+                    }
+                }
+
                 // Handle Enter to send, Shift+Enter for newline
                 let enter_pressed = response.has_focus() && ui.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift);
                 let can_send = state.pending_attachment.is_some() || !state.composer_text.trim().is_empty();
@@ -622,11 +1304,28 @@ fn show_composer(ui: &mut Ui, state: &mut AppState, chat_jid: &Jid, backend: &cr
                     state.show_schedule_dialog = true;
                 }
                 
-                let send_btn = ui.add(
-                    egui::Button::new(RichText::new("➤").font(FontId::proportional(22.0)).color(if can_send { Color32::WHITE } else { Color32::from_rgb(0x86, 0x96, 0xA0) }))
-                        .frame(false)
-                        .fill(if can_send { Color32::from_rgb(0x00, 0x80, 0x69) } else { Color32::TRANSPARENT })
-                ).on_hover_text("Send");
+                // WhatsApp swaps the send arrow for a microphone while the box
+                // is empty, so recording never needs a second control.
+                let send_btn = if can_send {
+                    ui.add(
+                        egui::Button::new(RichText::new("➤").font(FontId::proportional(22.0)).color(Color32::WHITE))
+                            .frame(false)
+                            .fill(Color32::from_rgb(0x00, 0x80, 0x69))
+                    ).on_hover_text("Send")
+                } else {
+                    ui.add(
+                        egui::Button::new(RichText::new("🎤").font(FontId::proportional(20.0)).color(Color32::from_rgb(0x86, 0x96, 0xA0)))
+                            .frame(false)
+                            .fill(Color32::TRANSPARENT)
+                    ).on_hover_text("Nahrát hlasovou zprávu")
+                };
+
+                if !can_send && send_btn.clicked() {
+                    match crate::recorder::start() {
+                        Ok(()) => ui.ctx().request_repaint(),
+                        Err(message) => state.recorder_error = Some(message),
+                    }
+                }
                 
                 if (enter_pressed || send_btn.clicked()) && can_send {
                     let text = state.composer_text.trim().to_string();
@@ -650,20 +1349,32 @@ fn show_composer(ui: &mut Ui, state: &mut AppState, chat_jid: &Jid, backend: &cr
                     
                     if let Some(file_path) = state.pending_attachment.take() {
                         let caption = if text.is_empty() { None } else { Some(text) };
+                        let view_once = state.send_view_once;
+                        state.send_view_once = false;
                         let _ = backend.send_command(Command::SendMedia {
                             chat_jid: chat_jid.clone(),
                             file_path,
                             caption,
                             reply_to,
+                            view_once,
                         });
                     } else {
-                        let _ = backend.send_command(Command::SendText { 
-                            to: chat_jid.clone(), 
-                            text, 
+                        let people = mention_people(state, chat_jid);
+                        let mentioned_jid: Vec<String> =
+                            crate::state::collect_mentions(&text, &people)
+                                .into_iter()
+                                .map(|jid| jid.to_string())
+                                .collect();
+                        let _ = backend.send_command(Command::SendText {
+                            to: chat_jid.clone(),
+                            text,
                             reply_to,
+                            mentioned_jid,
                         });
                     }
                     state.composer_text.clear();
+                    // The text is gone, so must be its remembered draft.
+                    state.drafts.remove(chat_jid);
                 }
             });
         });
@@ -772,7 +1483,7 @@ pub fn show_reaction_detail_modal(ctx: &Context, state: &SharedState, backend: &
                         };
 
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(&r.emoji).font(FontId::proportional(22.0)));
+                            ui.label(RichText::new(&r.emoji).font(crate::theme::message_font(22.0)));
                             ui.add_space(8.0);
                             ui.label(RichText::new(name_display).font(FontId::proportional(14.0)).color(Color32::from_rgb(0xE9, 0xED, 0xEF)));
                             if is_mine {
@@ -810,4 +1521,56 @@ pub fn show_reaction_detail_modal(ctx: &Context, state: &SharedState, backend: &
     if should_close || !is_open {
         state.write().reaction_detail_modal = None;
     }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base(id: &str, text: &str) -> Message {
+        let jid: Jid = "123@s.whatsapp.net".parse().unwrap();
+        Message::new_text(
+            id.to_string(),
+            jid.clone(),
+            jid,
+            text.to_string(),
+            chrono::Utc::now(),
+            false,
+            crate::state::MessageStatus::Delivered,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn pinned_preview_prefers_text_over_media_kind() {
+        let mut msg = base("a", "  nazdar  ");
+        msg.media_type = Some(crate::state::MediaType::Image);
+        assert_eq!(pinned_preview(&msg), "nazdar");
+    }
+
+    #[test]
+    fn pinned_preview_describes_media_without_caption() {
+        let mut msg = base("b", "");
+        msg.media_type = Some(crate::state::MediaType::Voice);
+        assert_eq!(pinned_preview(&msg), "🎤 Hlasová zpráva");
+        msg.media_type = None;
+        assert_eq!(pinned_preview(&msg), "Zpráva");
+    }
+}
+
+/// Group members as `(jid, jméno)` pairs — the pool both for `@` suggestions
+/// and for turning a finished body back into `mentioned_jid`.
+fn mention_people(state: &AppState, chat_jid: &Jid) -> Vec<(Jid, String)> {
+    let Some(chat) = state.chats.get(chat_jid) else {
+        return Vec::new();
+    };
+    if !chat.is_group {
+        return Vec::new();
+    }
+    let me = state.self_jid.clone();
+    chat.participants
+        .iter()
+        .filter(|jid| me.as_ref() != Some(*jid))
+        .filter_map(|jid| state.resolve_display_name(jid).map(|name| (jid.clone(), name)))
+        .collect()
 }

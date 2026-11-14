@@ -8,8 +8,10 @@ mod app;
 pub mod notifications;
 pub mod audio;
 pub mod video;
+pub mod recorder;
 pub mod autostart;
 mod backend;
+mod clipboard;
 mod commands;
 pub mod export;
 mod avatars;
@@ -21,6 +23,7 @@ mod theme;
 pub mod tray;
 mod ui;
 mod util;
+mod vcard;
 
 use anyhow::Result;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};

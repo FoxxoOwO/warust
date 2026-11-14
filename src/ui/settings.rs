@@ -272,7 +272,7 @@ fn show_appearance_settings(ui: &mut Ui, s: &mut crate::state::AppState) {
     });
 }
 
-fn show_storage_settings(ui: &mut Ui, _s: &mut crate::state::AppState, backend: &BackendHandle, should_close: &mut bool) {
+fn show_storage_settings(ui: &mut Ui, s: &mut crate::state::AppState, backend: &BackendHandle, should_close: &mut bool) {
     ui.label(RichText::new("O aplikaci a úložiště").font(FontId::proportional(18.0)).strong());
     ui.label(RichText::new("Informace o verzích softwaru a správě mezipaměti").font(FontId::proportional(12.0)).color(Color32::from_rgb(0x86, 0x96, 0xA0)));
     ui.add_space(12.0);
@@ -296,11 +296,130 @@ fn show_storage_settings(ui: &mut Ui, _s: &mut crate::state::AppState, backend: 
         let media_path = crate::media::media_dir();
         ui.label(RichText::new(format!("Složka médií: {}", media_path.display())).font(FontId::proportional(11.0)).color(Color32::from_rgb(0x86, 0x96, 0xA0)));
         ui.add_space(6.0);
+
+        // Scanning thousands of files every frame would stall the whole UI, so a
+        // cached result is reused for five seconds at a time.
+        const SCAN_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+        const OLD_MEDIA: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 60 * 60);
+        let fresh = s
+            .storage_scan
+            .as_ref()
+            .is_some_and(|(at, _)| at.elapsed() < SCAN_TTL);
+        if !fresh {
+            let referenced = s.referenced_media_paths();
+            let stats = crate::media::media_stats(
+                &media_path,
+                &referenced,
+                OLD_MEDIA,
+                std::time::SystemTime::now(),
+            );
+            s.storage_scan = Some((std::time::Instant::now(), stats));
+        }
+        let stats = s
+            .storage_scan
+            .as_ref()
+            .map(|(_, stats)| stats.clone())
+            .unwrap_or_default();
+
+        ui.label(
+            RichText::new(format!(
+                "Souborů: {} · celkem {}",
+                stats.files,
+                crate::media::format_file_size(stats.total_bytes)
+            ))
+            .font(FontId::proportional(12.5)),
+        );
+        ui.label(
+            RichText::new(format!(
+                "Nepoužívané (žádná zpráva na ně neodkazuje): {} · {}",
+                stats.stale_files,
+                crate::media::format_file_size(stats.stale_bytes)
+            ))
+            .font(FontId::proportional(11.0))
+            .color(Color32::from_rgb(0x86, 0x96, 0xA0)),
+        );
+        ui.add_space(6.0);
+
+        let mut deleted: Option<(usize, u64)> = None;
         ui.horizontal(|ui| {
             if ui.button("📂  Otevřít složku médií").clicked() {
                 let _ = std::process::Command::new("explorer").arg(&media_path).spawn();
             }
+            if ui
+                .add_enabled(
+                    !stats.stale_paths.is_empty(),
+                    egui::Button::new("🧹  Smazat nepoužívané"),
+                )
+                .on_hover_text("Smaže soubory, na které neodkazuje žádná zpráva")
+                .clicked()
+            {
+                let mut bytes = 0u64;
+                let mut removed = 0usize;
+                for path in &stats.stale_paths {
+                    if let Ok(meta) = std::fs::metadata(path) {
+                        bytes += meta.len();
+                    }
+                    if std::fs::remove_file(path).is_ok() {
+                        removed += 1;
+                    }
+                }
+                deleted = Some((removed, bytes));
+            }
+            if ui
+                .add_enabled(
+                    !stats.old_paths.is_empty(),
+                    egui::Button::new("🗑  Nepoužívané starší 30 dní"),
+                )
+                .clicked()
+            {
+                let mut bytes = 0u64;
+                let mut removed = 0usize;
+                for path in &stats.old_paths {
+                    if let Ok(meta) = std::fs::metadata(path) {
+                        bytes += meta.len();
+                    }
+                    if std::fs::remove_file(path).is_ok() {
+                        removed += 1;
+                    }
+                }
+                deleted = Some((removed, bytes));
+            }
         });
+
+        if let Some((removed, bytes)) = deleted {
+            crate::media::MEDIA_REV.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            s.storage_scan = None;
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!(
+                    "Uvolněno {} ({} souborů).",
+                    crate::media::format_file_size(bytes),
+                    removed
+                ))
+                .font(FontId::proportional(11.0))
+                .color(Color32::from_rgb(0x00, 0xA8, 0x84)),
+            );
+        }
+    });
+
+    setting_card(ui, "Klávesové zkratky", |ui| {
+        for (keys, what) in [
+            ("Ctrl+K", "přepínač chatů"),
+            ("Ctrl+F", "hledání ve zprávách"),
+            ("Esc", "zavřít okno nebo dialog"),
+            ("Alt+↓ / Alt+↑", "skočit na další nepřečtený chat"),
+            ("Enter / Shift+Enter", "odeslat / nový řádek"),
+            ("Ctrl+V", "vložit obrázek ze schránky"),
+        ] {
+            ui.horizontal(|ui| {
+                ui.monospace(keys);
+                ui.label(
+                    RichText::new(what)
+                        .font(FontId::proportional(12.0))
+                        .color(Color32::from_rgb(0x86, 0x96, 0xA0)),
+                );
+            });
+        }
     });
 
     setting_card(ui, "Účet a odhlášení", |ui| {

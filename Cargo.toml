@@ -1,6 +1,6 @@
 [package]
 name = "warust"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 description = "WhatsApp desktop client in Rust (egui + whatsapp-rust)"
 license = "MIT OR Apache-2.0"
@@ -32,6 +32,7 @@ egui_extras = "0.37"
 epaint = { version = "0.37", features = ["color_fonts"] }
 qrcode = { version = "0.14", features = ["image"] }
 image = "0.25"
+arboard = "3.7"
 ureq = "3"
 
 # --- Async & Runtime ---
@@ -60,6 +61,7 @@ glow = "0.14"
 console_error_panic_hook = { version = "0.1", optional = true }
 rodio = { version = "0.23", default-features = false, features = ["playback", "mp3", "mp4", "vorbis", "wav", "flac"] }
 notify-rust = "4.19.0"
+cpal = "0.18.2"
 
 [target.'cfg(windows)'.dependencies]
 tray-item = "0.10.0"

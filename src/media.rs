@@ -86,12 +86,156 @@ pub fn detect_media_type(path: &Path) -> MediaType {
         .unwrap_or("")
         .to_ascii_lowercase();
     match ext.as_str() {
-        "jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp" => MediaType::Image,
+        "jpg" | "jpeg" | "png" | "gif" | "bmp" => MediaType::Image,
+        // A WebP attachment is a sticker; WhatsApp sizes it to 512 px itself.
+        "webp" => MediaType::Sticker,
         "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" => MediaType::Video,
         "ogg" | "opus" => MediaType::Voice,
         "mp3" | "wav" | "m4a" | "aac" | "flac" => MediaType::Audio,
         _ => MediaType::Document,
     }
+}
+
+/// Pixel size of an image file, if the decoder can read the header.
+pub fn image_dimensions(path: &Path) -> Option<(u32, u32)> {
+    image::image_dimensions(path).ok()
+}
+
+/// Whether a WebP stream is animated — WhatsApp marks those `is_animated`.
+pub fn webp_is_animated(path: &Path) -> bool {
+    std::fs::read(path)
+        .map(|bytes| bytes.windows(4).any(|w| w == b"ANIM"))
+        .unwrap_or(false)
+}
+
+/// Sticker-sized WebP files already sitting in the media folder, newest first.
+///
+/// There is no sticker library in the app yet, so "recently received or sent
+/// stickers" doubles as the picker's library.
+pub fn sticker_files() -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(media_dir()) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("webp"))
+        })
+        .collect();
+    files.sort_by_key(|path| {
+        std::cmp::Reverse(std::fs::metadata(path).and_then(|m| m.modified()).ok())
+    });
+    files.truncate(48);
+    files
+}
+
+/// Texture for an arbitrary image file, cached by path.
+pub fn path_texture(ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
+    let id = egui::Id::new("warust_path_texture_cache");
+    let cache: MediaCache = ctx.data_mut(|d| d.get_temp::<MediaCache>(id)).unwrap_or_else(|| {
+        let c: MediaCache = Arc::new(Mutex::new(HashMap::new()));
+        ctx.data_mut(|d| d.insert_temp(id, c.clone()));
+        c
+    });
+
+    let key = path.to_string_lossy().to_string();
+    let rev = MEDIA_REV.load(Ordering::Relaxed);
+    let mut map = cache.lock();
+    if let Some((r, cached)) = map.get(&key) {
+        if *r == rev {
+            return cached.clone().map(|(tex, _)| tex);
+        }
+    }
+
+    let loaded = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| image::load_from_memory(&bytes).ok())
+        .map(|img| {
+            let rgba = img.to_rgba8();
+            let size = [rgba.width() as usize, rgba.height() as usize];
+            let dims = [rgba.width() as f32, rgba.height() as f32];
+            let color_img = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+            let tex = ctx.load_texture(
+                format!("path-{}", clean_filename(&key)),
+                color_img,
+                egui::TextureOptions::LINEAR,
+            );
+            (tex, dims)
+        });
+
+    let handle = loaded.as_ref().map(|(tex, _)| tex.clone());
+    map.insert(key, (rev, loaded));
+    handle
+}
+
+/// What the media folder holds, split by whether a message still points at it.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct MediaStats {
+    pub files: usize,
+    pub total_bytes: u64,
+    /// Files no stored message references any more.
+    pub stale_files: usize,
+    pub stale_bytes: u64,
+    /// Stale files, newest metadata first, ready to delete.
+    pub stale_paths: Vec<PathBuf>,
+    /// Stale files older than the requested age.
+    pub old_paths: Vec<PathBuf>,
+}
+
+/// Summarises `dir`, treating files absent from `referenced` as garbage.
+///
+/// `referenced` holds both absolute paths and bare file names, because a
+/// message may store either form.
+pub fn media_stats(
+    dir: &Path,
+    referenced: &std::collections::HashSet<PathBuf>,
+    max_age: std::time::Duration,
+    now: std::time::SystemTime,
+) -> MediaStats {
+    let mut stats = MediaStats::default();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return stats;
+    };
+
+    let mut stale: Vec<(PathBuf, u64, bool)> = Vec::new();
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        stats.files += 1;
+        stats.total_bytes += meta.len();
+
+        let name = path.file_name().map(PathBuf::from);
+        let used = referenced.contains(&path)
+            || name.as_ref().is_some_and(|name| referenced.contains(name));
+        if used {
+            continue;
+        }
+
+        let too_old = meta
+            .modified()
+            .ok()
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .is_some_and(|age| age > max_age);
+        stale.push((path, meta.len(), too_old));
+    }
+
+    stale.sort_by(|a, b| b.1.cmp(&a.1));
+    for (path, len, too_old) in stale {
+        stats.stale_files += 1;
+        stats.stale_bytes += len;
+        if too_old {
+            stats.old_paths.push(path.clone());
+        }
+        stats.stale_paths.push(path);
+    }
+    stats
 }
 
 /// Format file size for human display
@@ -273,4 +417,87 @@ pub fn image_texture(
 
     map.insert(msg.id.clone(), (rev, result.clone()));
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::time::{Duration, SystemTime};
+
+    /// Scratch folder unique per test, removed by the caller.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("warust-media-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write(dir: &Path, name: &str, len: usize) {
+        std::fs::write(dir.join(name), vec![0u8; len]).unwrap();
+    }
+
+    #[test]
+    fn media_stats_splits_referenced_from_stale_files() {
+        let dir = scratch("stats");
+        write(&dir, "keep.png", 100);
+        write(&dir, "orphan.png", 40);
+        write(&dir, "orphan2.webp", 20);
+
+        let mut referenced = HashSet::new();
+        // A message may store the absolute path…
+        referenced.insert(dir.join("keep.png"));
+
+        let stats = media_stats(&dir, &referenced, Duration::from_secs(3600), SystemTime::now());
+        assert_eq!(stats.files, 3);
+        assert_eq!(stats.total_bytes, 160);
+        assert_eq!(stats.stale_files, 2);
+        assert_eq!(stats.stale_bytes, 60);
+        // Largest first, so bulk deletions start where they save the most.
+        assert_eq!(stats.stale_paths[0], dir.join("orphan.png"));
+        // Everything was just written, so nothing is old yet.
+        assert!(stats.old_paths.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn media_stats_accepts_bare_file_names_as_references() {
+        let dir = scratch("names");
+        write(&dir, "photo.jpg", 10);
+
+        let mut referenced = HashSet::new();
+        // …or just the file name, which older messages do.
+        referenced.insert(PathBuf::from("photo.jpg"));
+
+        let stats = media_stats(&dir, &referenced, Duration::from_secs(3600), SystemTime::now());
+        assert_eq!(stats.stale_files, 0);
+        assert_eq!(stats.total_bytes, 10);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn media_stats_marks_unreferenced_files_older_than_the_limit() {
+        let dir = scratch("old");
+        write(&dir, "ancient.png", 5);
+
+        // Pretend "now" is far in the future: everything counts as old.
+        let referenced = HashSet::new();
+        let later = SystemTime::now() + Duration::from_secs(90 * 24 * 3600);
+        let stats = media_stats(&dir, &referenced, Duration::from_secs(30 * 24 * 3600), later);
+        assert_eq!(stats.stale_files, 1);
+        assert_eq!(stats.old_paths.len(), 1);
+        assert_eq!(stats.old_paths[0], dir.join("ancient.png"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn media_stats_of_a_missing_folder_is_empty() {
+        let dir = std::env::temp_dir().join("warust-media-does-not-exist");
+        let _ = std::fs::remove_dir_all(&dir);
+        let stats = media_stats(&dir, &HashSet::new(), Duration::from_secs(60), SystemTime::now());
+        assert_eq!(stats, MediaStats::default());
+    }
 }

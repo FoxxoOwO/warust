@@ -92,6 +92,40 @@ impl eframe::App for WarustApp {
             }
         }
 
+        // Global shortcuts. `consume_key` also keeps the keystroke away from the
+        // focused text field, so Ctrl+F does not insert a character anywhere.
+        let (want_palette, want_search, want_escape) = ui.ctx().input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::K),
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::F),
+                i.key_pressed(egui::Key::Escape),
+            )
+        });
+        if want_palette {
+            let mut s = self.state.write();
+            s.show_command_palette = !s.show_command_palette;
+            s.palette_query.clear();
+            s.palette_index = 0;
+        }
+        if want_search {
+            let mut s = self.state.write();
+            s.show_search_dialog = true;
+            s.search_filter.scope = if s.selected_chat.is_some() {
+                crate::search::SearchScope::CurrentChat
+            } else {
+                crate::search::SearchScope::AllChats
+            };
+        }
+        if want_escape {
+            // Settings lives on the app, not in AppState, so it closes first.
+            if self.show_settings {
+                self.show_settings = false;
+            } else {
+                let mut s = self.state.write();
+                crate::ui::close_topmost_dialog(&mut s);
+            }
+        }
+
         // Intercept close event if close-to-tray is enabled
         if ui.input(|i| i.viewport().close_requested()) {
             let close_to_tray = self.state.read().preferences.close_to_tray && self.tray.is_some();
@@ -203,11 +237,24 @@ impl eframe::App for WarustApp {
         if let Some(backend) = self.backend.as_ref() {
             let ctx = ui.ctx();
             crate::ui::search_dialog::show_search_dialog(ctx, &self.state, backend);
+            crate::ui::forward_dialog::show_forward_dialog(ctx, &self.state, backend);
+            crate::ui::group_dialog::show_new_group_dialog(ctx, &self.state, backend);
+            crate::ui::group_dialog::show_add_member_dialog(ctx, &self.state, backend);
+            crate::ui::poll_dialog::show_new_poll_dialog(ctx, &self.state, backend);
+            crate::ui::contacts_dialog::show_contacts_dialog(ctx, &self.state, backend);
+            crate::ui::sticker_dialog::show_sticker_dialog(ctx, &self.state, backend);
+            crate::ui::palette::show_command_palette(ctx, &self.state, backend);
+            // Last, so a confirmation always sits on top of the dialog that
+            // raised it.
+            crate::ui::confirm_dialog::show_confirm_dialog(ctx, &self.state, backend);
             crate::ui::export_dialog::show_export_dialog(ctx, &self.state, backend);
             crate::ui::schedule_dialog::show_schedule_dialog(ctx, &self.state, backend);
             crate::ui::schedule_dialog::show_scheduled_manager(ctx, &self.state, backend);
             crate::ui::conversation::show_reaction_detail_modal(ctx, &self.state, backend);
             crate::ui::call_dialog::show_call_overlay(ctx, &self.state, backend);
+            // Above the call overlay: a view-once payload is the most modal thing there is.
+            crate::ui::view_once_modal::show_view_once_modal(ctx, &self.state, backend);
+            crate::ui::view_once_modal::show_view_once_modal(ctx, &self.state, backend);
         }
 
         // Surface audio playback failures (missing ffmpeg, no output device...)

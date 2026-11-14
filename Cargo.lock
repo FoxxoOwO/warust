@@ -5968,12 +5968,14 @@ dependencies = [
 
 [[package]]
 name = "warust"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
+ "arboard",
  "async-channel",
  "chrono",
  "console_error_panic_hook",
+ "cpal",
  "dirs",
  "eframe",
  "egui",

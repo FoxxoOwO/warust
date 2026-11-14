@@ -26,6 +26,27 @@ pub struct CallManager {
     pub video_tx: tokio::sync::Mutex<Option<async_channel::Sender<Vec<u8>>>>,
 }
 
+/// Whether the message names us through `ContextInfo.mentioned_jid` (a group @mention).
+///
+/// Mentions are plain JID strings, so the comparison ignores any device suffix
+/// and looks at the user part only.
+fn message_mentions_me(message: &wa::Message, state: &crate::state::AppState) -> bool {
+    let Some(ctx) = find_context_info_ref(message) else {
+        return false;
+    };
+    if ctx.mentioned_jid.is_empty() {
+        return false;
+    }
+    let Some(me) = state.self_jid.as_ref() else {
+        return false;
+    };
+    let me = me.to_string();
+    let me_user = me.split('@').next().unwrap_or_default();
+    ctx.mentioned_jid
+        .iter()
+        .any(|mentioned| mentioned.split('@').next().unwrap_or_default() == me_user)
+}
+
 /// Helper function to find ContextInfo in a message (replaces find_context_info_ref! macro)
 fn find_context_info_ref(message: &wa::Message) -> Option<&wa::ContextInfo> {
     // Check all message types that can carry ContextInfo
@@ -678,6 +699,138 @@ pub async fn spawn_backend(state: SharedState) -> Result<BackendHandle> {
     })
 }
 
+/// Pull a poll's question, options and vote secret out of a creation stanza.
+///
+/// Single-choice polls travel as `poll_creation_message_v3`, multi-choice as
+/// `poll_creation_message`, and older peers as `poll_creation_message_v2`; all
+/// three share one proto shape.
+fn extract_poll_creation(message: &wa::Message, sender: &Jid) -> Option<crate::state::PollData> {
+    let base = message.get_base_message();
+    let poll = base
+        .poll_creation_message_v3
+        .as_option()
+        .or_else(|| base.poll_creation_message_v2.as_option())
+        .or_else(|| base.poll_creation_message.as_option())?;
+    let question = poll.name.clone().unwrap_or_default();
+    let options: Vec<String> = poll
+        .options
+        .iter()
+        .filter_map(|opt| opt.option_name.clone())
+        .filter(|name| !name.is_empty())
+        .collect();
+    if question.is_empty() || options.is_empty() {
+        return None;
+    }
+    // Voters derive their encryption keys from the secret WhatsApp embeds in
+    // the creation stanza's context info. Without it no vote can be read, so a
+    // poll received without one simply shows zero tallies.
+    let secret = base
+        .message_context_info
+        .as_option()
+        .and_then(|ctx| ctx.message_secret.clone())
+        .unwrap_or_default();
+    let is_quiz = poll.poll_type == Some(wa::message::PollType::QUIZ)
+        || poll.correct_answer.as_option().is_some();
+    Some(crate::state::PollData {
+        question,
+        options,
+        selectable_count: poll.selectable_options_count.unwrap_or(1),
+        secret,
+        creator: sender.clone(),
+        votes: std::collections::HashMap::new(),
+        is_quiz,
+    })
+}
+
+/// Decrypt one inbound vote and fold it into the stored poll's tally.
+///
+/// Votes are separate messages carrying only ciphertext, so they are never
+/// stored as bubbles: the option hashes are mapped back to the option names we
+/// keep for the poll and counted from there.
+/// Map a requested pin duration onto the three lengths WhatsApp offers.
+fn pin_duration(secs: u32) -> whatsapp_rust::send::PinDuration {
+    match secs {
+        86_400 => whatsapp_rust::send::PinDuration::Hours24,
+        2_592_000 => whatsapp_rust::send::PinDuration::Days30,
+        _ => whatsapp_rust::send::PinDuration::Days7,
+    }
+}
+
+async fn apply_poll_vote(
+    client: Arc<Client>,
+    state: SharedState,
+    chat_jid: Jid,
+    poll_id: String,
+    payload: Vec<u8>,
+    iv: Vec<u8>,
+    voter: Jid,
+    is_group: bool,
+) {
+    if poll_id.is_empty() {
+        return;
+    }
+    let found = {
+        let s = state.read();
+        let canon = if is_group { chat_jid.clone() } else { s.canonical_jid(&chat_jid) };
+        s.messages
+            .get(&canon)
+            .and_then(|msgs| msgs.iter().find(|m| m.id == poll_id))
+            .and_then(|m| m.poll.as_ref())
+            .map(|p| (canon, p.secret.clone(), p.creator.clone(), p.options.clone()))
+    };
+    let Some((canon, secret, creator, options)) = found else {
+        // The creation stanza has not landed (or was pruned): nothing to count.
+        debug!("Vote for unknown poll {} in {}", poll_id, chat_jid);
+        return;
+    };
+    if secret.is_empty() {
+        debug!("Vote for poll {} dropped: no message secret", poll_id);
+        return;
+    }
+    let ciphertext = whatsapp_rust::wacore::poll::PollVoteCiphertext {
+        enc_payload: &payload,
+        enc_iv: &iv,
+    };
+    let hashes = match client
+        .polls()
+        .decrypt_vote(ciphertext, &secret, &poll_id, &creator, &voter)
+        .await
+    {
+        Ok(hashes) => hashes,
+        Err(err) => {
+            debug!("Undecryptable vote for poll {} from {}: {}", poll_id, voter, err);
+            return;
+        }
+    };
+    let picked: Vec<String> = hashes
+        .iter()
+        .filter_map(|hash| {
+            options
+                .iter()
+                .find(|name| {
+                    whatsapp_rust::wacore::poll::compute_option_hash(name).as_slice() == hash.as_slice()
+                })
+                .cloned()
+        })
+        .collect();
+    {
+        let mut s = state.write();
+        let mut touched = false;
+        if let Some(msgs) = s.messages.get_mut(&canon) {
+            if let Some(msg) = msgs.iter_mut().find(|m| m.id == poll_id) {
+                if let Some(poll) = msg.poll.as_mut() {
+                    poll.votes.insert(voter.to_string(), picked);
+                    touched = true;
+                }
+            }
+        }
+        if touched {
+            s.dirty = true;
+        }
+    }
+    let _ = crate::storage::persist_state(&state).await;
+}
+
 async fn handle_incoming_message(
     info: MessageInfo,
     message: wa::Message,
@@ -757,6 +910,74 @@ async fn handle_incoming_message(
         return;
     }
 
+    // Poll votes arrive as their own messages. They must never become bubbles:
+    // the ciphertext is opened with the poll's secret and merged into its tally.
+    if let Some(update) = base_msg.poll_update_message.as_option() {
+        let poll_id = update
+            .poll_creation_message_key
+            .as_option()
+            .and_then(|key| key.id.clone())
+            .unwrap_or_default();
+        let enc = update.vote.as_option();
+        let payload = enc.and_then(|v| v.enc_payload.clone());
+        let iv = enc.and_then(|v| v.enc_iv.clone());
+        if let (Some(payload), Some(iv)) = (payload, iv) {
+            apply_poll_vote(
+                client.clone(),
+                state.clone(),
+                chat_jid.clone(),
+                poll_id,
+                payload,
+                iv,
+                sender_jid.clone(),
+                info.source.is_group,
+            )
+            .await;
+        }
+        return;
+    }
+
+    // Pin/unpin is a control message too: it rewrites `AppState.pinned` and
+    // must not turn into a bubble. WhatsApp pins for everyone, so at most one
+    // pin exists per chat and the newest one replaces the previous.
+    if let Some(pin) = base_msg.pin_in_chat_message.as_option() {
+        let target = pin
+            .key
+            .as_option()
+            .and_then(|key| key.id.clone())
+            .unwrap_or_default();
+        let canon_chat = if info.source.is_group {
+            chat_jid.clone()
+        } else {
+            state.read().canonical_jid(&chat_jid)
+        };
+        let unpin = matches!(
+            pin.r#type.as_ref(),
+            Some(&wa::message::pin_in_chat_message::Type::UnpinForAll)
+        );
+        {
+            let mut s = state.write();
+            if unpin {
+                s.pinned.remove(&canon_chat);
+            } else if !target.is_empty() {
+                // Duration travels beside the pin, not inside it.
+                let duration = base_msg
+                    .message_context_info
+                    .as_option()
+                    .and_then(|ctx| ctx.message_add_on_duration_in_secs);
+                let entry = crate::state::PinnedMessage::new(
+                    target,
+                    duration,
+                    Some(sender_jid.clone()),
+                );
+                s.pinned.insert(canon_chat.clone(), entry);
+            }
+            s.dirty = true;
+        }
+        let _ = crate::storage::persist_state(&state).await;
+        return;
+    }
+
     // Extract text content
     let text = extract_message_text(&message).to_string();
     
@@ -776,6 +997,18 @@ async fn handle_incoming_message(
         extract_reply_to(&message),
         info.ephemeral_expiration,
     );
+
+    if let Some(exp) = info.ephemeral_expiration {
+        // Every message sent under a disappearing-message timer carries the
+        // expiry, so this keeps the per-chat timer in sync with the server
+        // even when the other side changed it.
+        let mut s = state.write();
+        if exp == 0 {
+            s.ephemeral.remove(&chat_jid);
+        } else {
+            s.ephemeral.insert(chat_jid.clone(), exp);
+        }
+    }
 
     if let Some(media) = extract_media_info(&message) {
         let local_path = crate::media::get_local_path(
@@ -797,7 +1030,20 @@ async fn handle_incoming_message(
         msg.media_caption = media.caption;
         msg.media_jpeg_thumbnail = media.jpeg_thumbnail;
     }
+
+    if message.is_view_once() {
+        msg.view_once = true;
+        // Nothing may survive locally before the user asks to open it: a
+        // thumbnail on disk (or a leftover copy from an earlier download)
+        // would defeat the point of "zobrazit jednou".
+        msg.media_jpeg_thumbnail = None;
+        msg.media_path = None;
+    }
     
+    if let Some(poll) = extract_poll_creation(&message, &sender_jid) {
+        msg.poll = Some(poll);
+    }
+
     // Update state
     {
         let mut s = state.write();
@@ -856,6 +1102,9 @@ async fn handle_incoming_message(
         }
     }
     
+    // A message that names us deserves a louder ping than a plain one.
+    let mentioned_me = !from_me && message_mentions_me(&message, &state.read());
+
     // Desktop notification / chime for messages the user is not looking at.
     // Muted chats stay silent; previews honour the privacy preference.
     if !from_me {
@@ -887,11 +1136,14 @@ async fn handle_incoming_message(
         };
 
         if !muted {
-            let body = if show_previews {
+            let mut body = if show_previews {
                 crate::notifications::preview(&text)
             } else {
                 "Nová zpráva".to_string()
             };
+            if mentioned_me {
+                body = format!("Zmínka · {body}");
+            }
             if desktop {
                 crate::notifications::notify(&title, &body, sound);
             } else if sound {
@@ -1047,6 +1299,10 @@ fn extract_message_text(message: &wa::Message) -> &str {
     if message.sticker_message.is_set() {
         return "🎨 Sticker";
     }
+    // Shared contact card
+    if message.contact_message.is_set() {
+        return "👤 Kontakt";
+    }
     // Check for audio / voice note
     if let Some(audio) = message.audio_message.as_option() {
         if audio.ptt.unwrap_or(false) {
@@ -1073,8 +1329,19 @@ fn extract_message_text(message: &wa::Message) -> &str {
     if message.reaction_message.is_set() {
         return "";
     }
-    // Check for poll
-    if message.poll_creation_message.is_set() {
+    // Check for poll - the question doubles as the bubble text, the options
+    // are drawn from the structured payload.
+    for poll in [
+        message.poll_creation_message_v3.as_option(),
+        message.poll_creation_message_v2.as_option(),
+        message.poll_creation_message.as_option(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(name) = poll.name.as_deref() {
+            return name;
+        }
         return "[Poll]";
     }
     // Check for poll update
@@ -1100,6 +1367,70 @@ fn extract_reply_to(message: &wa::Message) -> Option<String> {
     // ContextInfo has stanza_id (message ID) directly
     ctx.and_then(|ci| ci.stanza_id.as_deref())
         .map(|s| s.to_string())
+}
+
+/// Rebuild a sendable envelope for a stored message so it can be forwarded.
+///
+/// `Client::forward_message` would normally relay the original CDN blob, but we
+/// keep only the decrypted local file and the plain text, never the raw
+/// protocol envelope — so media is uploaded again from `media_path`.
+async fn build_forward_body(client: &Arc<Client>, msg: &Message) -> Option<wa::Message> {
+    if let (Some(kind), Some(path)) = (msg.media_type, msg.media_path.as_ref()) {
+        let path = std::path::PathBuf::from(path);
+        if path.exists() {
+            let bytes = tokio::fs::read(&path).await.ok()?;
+            let wa_type = match kind {
+                crate::state::MediaType::Image | crate::state::MediaType::Sticker => {
+                    whatsapp_rust::download::MediaType::Image
+                }
+                crate::state::MediaType::Video => whatsapp_rust::download::MediaType::Video,
+                crate::state::MediaType::Audio | crate::state::MediaType::Voice => {
+                    whatsapp_rust::download::MediaType::Audio
+                }
+                crate::state::MediaType::Document => whatsapp_rust::download::MediaType::Document,
+            };
+            let upload = client.upload(bytes, wa_type, Default::default()).await.ok()?;
+            let file_name = path.file_name().map(|n| n.to_string_lossy().to_string());
+            let caption = msg
+                .media_caption
+                .clone()
+                .or_else(|| (!msg.text.is_empty()).then(|| msg.text.clone()));
+            return Some(match kind {
+                crate::state::MediaType::Image | crate::state::MediaType::Sticker => {
+                    whatsapp_rust::media::image_message(
+                        upload,
+                        whatsapp_rust::media::ImageOptions { caption, ..Default::default() },
+                    )
+                }
+                crate::state::MediaType::Video => whatsapp_rust::media::video_message(
+                    upload,
+                    whatsapp_rust::media::VideoOptions { caption, ..Default::default() },
+                ),
+                crate::state::MediaType::Audio | crate::state::MediaType::Voice => {
+                    whatsapp_rust::media::audio_message(
+                        upload,
+                        whatsapp_rust::media::AudioOptions {
+                            ptt: Some(kind == crate::state::MediaType::Voice),
+                            ..Default::default()
+                        },
+                    )
+                }
+                crate::state::MediaType::Document => whatsapp_rust::media::document_message(
+                    upload,
+                    whatsapp_rust::media::DocumentOptions {
+                        file_name,
+                        caption,
+                        ..Default::default()
+                    },
+                ),
+            });
+        }
+    }
+
+    if !msg.text.is_empty() {
+        return Some(wa::Message::text(msg.text.clone()));
+    }
+    None
 }
 
 fn is_jid_group(jid: &Jid) -> bool {
@@ -1794,6 +2125,127 @@ async fn handle_event(
     }
 }
 
+/// Pull a group's description, admin list and settings from the server and
+/// mirror them into the chat row (participants, subject). Groups are the only
+/// thing the UI cannot derive from message traffic, so every mutation funnels
+/// through here instead of patching the snapshot locally and drifting.
+async fn refresh_group_info(client: &Client, state: &SharedState, chat_jid: &Jid) {
+    match client.groups().get_metadata(chat_jid).await {
+        Ok(meta) => {
+            let participants: std::collections::HashSet<Jid> =
+                meta.participants.iter().map(|p| p.jid.clone()).collect();
+            let admins: std::collections::HashSet<Jid> = meta
+                .participants
+                .iter()
+                .filter(|p| p.is_admin())
+                .map(|p| p.jid.clone())
+                .collect();
+            let mut s = state.write();
+            let snapshot = s.group_info.entry(chat_jid.to_string()).or_default();
+            snapshot.subject = meta.subject.clone();
+            snapshot.description = meta.description.clone();
+            snapshot.admins = admins;
+            snapshot.is_locked = meta.is_locked;
+            snapshot.is_announcement = meta.is_announcement;
+            if let Some(chat) = s.chats.get_mut(chat_jid) {
+                chat.is_group = true;
+                chat.participants = participants;
+                if !meta.subject.is_empty() {
+                    chat.name = meta.subject.clone();
+                }
+            }
+            s.dirty = true;
+        }
+        Err(e) => warn!("group info for {} failed: {}", chat_jid, e),
+    }
+}
+
+/// Fetch one media message in the background and remember where it landed.
+///
+/// Shared by `DownloadMedia` and `OpenViewOnce`: the only difference is who
+/// asked for the bytes and what happens afterwards.
+fn spawn_media_download(
+    client: Arc<Client>,
+    state: SharedState,
+    canon_chat: Jid,
+    message_id: String,
+) {
+    let msg_clone = {
+        let s = state.read();
+        s.get_chat_messages(&canon_chat)
+            .and_then(|msgs| msgs.iter().find(|m| m.id == message_id))
+            .cloned()
+    };
+    let Some(msg) = msg_clone else {
+        return;
+    };
+    let (Some(direct_path), Some(media_key), Some(file_sha256), Some(media_type)) = (
+        msg.media_direct_path,
+        msg.media_key,
+        msg.media_file_sha256,
+        msg.media_type,
+    ) else {
+        return;
+    };
+
+    let wa_type = match media_type {
+        crate::state::MediaType::Image => whatsapp_rust::download::MediaType::Image,
+        crate::state::MediaType::Video => whatsapp_rust::download::MediaType::Video,
+        crate::state::MediaType::Audio | crate::state::MediaType::Voice => {
+            whatsapp_rust::download::MediaType::Audio
+        }
+        crate::state::MediaType::Document => whatsapp_rust::download::MediaType::Document,
+        crate::state::MediaType::Sticker => whatsapp_rust::download::MediaType::Sticker,
+    };
+    let enc_sha = msg.media_file_enc_sha256.as_deref();
+    let length = msg.media_file_length.unwrap_or(0);
+    let params = whatsapp_rust::download::DownloadParams::encrypted(
+        direct_path,
+        &media_key,
+        &file_sha256,
+        enc_sha.unwrap_or(&file_sha256),
+        length,
+        wa_type,
+    );
+
+    let target_path = crate::media::get_local_path(
+        &message_id,
+        msg.media_caption.as_deref(),
+        msg.media_mimetype.as_deref(),
+        media_type,
+    );
+
+    tokio::spawn(async move {
+        tracing::info!(
+            "Starting download for media message {} -> {}",
+            message_id,
+            target_path.display()
+        );
+        match client.download_from_params(&params).await {
+            Ok(bytes) => {
+                let _ = std::fs::create_dir_all(crate::media::media_dir());
+                if let Err(e) = tokio::fs::write(&target_path, bytes).await {
+                    tracing::error!("Failed to save media to {}: {}", target_path.display(), e);
+                } else {
+                    tracing::info!("Media successfully saved to {}", target_path.display());
+                    {
+                        let mut s = state.write();
+                        if let Some(msgs) = s.messages.get_mut(&canon_chat) {
+                            if let Some(m) = msgs.iter_mut().find(|m| m.id == message_id) {
+                                m.media_path = Some(target_path.to_string_lossy().to_string());
+                            }
+                        }
+                        s.dirty = true;
+                    }
+                    crate::media::MEDIA_REV.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let _ = crate::storage::persist_state(&state).await;
+                }
+            }
+            Err(e) => tracing::error!("Failed to download media for {}: {}", message_id, e),
+        }
+    });
+}
+
 async fn handle_command(
     cmd: Command,
     active_client: &Arc<tokio::sync::RwLock<Arc<Client>>>,
@@ -1810,21 +2262,31 @@ async fn handle_command(
             let _ = tx_status.send(ConnectionStatus::Connected);
         }
 
-        Command::SendText { to, text, reply_to } => {
+        Command::SendText { to, text, reply_to, mentioned_jid } => {
             let canon_to = state.read().canonical_jid(&to);
-            let mut msg = wa::Message::text(text.clone());
+            let mut context: Option<wa::ContextInfo> = None;
             if let Some(ref reply_id) = reply_to {
                 if let Some(reply_msg) = state.read().get_chat_messages(&canon_to).and_then(|msgs| msgs.iter().find(|m| m.id == *reply_id)) {
-                    let context = build_quote_context_with_info(
+                    context = Some(build_quote_context_with_info(
                         reply_id,
                         &reply_msg.sender_jid,
                         &canon_to,
                         &canon_to,
                         &wa::Message::default(),
-                    );
-                    msg = wa::Message::text_with_context(text.clone(), context);
+                    ));
                 }
             }
+            // Mentions share ContextInfo with a quote, so a reply that also names
+            // somebody keeps both.
+            if !mentioned_jid.is_empty() {
+                let mut ctx = context.unwrap_or_default();
+                ctx.mentioned_jid = mentioned_jid;
+                context = Some(ctx);
+            }
+            let msg = match context {
+                Some(ctx) => wa::Message::text_with_context(text.clone(), ctx),
+                None => wa::Message::text(text.clone()),
+            };
             let res = client.send_message(canon_to.clone(), msg).await?;
             let sender = client.pn().or(client.lid()).unwrap_or_else(|| canon_to.clone());
             let message = Message::new_text(
@@ -1846,6 +2308,67 @@ async fn handle_command(
             let _ = crate::storage::persist_state(state).await;
         }
         
+        Command::SendContact { chat_jid, contact_jid, reply_to } => {
+            let canon_to = state.read().canonical_jid(&chat_jid);
+            let (display_name, phone) = {
+                let s = state.read();
+                let name = s
+                    .resolve_display_name(&contact_jid)
+                    .unwrap_or_else(|| crate::util::format_jid(&contact_jid));
+                let phone = crate::vcard::jid_digits(&contact_jid.to_string());
+                (name, phone)
+            };
+            if phone.is_empty() {
+                warn!("Cannot share {}: the JID carries no phone number", contact_jid);
+                return Ok(());
+            }
+            let quote_context = reply_to.as_ref().and_then(|reply_id| {
+                let s = state.read();
+                let reply_msg = s
+                    .get_chat_messages(&canon_to)
+                    .and_then(|msgs| msgs.iter().find(|m| m.id == *reply_id))?;
+                Some(build_quote_context_with_info(
+                    reply_id,
+                    &reply_msg.sender_jid,
+                    &canon_to,
+                    &canon_to,
+                    &wa::Message::default(),
+                ))
+            });
+            let msg = wa::Message {
+                contact_message: whatsapp_rust::waproto::buffa::MessageField::some(
+                    wa::message::ContactMessage {
+                        display_name: Some(display_name.clone()),
+                        vcard: Some(crate::vcard::build_vcard(&display_name, &phone)),
+                        context_info: quote_context
+                            .map(|ci| whatsapp_rust::waproto::buffa::MessageField::some(ci))
+                            .unwrap_or_default(),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            };
+            let res = client.send_message(canon_to.clone(), msg).await?;
+            let sender = client.pn().or(client.lid()).unwrap_or_else(|| canon_to.clone());
+            let message = Message::new_text(
+                res.message_id,
+                canon_to.clone(),
+                sender,
+                format!("👤 Kontakt: {display_name}"),
+                Utc::now(),
+                true,
+                MessageStatus::Sent,
+                reply_to,
+                None,
+            );
+            {
+                let mut s = state.write();
+                s.add_message(message);
+                s.consolidate_canonical_chats();
+            }
+            let _ = crate::storage::persist_state(state).await;
+        }
+
         Command::SendMessage { to, message } => {
             client.send_message(to, message).await?;
         }
@@ -1873,7 +2396,7 @@ async fn handle_command(
             }
         }
         
-        Command::SendMedia { chat_jid, file_path, caption, reply_to } => {
+        Command::SendMedia { chat_jid, file_path, caption, reply_to, view_once } => {
             let canon_to = state.read().canonical_jid(&chat_jid);
             let quote_context = reply_to.as_ref().and_then(|reply_id| {
                 let s = state.read();
@@ -1939,13 +2462,63 @@ async fn handle_command(
                                         })
                                     }
                                     crate::state::MediaType::Sticker => {
-                                        whatsapp_rust::media::image_message(upload, whatsapp_rust::media::ImageOptions {
-                                            caption: caption.clone(),
+                                        // Stickers are their own payload type; sending
+                                        // a .webp as an image makes clients offer a
+                                        // download instead of sticking it in the chat.
+                                        let (width, height) = crate::media::image_dimensions(&file_path)
+                                            .unwrap_or((512, 512));
+                                        let sticker = wa::message::StickerMessage {
+                                            url: Some(upload.url),
+                                            direct_path: Some(upload.direct_path),
+                                            media_key: Some(upload.media_key.to_vec()),
+                                            file_sha256: Some(upload.file_sha256.to_vec()),
+                                            file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+                                            file_length: Some(upload.file_length),
+                                            media_key_timestamp: Some(upload.media_key_timestamp),
+                                            mimetype: Some("image/webp".to_string()),
+                                            width: Some(width),
+                                            height: Some(height),
+                                            is_animated: Some(crate::media::webp_is_animated(&file_path)),
+                                            sticker_sent_ts: Some(Utc::now().timestamp_millis()),
+                                            context_info: quote_context
+                                                .clone()
+                                                .map(|ci| whatsapp_rust::waproto::buffa::MessageField::some(*ci))
+                                                .unwrap_or_default(),
                                             ..Default::default()
-                                        })
+                                        };
+                                        wa::Message {
+                                            sticker_message: whatsapp_rust::waproto::buffa::MessageField::some(sticker),
+                                            ..Default::default()
+                                        }
                                     }
                                 };
-                                
+
+                                // "Zobrazit jednou": the payload travels inside a
+                                // future-proof wrapper, which is what keeps clients
+                                // from caching it.
+                                let wa_msg = if view_once {
+                                    let mut inner = wa_msg;
+                                    if let Some(img) = inner.image_message.as_option_mut() {
+                                        img.view_once = Some(true);
+                                    }
+                                    if let Some(vid) = inner.video_message.as_option_mut() {
+                                        vid.view_once = Some(true);
+                                    }
+                                    wa::Message {
+                                        view_once_message_v2: whatsapp_rust::waproto::buffa::MessageField::some(
+                                            wa::message::FutureProofMessage {
+                                                message: whatsapp_rust::waproto::buffa::MessageField::from_box(
+                                                    Box::new(inner),
+                                                ),
+                                                ..Default::default()
+                                            },
+                                        ),
+                                        ..Default::default()
+                                    }
+                                } else {
+                                    wa_msg
+                                };
+
                                 match client_clone.send_message(canon_to.clone(), wa_msg).await {
                                     Ok(res) => {
                                         tracing::info!("Media message sent successfully with id {}", res.message_id);
@@ -1998,75 +2571,103 @@ async fn handle_command(
             });
         }
 
+        Command::ForwardMessages { to, from_chat, message_ids } => {
+            let (canon_to, self_jid, msgs) = {
+                let s = state.read();
+                let canon_to = s.canonical_jid(&to);
+                let canon_from = s.canonical_jid(&from_chat);
+                let msgs: Vec<Message> = s
+                    .get_chat_messages(&canon_from)
+                    .map(|all| {
+                        all.iter()
+                            .filter(|m| message_ids.contains(&m.id))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (canon_to, s.self_jid.clone(), msgs)
+            };
+
+            if msgs.is_empty() {
+                warn!("Forward requested but none of {:?} is still stored", message_ids);
+            } else {
+                let client_clone = client.clone();
+                let state_clone = state.clone();
+                tokio::spawn(async move {
+                    let sender = self_jid
+                        .or_else(|| client_clone.pn())
+                        .unwrap_or_else(|| canon_to.clone());
+                    let mut delivered = 0usize;
+                    for msg in msgs {
+                        let Some(body) = build_forward_body(&client_clone, &msg).await else {
+                            warn!("Skipping forward of {} — no text and no local media", msg.id);
+                            continue;
+                        };
+                        match client_clone.forward_message(canon_to.clone(), &body).await {
+                            Ok(res) => {
+                                delivered += 1;
+                                let mut copy = msg.clone();
+                                copy.id = res.message_id;
+                                copy.chat_jid = canon_to.clone();
+                                copy.sender_jid = sender.clone();
+                                copy.from_me = true;
+                                copy.status = MessageStatus::Sent;
+                                copy.timestamp = chrono::Utc::now();
+                                copy.reply_to = None;
+                                copy.edited = false;
+                                copy.reactions.clear();
+                                state_clone.write().add_message(copy);
+                            }
+                            Err(e) => error!("Failed to forward {}: {}", msg.id, e),
+                        }
+                    }
+                    tracing::info!("Forwarded {} message(s) to {}", delivered, canon_to);
+                    {
+                        let mut s = state_clone.write();
+                        s.consolidate_canonical_chats();
+                    }
+                    let _ = crate::storage::persist_state(&state_clone).await;
+                });
+            }
+        }
+
         Command::DownloadMedia { chat_jid, message_id } => {
             let canon_chat = state.read().canonical_jid(&chat_jid);
-            let msg_clone = {
+            spawn_media_download(client.clone(), state.clone(), canon_chat, message_id);
+        }
+
+        Command::OpenViewOnce { chat_jid, message_id } => {
+            let canon_chat = state.read().canonical_jid(&chat_jid);
+            spawn_media_download(client.clone(), state.clone(), canon_chat, message_id);
+        }
+
+        Command::ConsumeViewOnce { chat_jid, message_id } => {
+            let canon_chat = state.read().canonical_jid(&chat_jid);
+            let stored_path = {
                 let s = state.read();
                 s.get_chat_messages(&canon_chat)
                     .and_then(|msgs| msgs.iter().find(|m| m.id == message_id))
-                    .cloned()
+                    .and_then(|m| m.media_path.clone())
             };
-            if let Some(msg) = msg_clone {
-                if let (Some(direct_path), Some(media_key), Some(file_sha256), Some(media_type)) =
-                    (msg.media_direct_path, msg.media_key, msg.media_file_sha256, msg.media_type)
-                {
-                    let wa_type = match media_type {
-                        crate::state::MediaType::Image => whatsapp_rust::download::MediaType::Image,
-                        crate::state::MediaType::Video => whatsapp_rust::download::MediaType::Video,
-                        crate::state::MediaType::Audio | crate::state::MediaType::Voice => whatsapp_rust::download::MediaType::Audio,
-                        crate::state::MediaType::Document => whatsapp_rust::download::MediaType::Document,
-                        crate::state::MediaType::Sticker => whatsapp_rust::download::MediaType::Sticker,
-                    };
-                    let enc_sha = msg.media_file_enc_sha256.as_deref();
-                    let length = msg.media_file_length.unwrap_or(0);
-                    let params = whatsapp_rust::download::DownloadParams::encrypted(
-                        direct_path,
-                        &media_key,
-                        &file_sha256,
-                        enc_sha.unwrap_or(&file_sha256),
-                        length,
-                        wa_type,
-                    );
-                    
-                    let client_clone = client.clone();
-                    let state_clone = state.clone();
-                    let target_path = crate::media::get_local_path(
-                        &message_id,
-                        msg.media_caption.as_deref(),
-                        msg.media_mimetype.as_deref(),
-                        media_type,
-                    );
-                    
-                    tokio::spawn(async move {
-                        tracing::info!("Starting download for media message {} -> {}", message_id, target_path.display());
-                        match client_clone.download_from_params(&params).await {
-                            Ok(bytes) => {
-                                let _ = std::fs::create_dir_all(crate::media::media_dir());
-                                if let Err(e) = tokio::fs::write(&target_path, bytes).await {
-                                    tracing::error!("Failed to save media to {}: {}", target_path.display(), e);
-                                } else {
-                                    tracing::info!("Media successfully saved to {}", target_path.display());
-                                    {
-                                        let mut s = state_clone.write();
-                                        if let Some(msgs) = s.messages.get_mut(&canon_chat) {
-                                            if let Some(m) = msgs.iter_mut().find(|m| m.id == message_id) {
-                                                m.media_path = Some(target_path.to_string_lossy().to_string());
-                                            }
-                                        }
-                                    }
-                                    crate::media::MEDIA_REV.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    let _ = crate::storage::persist_state(&state_clone).await;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to download media for {}: {}", message_id, e);
-                            }
-                        }
-                    });
-                }
+            if let Some(path) = stored_path {
+                // The point of a view-once message is that no copy survives.
+                let _ = tokio::fs::remove_file(&path).await;
             }
+            {
+                let mut s = state.write();
+                if let Some(msgs) = s.messages.get_mut(&canon_chat) {
+                    if let Some(m) = msgs.iter_mut().find(|m| m.id == message_id) {
+                        m.media_path = None;
+                        m.media_jpeg_thumbnail = None;
+                        m.view_once_opened = true;
+                    }
+                }
+                s.dirty = true;
+            }
+            crate::media::MEDIA_REV.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let _ = crate::storage::persist_state(state).await;
         }
-        
+
         Command::SendReaction { chat_jid, message_id, emoji } => {
             let canon_chat = {
                 let s = state.read();
@@ -2615,6 +3216,58 @@ async fn handle_command(
             client.chat_actions().unstar_message(&chat_jid, participant_jid.as_ref(), &message_id, from_me).await?;
         }
         
+        Command::PinMessage { chat_jid, message_id, duration_secs } => {
+            let canon_chat = state.read().canonical_jid(&chat_jid);
+            let (from_me, sender_jid) = state
+                .read()
+                .messages
+                .get(&canon_chat)
+                .and_then(|msgs| msgs.iter().find(|m| m.id == message_id))
+                .map(|m| (m.from_me, m.sender_jid.clone()))
+                .unwrap_or((true, canon_chat.clone()));
+            let is_group = state
+                .read()
+                .chats
+                .get(&canon_chat)
+                .map_or(false, |chat| chat.is_group);
+            let key = wa::MessageKey {
+                id: Some(message_id.clone()),
+                from_me: Some(from_me),
+                remote_jid: Some(canon_chat.to_string()),
+                // Group pins must name the original sender, or the server
+                // cannot resolve the key.
+                participant: if is_group && !from_me {
+                    Some(sender_jid.to_string())
+                } else {
+                    None
+                },
+                ..Default::default()
+            };
+            match duration_secs {
+                Some(secs) => {
+                    client
+                        .pin_message(canon_chat.clone(), key, pin_duration(secs))
+                        .await?
+                }
+                None => client.unpin_message(canon_chat.clone(), key).await?,
+            }
+            {
+                let mut s = state.write();
+                match duration_secs {
+                    Some(secs) => {
+                        let me = client.pn().or(client.lid());
+                        let entry =
+                            crate::state::PinnedMessage::new(message_id, Some(secs), me);
+                        s.pinned.insert(canon_chat.clone(), entry);
+                    }
+                    None => {
+                        s.pinned.remove(&canon_chat);
+                    }
+                }
+                s.dirty = true;
+            }
+        }
+
         Command::DeleteMessageForMe { chat_jid, message_id } => {
             let res = client.revoke_message(chat_jid.clone(), message_id.clone(), whatsapp_rust::send::RevokeType::Sender).await;
             {
@@ -2692,11 +3345,24 @@ async fn handle_command(
         }
         
         Command::BlockContact { jid } => {
-            client.blocking().block(&jid).await?;
+            let canon = state.read().canonical_jid(&jid);
+            client.blocking().block(&canon).await?;
+            let mut s = state.write();
+            s.contacts
+                .entry(canon.clone())
+                .or_insert_with(|| crate::state::Contact::new(canon.clone(), None))
+                .is_blocked = true;
+            s.dirty = true;
         }
         
         Command::UnblockContact { jid } => {
-            client.blocking().unblock(&jid).await?;
+            let canon = state.read().canonical_jid(&jid);
+            client.blocking().unblock(&canon).await?;
+            let mut s = state.write();
+            if let Some(contact) = s.contacts.get_mut(&canon) {
+                contact.is_blocked = false;
+            }
+            s.dirty = true;
         }
         
         Command::CreateGroup { subject, participants } => {
@@ -2705,23 +3371,226 @@ async fn handle_command(
                 options = options.with_participant(whatsapp_rust::wacore::iq::groups::GroupParticipantOptions::new(p.clone()));
             }
             let result = client.groups().create_group(options).await?;
-            let mut s = state.write();
-            let chat = s.get_or_create_chat(result.metadata.id.clone(), subject, true);
-            chat.is_group = true;
+            let group_jid = result.metadata.id.clone();
+            let participants: std::collections::HashSet<Jid> =
+                result.metadata.participants.iter().map(|p| p.jid.clone()).collect();
+            let admins: std::collections::HashSet<Jid> = result
+                .metadata
+                .participants
+                .iter()
+                .filter(|p| p.is_admin())
+                .map(|p| p.jid.clone())
+                .collect();
+            {
+                let mut s = state.write();
+                let chat = s.get_or_create_chat(group_jid.clone(), subject.clone(), true);
+                chat.is_group = true;
+                chat.participants = participants;
+                let snapshot = s.group_info.entry(group_jid.to_string()).or_default();
+                snapshot.subject = result.metadata.subject.clone();
+                snapshot.description = result.metadata.description.clone();
+                snapshot.admins = admins;
+                snapshot.is_locked = result.metadata.is_locked;
+                snapshot.is_announcement = result.metadata.is_announcement;
+                // Land in the new group so the user sees what they created.
+                s.selected_chat = Some(group_jid.clone());
+                s.selected_messages.clear();
+                s.dirty = true;
+            }
+            let _ = crate::storage::persist_state(&state).await;
         }
         
         Command::JoinGroup { invite_code } => {
-            // join_via_link is not available, need to use different method
-            // For now, no-op
-            let _ = invite_code;
+            // The vendor pulls the code out of a full chat.whatsapp.com link too.
+            let result = client.groups().join_with_invite_code(&invite_code).await?;
+            let group_jid = result.group_jid().clone();
+            let pending = matches!(
+                result,
+                whatsapp_rust::wacore::iq::groups::JoinGroupResult::PendingApproval(_)
+            );
+            {
+                let mut s = state.write();
+                let chat = s.get_or_create_chat(group_jid.clone(), "Skupina".to_string(), true);
+                chat.is_group = true;
+                s.selected_chat = Some(group_jid.clone());
+                s.selected_messages.clear();
+                if pending {
+                    info!("Join request for {group_jid} awaits admin approval");
+                }
+                s.dirty = true;
+            }
+            refresh_group_info(&client, state, &group_jid).await;
+            let _ = crate::storage::persist_state(state).await;
+        }
+
+        Command::SendVoiceNote { chat_jid, file_path, duration_seconds, waveform } => {
+            let canon_to = state.read().canonical_jid(&chat_jid);
+            let client_clone = client.clone();
+            let state_clone = state.clone();
+            tokio::spawn(async move {
+                // Keep the take in the media dir: the temp file the recorder
+                // produced is what the local echo will try to play.
+                let stored = crate::media::media_dir().join(
+                    file_path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "voice.ogg".to_string()),
+                );
+                let _ = tokio::fs::create_dir_all(crate::media::media_dir()).await;
+                let _ = tokio::fs::copy(&file_path, &stored).await;
+                let playable = if stored.exists() { stored.clone() } else { file_path.clone() };
+
+                let bytes = match tokio::fs::read(&file_path).await {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        tracing::error!("Failed to read voice note {}: {}", file_path.display(), err);
+                        return;
+                    }
+                };
+                let file_size = bytes.len() as u64;
+                let upload = match client_clone
+                    .upload(bytes, whatsapp_rust::download::MediaType::Audio, Default::default())
+                    .await
+                {
+                    Ok(upload) => upload,
+                    Err(err) => {
+                        tracing::error!("Failed to upload voice note: {err}");
+                        return;
+                    }
+                };
+                let msg = whatsapp_rust::media::audio_message(
+                    upload,
+                    whatsapp_rust::media::AudioOptions {
+                        ptt: Some(true),
+                        duration_seconds: Some(duration_seconds),
+                        waveform: if waveform.is_empty() { None } else { Some(waveform) },
+                        ..Default::default()
+                    },
+                );
+                match client_clone.send_message(canon_to.clone(), msg).await {
+                    Ok(res) => {
+                        let sender = client_clone
+                            .pn()
+                            .or(client_clone.lid())
+                            .unwrap_or_else(|| canon_to.clone());
+                        let mut local_msg = Message::new_text(
+                            res.message_id,
+                            canon_to.clone(),
+                            sender,
+                            "🎤 Voice message".to_string(),
+                            chrono::Utc::now(),
+                            true,
+                            MessageStatus::Sent,
+                            None,
+                            None,
+                        );
+                        local_msg.media_type = Some(crate::state::MediaType::Voice);
+                        local_msg.media_path = Some(playable.to_string_lossy().to_string());
+                        local_msg.media_file_length = Some(file_size);
+                        {
+                            let mut s = state_clone.write();
+                            s.add_message(local_msg);
+                            s.consolidate_canonical_chats();
+                        }
+                        crate::media::MEDIA_REV.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let _ = crate::storage::persist_state(&state_clone).await;
+                    }
+                    Err(err) => tracing::error!("Failed to send voice note: {err}"),
+                }
+            });
         }
         
+        Command::CreatePoll { chat_jid, question, options, selectable_count } => {
+            let canon_to = state.read().canonical_jid(&chat_jid);
+            let selectable = selectable_count.max(1);
+            match client
+                .polls()
+                .create(canon_to.clone(), &question, &options, selectable)
+                .await
+            {
+                Ok((res, secret)) => {
+                    let sender = client
+                        .pn()
+                        .or(client.lid())
+                        .unwrap_or_else(|| canon_to.clone());
+                    let mut local_msg = Message::new_text(
+                        res.message_id,
+                        canon_to.clone(),
+                        sender.clone(),
+                        question.clone(),
+                        chrono::Utc::now(),
+                        true,
+                        MessageStatus::Sent,
+                        None,
+                        None,
+                    );
+                    local_msg.poll = Some(crate::state::PollData {
+                        question,
+                        options,
+                        selectable_count: selectable,
+                        secret,
+                        creator: sender,
+                        votes: Default::default(),
+                        is_quiz: false,
+                    });
+                    {
+                        let mut s = state.write();
+                        s.add_message(local_msg);
+                        s.consolidate_canonical_chats();
+                    }
+                    let _ = crate::storage::persist_state(&state).await;
+                }
+                Err(err) => error!("Failed to create poll: {err}"),
+            }
+        }
+
+        Command::VotePoll { chat_jid, message_id, poll_creator, message_secret, option_names } => {
+            // Same normalisation as `CreatePoll`: a chat may be addressed by its
+            // LID while the poll lives under the PN (or the other way round).
+            let canon_chat = state.read().canonical_jid(&chat_jid);
+            match client
+                .polls()
+                .vote(canon_chat.clone(), &message_id, &poll_creator, &message_secret, &option_names)
+                .await
+            {
+                Ok(_) => {
+                    let me = client
+                        .pn()
+                        .or(client.lid())
+                        .unwrap_or_else(|| poll_creator.clone())
+                        .to_string();
+                    let mut s = state.write();
+                    let mut touched = false;
+                    if let Some(msgs) = s.messages.get_mut(&canon_chat) {
+                        if let Some(msg) = msgs.iter_mut().find(|m| m.id == message_id) {
+                            if let Some(poll) = msg.poll.as_mut() {
+                                poll.votes.insert(me, option_names);
+                                touched = true;
+                            }
+                        }
+                    }
+                    if touched {
+                        s.dirty = true;
+                    }
+                }
+                Err(err) => error!("Failed to vote in poll {message_id}: {err}"),
+            }
+        }
+
         Command::LeaveGroup { chat_jid } => {
             client.groups().leave(&chat_jid).await?;
             let mut s = state.write();
+            let key = chat_jid.to_string();
+            s.group_info.remove(&key);
+            s.group_info_pending.remove(&key);
             if let Some(chat) = s.chats.get_mut(&chat_jid) {
                 chat.is_archived = true;
             }
+            if s.selected_chat.as_ref() == Some(&chat_jid) {
+                s.selected_chat = None;
+                s.show_chat_info = false;
+            }
+            s.dirty = true;
         }
         
         Command::AddParticipants { chat_jid, participants } => {
@@ -2746,24 +3615,35 @@ async fn handle_command(
         
         Command::PromoteParticipants { chat_jid, participants } => {
             client.groups().promote_participants(&chat_jid, &participants).await?;
+            refresh_group_info(&client, state, &chat_jid).await;
         }
         
         Command::DemoteParticipants { chat_jid, participants } => {
             client.groups().demote_participants(&chat_jid, &participants).await?;
+            refresh_group_info(&client, state, &chat_jid).await;
         }
         
         Command::GetGroupInviteLink { chat_jid } => {
             let link = client.groups().get_invite_link(&chat_jid, false).await?;
             info!("Group invite link: {}", link);
+            let mut s = state.write();
+            s.group_info.entry(chat_jid.to_string()).or_default().invite_link = Some(link);
+        }
+        
+        Command::RequestGroupInfo { chat_jid } => {
+            refresh_group_info(&client, state, &chat_jid).await;
         }
         
         Command::SetGroupSubject { chat_jid, subject } => {
             let validated = GroupSubject::new(&subject)
                 .map_err(|e| anyhow::anyhow!("Invalid group subject: {}", e))?;
             client.groups().set_subject(&chat_jid, validated).await?;
-            let mut s = state.write();
-            if let Some(chat) = s.chats.get_mut(&chat_jid) {
-                chat.name = subject;
+            {
+                let mut s = state.write();
+                if let Some(chat) = s.chats.get_mut(&chat_jid) {
+                    chat.name = subject.clone();
+                }
+                s.group_info.entry(chat_jid.to_string()).or_default().subject = subject;
             }
         }
         
@@ -2771,10 +3651,38 @@ async fn handle_command(
             let validated = GroupDescription::new(&description)
                 .map_err(|e| anyhow::anyhow!("Invalid group description: {}", e))?;
             client.groups().set_description(&chat_jid, Some(validated), PreviousDescription::Resolve).await?;
+            let mut s = state.write();
+            s.group_info.entry(chat_jid.to_string()).or_default().description = Some(description);
+            s.dirty = true;
         }
         
-        Command::SetGroupEphemeral { chat_jid, expiration } => {
+        Command::SetEphemeral { chat_jid, expiration } => {
+            // Works for 1:1 chats too, not just groups: the vendor sends the
+            // same protocol message either way.
             client.groups().set_ephemeral(&chat_jid, expiration).await?;
+            let mut s = state.write();
+            if expiration == 0 {
+                s.ephemeral.remove(&chat_jid);
+            } else {
+                s.ephemeral.insert(chat_jid.clone(), expiration);
+            }
+            s.dirty = true;
+        }
+
+        Command::SetGroupAnnounce { chat_jid, enabled } => {
+            client.groups().set_announce(&chat_jid, enabled).await?;
+            if let Some(snapshot) = state.write().group_info.get_mut(&chat_jid.to_string()) {
+                snapshot.is_announcement = enabled;
+            }
+            refresh_group_info(&client, state, &chat_jid).await;
+        }
+
+        Command::SetGroupLocked { chat_jid, enabled } => {
+            client.groups().set_locked(&chat_jid, enabled).await?;
+            if let Some(snapshot) = state.write().group_info.get_mut(&chat_jid.to_string()) {
+                snapshot.is_locked = enabled;
+            }
+            refresh_group_info(&client, state, &chat_jid).await;
         }
         
         Command::SetPresence { status } => {

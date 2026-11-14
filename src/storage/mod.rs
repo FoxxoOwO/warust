@@ -37,6 +37,12 @@ struct PersistedAppState {
     preferences: crate::state::UserPreferences,
     #[serde(default)]
     initial_history_fetched: bool,
+    /// Chat jid (as a string, because JSON keys must be strings) to its pin.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pinned: HashMap<String, crate::state::PinnedMessage>,
+    /// Unsent composer text per chat, keyed the same way as `pinned`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    drafts: HashMap<String, String>,
 }
 
 /// Contents of one `messages/<hash>.json` file.
@@ -145,6 +151,16 @@ impl Store {
                 scheduled_messages: s.scheduled_messages.clone(),
                 preferences: s.preferences.clone(),
                 initial_history_fetched: s.initial_history_fetched,
+                pinned: s
+                    .pinned
+                    .iter()
+                    .map(|(jid, pin)| (jid.to_string(), pin.clone()))
+                    .collect(),
+                drafts: s
+                    .drafts
+                    .iter()
+                    .map(|(jid, text)| (jid.to_string(), text.clone()))
+                    .collect(),
             };
             let mut history: Vec<(String, Vec<Message>)> = s
                 .messages
@@ -329,6 +345,16 @@ impl Store {
         state.self_name = persisted.self_name;
         state.scheduled_messages = persisted.scheduled_messages;
         state.initial_history_fetched = persisted.initial_history_fetched;
+        state.pinned = persisted
+            .pinned
+            .into_iter()
+            .filter_map(|(jid, pin)| jid.parse::<Jid>().ok().map(|jid| (jid, pin)))
+            .collect();
+        state.drafts = persisted
+            .drafts
+            .into_iter()
+            .filter_map(|(jid, text)| jid.parse::<Jid>().ok().map(|jid| (jid, text)))
+            .collect();
         state.clean_stray_reactions();
         state.consolidate_canonical_chats();
 
@@ -592,6 +618,8 @@ mod tests {
             scheduled_messages: vec![],
             preferences: UserPreferences::default(),
             initial_history_fetched: false,
+            pinned: HashMap::new(),
+            drafts: HashMap::new(),
         };
         std::fs::create_dir_all(temp.path()).unwrap();
         std::fs::write(

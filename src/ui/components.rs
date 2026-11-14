@@ -6,6 +6,45 @@ use crate::theme::{bubble, chat_list, status};
 use crate::util::{format_timestamp, format_message_time, initials, truncate};
 
 /// Status indicator icon
+/// Chat-list preview text for a message, with WhatsApp's media markers.
+///
+/// The backend already labels uncaptioned media (`"📷 Image"`), so only the
+/// plain-caption case needs an icon prefix here.
+fn preview_label(preview: &crate::state::MessagePreview) -> String {
+    use crate::state::MediaType;
+
+    let text = preview.text.trim();
+    if text.starts_with("[Reaction]") {
+        return "Reakce".to_string();
+    }
+
+    let icon = match preview.media_type {
+        Some(MediaType::Image) => "📷",
+        Some(MediaType::Video) => "📹",
+        Some(MediaType::Audio) | Some(MediaType::Voice) => "🎤",
+        Some(MediaType::Document) => "📄",
+        Some(MediaType::Sticker) => "🎨",
+        None => "",
+    };
+
+    if text.is_empty() || text == "[Protocol Message]" {
+        return if icon.is_empty() {
+            "Zpráva".to_string()
+        } else {
+            format!("{} Zpráva", icon)
+        };
+    }
+
+    let already_labelled = ["📷", "📹", "🎤", "🎵", "📄", "🎨"]
+        .iter()
+        .any(|prefix| text.starts_with(prefix));
+    if icon.is_empty() || already_labelled {
+        text.to_string()
+    } else {
+        format!("{} {}", icon, text)
+    }
+}
+
 pub fn status_icon(ui: &mut Ui, status: crate::state::MessageStatus, size: f32) {
     let (icon, color) = match status {
         crate::state::MessageStatus::Sending => ("⏳", status::SENDING),
@@ -110,6 +149,8 @@ pub struct ChatItem<'a> {
     pub chat: &'a crate::state::Chat,
     pub is_selected: bool,
     pub on_click: Option<Box<dyn FnOnce() + 'a>>,
+    /// Unsent text for this chat; shown as a draft instead of the last message.
+    pub draft: Option<&'a str>,
 }
 
 impl<'a> ChatItem<'a> {
@@ -118,9 +159,15 @@ impl<'a> ChatItem<'a> {
             chat,
             is_selected,
             on_click: None,
+            draft: None,
         }
     }
     
+    pub fn draft(mut self, text: Option<&'a str>) -> Self {
+        self.draft = text;
+        self
+    }
+
     pub fn on_click(mut self, f: impl FnOnce() + 'a) -> Self {
         self.on_click = Some(Box::new(f));
         self
@@ -226,14 +273,18 @@ impl<'a> Widget for ChatItem<'a> {
                     3.5,
                 );
                 ui.ctx().request_repaint();
+            } else if let Some(draft) = self.draft.filter(|d| !d.trim().is_empty()) {
+                // Drafts win over the last message, as they do on the phone.
+                let preview_text = truncate(&format!("Koncept: {}", draft.trim()), 40);
+                painter.text(
+                    egui::pos2(text_x, preview_y),
+                    egui::Align2::LEFT_TOP,
+                    &preview_text,
+                    FontId::proportional(13.0),
+                    Color32::from_rgb(0x25, 0xD3, 0x66),
+                );
             } else if let Some(preview) = &self.chat.last_message {
-                let clean_text = if preview.text == "[Protocol Message]" || preview.text.is_empty() {
-                    "Zpráva".to_string()
-                } else if preview.text.starts_with("[Reaction]") {
-                    "Reakce".to_string()
-                } else {
-                    preview.text.clone()
-                };
+                let clean_text = preview_label(preview);
 
                 let preview_text = if preview.from_me {
                     format!("You: {}", truncate(&clean_text, 40))
@@ -344,6 +395,26 @@ pub struct MessageBubble<'a> {
     pub on_react: Option<Box<dyn FnOnce(&'a str, &'a str) + 'a>>,
     pub on_view_reactions: Option<Box<dyn FnOnce(&'a str) + 'a>>,
     pub on_open_emoji_picker: Option<Box<dyn FnOnce(&'a str) + 'a>>,
+    pub on_select: Option<Box<dyn FnOnce(&'a str) + 'a>>,
+    /// Pins the message for the given duration, or unpins when `None`.
+    pub on_pin: Option<Box<dyn FnOnce(&'a str, Option<u32>) + 'a>>,
+    /// Whether this message currently carries the chat's pin.
+    pub is_pinned: bool,
+    /// Bulk-action mode: a click ticks the bubble instead of using the media.
+    pub selection_mode: bool,
+    pub selected: bool,
+    /// Briefly tinted and outlined, e.g. after jumping here from search.
+    pub highlight: bool,
+    /// Fired with the option name when a poll option row is clicked.
+    pub on_poll_option: Option<Box<dyn FnOnce(String) + 'a>>,
+    /// Fired by the "Hlasovat" button of a multi-choice poll.
+    pub on_poll_submit: Option<Box<dyn FnOnce() + 'a>>,
+    /// Options ticked in a multi-choice poll but not sent yet.
+    pub poll_draft: Vec<String>,
+    /// Our own JID (string form), used to mark the options we voted for.
+    pub me: Option<&'a str>,
+    /// Fired when the view-once tile is clicked and the media must be fetched.
+    pub on_open_view_once: Option<Box<dyn FnOnce() + 'a>>,
 }
 
 impl<'a> MessageBubble<'a> {
@@ -360,6 +431,17 @@ impl<'a> MessageBubble<'a> {
             on_react: None,
             on_view_reactions: None,
             on_open_emoji_picker: None,
+            on_select: None,
+            on_pin: None,
+            is_pinned: false,
+            selection_mode: false,
+            selected: false,
+            highlight: false,
+            on_poll_option: None,
+            on_poll_submit: None,
+            poll_draft: Vec::new(),
+            me: None,
+            on_open_view_once: None,
         }
     }
     
@@ -384,6 +466,62 @@ impl<'a> MessageBubble<'a> {
         self
     }
 
+    pub fn on_pin(mut self, f: impl FnOnce(&'a str, Option<u32>) + 'a) -> Self {
+        self.on_pin = Some(Box::new(f));
+        self
+    }
+
+    pub fn is_pinned(mut self, pinned: bool) -> Self {
+        self.is_pinned = pinned;
+        self
+    }
+
+    pub fn on_select(mut self, f: impl FnOnce(&'a str) + 'a) -> Self {
+        self.on_select = Some(Box::new(f));
+        self
+    }
+
+    /// Turn the bubble into a selectable row for the bulk-action bar.
+    pub fn selection_mode(mut self, on: bool) -> Self {
+        self.selection_mode = on;
+        self
+    }
+
+    pub fn selected(mut self, on: bool) -> Self {
+        self.selected = on;
+        self
+    }
+
+    pub fn highlight(mut self, on: bool) -> Self {
+        self.highlight = on;
+        self
+    }
+
+    pub fn on_poll_option(mut self, f: impl FnOnce(String) + 'a) -> Self {
+        self.on_poll_option = Some(Box::new(f));
+        self
+    }
+
+    pub fn on_poll_submit(mut self, f: impl FnOnce() + 'a) -> Self {
+        self.on_poll_submit = Some(Box::new(f));
+        self
+    }
+
+    pub fn poll_draft(mut self, names: Vec<String>) -> Self {
+        self.poll_draft = names;
+        self
+    }
+
+    pub fn me(mut self, jid: &'a str) -> Self {
+        self.me = Some(jid);
+        self
+    }
+
+    pub fn on_open_view_once(mut self, f: impl FnOnce() + 'a) -> Self {
+        self.on_open_view_once = Some(Box::new(f));
+        self
+    }
+
     pub fn on_download(mut self, f: impl Fn(&'a str) + 'a) -> Self {
         self.on_download = Some(Box::new(f));
         self
@@ -405,6 +543,65 @@ impl<'a> MessageBubble<'a> {
     }
 }
 
+/// Tile standing in for a view-once attachment: no thumbnail and no size, so
+/// nothing about the payload leaks before it is opened.
+fn paint_view_once_tile<'a>(
+    ctx: &egui::Context,
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    mt: crate::state::MediaType,
+    message: &crate::state::Message,
+    on_open: &mut Option<Box<dyn FnOnce() + 'a>>,
+) {
+    painter.rect_filled(rect, 8.0, Color32::from_rgb(0x1E, 0x2B, 0x32));
+
+    let badge_center = rect.center() + Vec2::new(0.0, -12.0);
+    painter.circle_stroke(badge_center, 12.0, Stroke::new(2.0, crate::theme::ACCENT));
+    painter.text(
+        badge_center,
+        egui::Align2::CENTER_CENTER,
+        "1",
+        FontId::proportional(13.0),
+        crate::theme::ACCENT,
+    );
+
+    let kind = match mt {
+        crate::state::MediaType::Image | crate::state::MediaType::Sticker => "Fotka",
+        crate::state::MediaType::Video => "Video",
+        _ => "Médium",
+    };
+    let label = if message.view_once_opened {
+        "Jednorázové médium bylo zobrazeno".to_string()
+    } else {
+        format!("{kind} (zobrazit jednou)")
+    };
+    painter.text(
+        rect.center() + Vec2::new(0.0, 16.0),
+        egui::Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(11.0),
+        Color32::from_rgb(0xA9, 0xB6, 0xBD),
+    );
+
+    if message.view_once_opened {
+        return;
+    }
+
+    // Hit-tested against the pointer instead of `ui.interact`: the bubble paints
+    // through a painter borrowed from `ui`, so `ui` cannot be borrowed mutably here.
+    let hovered = ctx
+        .pointer_hover_pos()
+        .map_or(false, |pos| rect.contains(pos));
+    if hovered {
+        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        if ctx.input(|i| i.pointer.primary_clicked()) {
+            if let Some(f) = on_open.take() {
+                f();
+            }
+        }
+    }
+}
+
 impl<'a> Widget for MessageBubble<'a> {
     fn ui(self, ui: &mut Ui) -> egui::Response {
         let max_bubble_width = (ui.available_width() * 0.72).max(180.0);
@@ -417,6 +614,14 @@ impl<'a> Widget for MessageBubble<'a> {
         let mut cached_texture: Option<(egui::TextureHandle, [f32; 2])> = None;
 
         if let Some(mt) = media_type {
+            if self.message.view_once {
+                // Opaque tile: neither the bytes nor a thumbnail are shown
+                // until the recipient asks for them.
+                media_size = Vec2::new(
+                    220.0_f32.min(max_bubble_width - bubble_padding.x * 2.0),
+                    96.0,
+                );
+            } else {
             match mt {
                 crate::state::MediaType::Image | crate::state::MediaType::Sticker => {
                     if let Some((tex, dim)) = crate::media::image_texture(ui.ctx(), self.message) {
@@ -457,6 +662,7 @@ impl<'a> Widget for MessageBubble<'a> {
                     media_size = Vec2::new(240.0_f32.min(max_bubble_width - bubble_padding.x * 2.0), 52.0);
                 }
             }
+            }
         }
 
         let display_text = if let Some(ref cap) = self.message.media_caption {
@@ -488,12 +694,12 @@ impl<'a> Widget for MessageBubble<'a> {
 
         let has_text = !display_text.trim().is_empty();
         let galley = if has_text {
-            Some(ui.painter().layout(
-                display_text,
-                FontId::proportional(font_size),
+            Some(ui.painter().layout_job(mention_layout_job(
+                display_text.as_str(),
+                crate::theme::message_font(font_size),
                 text_color,
                 text_wrap_width,
-            ))
+            )))
         } else {
             None
         };
@@ -514,12 +720,24 @@ impl<'a> Widget for MessageBubble<'a> {
         let text_height = galley.as_ref().map_or(0.0, |g| g.size().y + 4.0);
         let time_height = 16.0;
 
+        // Polls grow a tally block under the question: one row per option plus
+        // a header line and, for multi-choice polls, a submit button.
+        let poll_row_count = self.message.poll.as_ref().map_or(0, |p| p.options.len());
+        let poll_is_multi = self.message.poll.as_ref().is_some_and(|p| p.is_multi());
+        let poll_height = if poll_row_count == 0 {
+            0.0
+        } else {
+            22.0 + poll_row_count as f32 * 28.0 + if poll_is_multi { 28.0 } else { 4.0 }
+        };
+
         let content_width = {
             let tw = galley.as_ref().map_or(0.0, |g| g.size().x);
-            (tw.max(media_size.x) + bubble_padding.x * 2.0).max(110.0)
+            // Tally bars need room for an option name next to its count.
+            let floor = if poll_row_count > 0 { 240.0 } else { 110.0 };
+            (tw.max(media_size.x) + bubble_padding.x * 2.0).max(floor)
         };
         let bubble_width = content_width.min(max_bubble_width);
-        let bubble_height = bubble_padding.y * 2.0 + sender_height + reply_height + media_height + text_height + time_height + 4.0;
+        let bubble_height = bubble_padding.y * 2.0 + sender_height + reply_height + media_height + text_height + time_height + poll_height + 4.0;
         
         let reaction_text = if !self.message.reactions.is_empty() {
             let mut emojis: Vec<String> = self.message.reactions.iter().map(|r| r.emoji.clone()).collect();
@@ -540,6 +758,9 @@ impl<'a> Widget for MessageBubble<'a> {
         
         let mut audio_clicked = false;
         let mut video_scrub_used = false;
+        let mut on_poll_option = self.on_poll_option;
+        let mut on_poll_submit = self.on_poll_submit;
+        let mut on_open_view_once = self.on_open_view_once;
 
         let bubble_rect = if self.is_own {
             egui::Rect::from_min_size(
@@ -628,6 +849,9 @@ impl<'a> Widget for MessageBubble<'a> {
                     media_size,
                 );
 
+                if self.message.view_once {
+                    paint_view_once_tile(ui.ctx(), painter, media_rect, mt, self.message, &mut on_open_view_once);
+                } else {
                 let is_downloaded = self.message.media_path.as_ref().map_or(false, |p| std::path::Path::new(p).exists());
                 let file_len = self.message.media_file_length.unwrap_or(0);
 
@@ -889,6 +1113,8 @@ impl<'a> Widget for MessageBubble<'a> {
                     }
                 }
 
+                }
+
                 y_offset += media_height;
             }
 
@@ -899,6 +1125,137 @@ impl<'a> Widget for MessageBubble<'a> {
                     g.clone(),
                     text_color,
                 );
+                y_offset += g.size().y + 4.0;
+            }
+
+            // Poll: one tally bar per option, click to vote.
+            if let Some(poll) = &self.message.poll {
+                let left = bubble_rect.min.x + bubble_padding.x;
+                let inner_width = bubble_rect.width() - bubble_padding.x * 2.0;
+                let tallies = poll.tallies();
+                let total_votes: usize = tallies.iter().map(|(_, count)| *count).sum();
+                let my_vote = self.me.map(|me| poll.my_vote(me)).unwrap_or_default();
+
+                painter.text(
+                    egui::pos2(left, y_offset),
+                    egui::Align2::LEFT_TOP,
+                    if poll.is_quiz { "🧠 Kvíz" } else { "📊 Anketa" },
+                    FontId::proportional(10.0),
+                    bubble::REPLY_NAME,
+                );
+                painter.text(
+                    egui::pos2(bubble_rect.max.x - bubble_padding.x, y_offset),
+                    egui::Align2::RIGHT_TOP,
+                    format!(
+                        "{} {}",
+                        total_votes,
+                        if total_votes == 1 { "hlas" } else { "hlasů" }
+                    ),
+                    FontId::proportional(10.0),
+                    Color32::from_rgb(0x86, 0x96, 0xA0),
+                );
+                y_offset += 22.0;
+
+                for (name, count) in &tallies {
+                    let row = egui::Rect::from_min_size(
+                        egui::pos2(left, y_offset),
+                        Vec2::new(inner_width, 24.0),
+                    );
+                    let ticked = my_vote.iter().any(|picked| picked == name)
+                        || self.poll_draft.iter().any(|picked| picked == name);
+                    let resp = ui.interact(
+                        row,
+                        ui.scope_id()
+                            .with(("poll-opt", self.message.id.as_str(), name.as_str())),
+                        Sense::click(),
+                    );
+                    painter.rect_filled(
+                        row,
+                        6.0,
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 14),
+                    );
+                    if total_votes > 0 && *count > 0 {
+                        let share = (*count as f32 / total_votes as f32).min(1.0);
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(
+                                row.min,
+                                Vec2::new(row.width() * share, row.height()),
+                            ),
+                            6.0,
+                            if ticked {
+                                Color32::from_rgba_unmultiplied(0x00, 0xA8, 0x84, 110)
+                            } else {
+                                Color32::from_rgba_unmultiplied(255, 255, 255, 30)
+                            },
+                        );
+                    }
+                    if ticked {
+                        painter.rect_stroke(
+                            row,
+                            6.0,
+                            egui::Stroke::new(1.5, crate::theme::ACCENT),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    painter.text(
+                        egui::pos2(row.min.x + 8.0, row.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        name,
+                        FontId::proportional(12.0),
+                        text_color,
+                    );
+                    if *count > 0 {
+                        painter.text(
+                            egui::pos2(row.max.x - 8.0, row.center().y),
+                            egui::Align2::RIGHT_CENTER,
+                            count.to_string(),
+                            FontId::proportional(11.0),
+                            Color32::from_rgb(0x86, 0x96, 0xA0),
+                        );
+                    }
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if resp.clicked() {
+                        if let Some(f) = on_poll_option.take() {
+                            f(name.clone());
+                        }
+                    }
+                    y_offset += 28.0;
+                }
+
+                if poll.is_multi() {
+                    let button = egui::Rect::from_min_size(
+                        egui::pos2(left, y_offset),
+                        Vec2::new(inner_width, 24.0),
+                    );
+                    let resp = ui.interact(
+                        button,
+                        ui.scope_id().with(("poll-submit", self.message.id.as_str())),
+                        Sense::click(),
+                    );
+                    painter.rect_filled(
+                        button,
+                        6.0,
+                        if resp.hovered() {
+                            Color32::from_rgb(0x06, 0xC0, 0x8A)
+                        } else {
+                            Color32::from_rgb(0x00, 0x8A, 0x6E)
+                        },
+                    );
+                    painter.text(
+                        button.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Hlasovat",
+                        FontId::proportional(12.0),
+                        Color32::WHITE,
+                    );
+                    if resp.clicked() {
+                        if let Some(f) = on_poll_submit.take() {
+                            f();
+                        }
+                    }
+                }
             }
             
             // Timestamp and status
@@ -954,7 +1311,7 @@ impl<'a> Widget for MessageBubble<'a> {
                     pill_rect.center(),
                     egui::Align2::CENTER_CENTER,
                     &reaction_text,
-                    FontId::proportional(11.0),
+                    crate::theme::message_font(11.0),
                     Color32::WHITE,
                 );
 
@@ -1004,7 +1361,7 @@ impl<'a> Widget for MessageBubble<'a> {
                 ui.horizontal(|ui| {
                     for emoji in ["👍", "❤️", "😂", "😮", "😢", "🙏", "🔥", "🎉"] {
                         let has_this_reaction = self.message.reactions.iter().any(|r| r.emoji == emoji);
-                        let btn = egui::Button::new(RichText::new(emoji).font(FontId::proportional(18.0)))
+                        let btn = egui::Button::new(RichText::new(emoji).font(crate::theme::message_font(18.0)))
                             .fill(if has_this_reaction { Color32::from_rgb(0x00, 0x5C, 0x4B) } else { Color32::TRANSPARENT })
                             .corner_radius(egui::CornerRadius::same(6));
                         if ui.add(btn).on_hover_text(if has_this_reaction { "Odebrat reakci" } else { "Reagovat" }).clicked() {
@@ -1028,6 +1385,35 @@ impl<'a> Widget for MessageBubble<'a> {
             });
         }
         
+        // Selection mode swallows the click, so tapping a bubble ticks it
+        // instead of opening, playing or downloading the attachment.
+        if self.selection_mode || self.highlight {
+            if self.highlight || self.selected {
+                ui.painter().rect_filled(
+                    bubble_rect,
+                    egui::CornerRadius::same(9),
+                    Color32::from_rgba_unmultiplied(0x00, 0xA8, 0x84, 0x24),
+                );
+                ui.painter().rect_stroke(
+                    bubble_rect.expand(1.0),
+                    egui::CornerRadius::same(10),
+                    egui::Stroke::new(2.0, crate::theme::ACCENT),
+                    egui::StrokeKind::Outside,
+                );
+            }
+            if response.clicked() {
+                if let Some(f) = self.on_select {
+                    f(&self.message.id);
+                }
+            }
+            return response;
+        }
+
+        // View-once attachments open through the viewer modal only.
+        if self.message.view_once {
+            return response;
+        }
+
         // Handle click on media
         let is_audio_bubble = matches!(
             self.message.media_type,
@@ -1075,7 +1461,7 @@ impl<'a> Widget for MessageBubble<'a> {
             ui.horizontal(|ui| {
                 for emoji in ["👍", "❤️", "😂", "😮", "😢", "🙏", "🔥", "🎉"] {
                     let has_this_reaction = self.message.reactions.iter().any(|r| r.emoji == emoji);
-                    let btn = egui::Button::new(RichText::new(emoji).font(FontId::proportional(18.0)))
+                    let btn = egui::Button::new(RichText::new(emoji).font(crate::theme::message_font(18.0)))
                         .fill(if has_this_reaction { Color32::from_rgb(0x00, 0x5C, 0x4B) } else { Color32::TRANSPARENT })
                         .corner_radius(egui::CornerRadius::same(6));
                     if ui.add(btn).on_hover_text(if has_this_reaction { "Odebrat reakci" } else { "Reagovat" }).clicked() {
@@ -1123,6 +1509,13 @@ impl<'a> Widget for MessageBubble<'a> {
                 }
                 ui.close();
             }
+            let mut on_select = self.on_select;
+            if on_select.is_some() && ui.button("Vybrat").clicked() {
+                if let Some(f) = on_select.take() {
+                    f(&self.message.id);
+                }
+                ui.close();
+            }
             // Only plain text can be rewritten in place; media captions and
             // system-ish bubbles have no editable body.
             if self.is_own && self.message.media_type.is_none() && !self.message.text.is_empty() {
@@ -1132,6 +1525,36 @@ impl<'a> Widget for MessageBubble<'a> {
                         f(&self.message.id);
                     }
                     ui.close();
+                }
+            }
+            let mut on_pin = self.on_pin;
+            if on_pin.is_some() {
+                ui.separator();
+                if self.is_pinned {
+                    if ui.button("📌 Odepnout").clicked() {
+                        if let Some(f) = on_pin.take() {
+                            f(&self.message.id, None);
+                        }
+                        ui.close();
+                    }
+                } else {
+                    ui.label(
+                        RichText::new("Připnout pro všechny")
+                            .font(FontId::proportional(11.0))
+                            .color(Color32::from_rgb(0x86, 0x96, 0xA0)),
+                    );
+                    for (label, secs) in [
+                        ("📌 Na 24 hodin", 86_400u32),
+                        ("📌 Na 7 dní", 604_800),
+                        ("📌 Na 30 dní", 2_592_000),
+                    ] {
+                        if ui.button(label).clicked() {
+                            if let Some(f) = on_pin.take() {
+                                f(&self.message.id, Some(secs));
+                            }
+                            ui.close();
+                        }
+                    }
                 }
             }
             if ui.button("Copy").clicked() {
@@ -1416,4 +1839,139 @@ mod bubble_tests {
     fn unedited_bubble_renders() {
         render(&message("plain", false), false);
     }
+
+    /// Selection mode intercepts the click and paints an outline; it must lay
+    /// out in both states without touching the media path.
+    #[test]
+    fn selection_highlight_renders() {
+        let ctx = egui::Context::default();
+        for selected in [true, false] {
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                ui.set_max_width(360.0);
+                MessageBubble::new(&message("tick me", false), false)
+                    .selection_mode(true)
+                    .selected(selected)
+                    .ui(ui);
+            });
+            output.textures_delta.clear();
+        }
+    }
+
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::preview_label;
+    use crate::state::{MediaType, MessagePreview, MessageStatus};
+    use chrono::Utc;
+
+    fn preview(text: &str, media_type: Option<MediaType>) -> MessagePreview {
+        MessagePreview {
+            text: text.to_string(),
+            timestamp: Utc::now(),
+            from_me: false,
+            status: MessageStatus::Sent,
+            media_type,
+        }
+    }
+
+    #[test]
+    fn plain_text_is_untouched() {
+        assert_eq!(preview_label(&preview("ahoj", None)), "ahoj");
+    }
+
+    #[test]
+    fn empty_text_without_media_is_a_generic_message() {
+        assert_eq!(preview_label(&preview("", None)), "Zpráva");
+        assert_eq!(
+            preview_label(&preview("[Protocol Message]", None)),
+            "Zpráva"
+        );
+    }
+
+    #[test]
+    fn empty_text_with_media_names_the_type() {
+        assert_eq!(
+            preview_label(&preview("", Some(MediaType::Image))),
+            "📷 Zpráva"
+        );
+        assert_eq!(
+            preview_label(&preview("[Protocol Message]", Some(MediaType::Voice))),
+            "🎤 Zpráva"
+        );
+    }
+
+    #[test]
+    fn media_caption_gets_one_icon_prefix() {
+        assert_eq!(
+            preview_label(&preview("ahoj", Some(MediaType::Image))),
+            "📷 ahoj"
+        );
+    }
+
+    #[test]
+    fn already_labelled_media_is_not_prefixed_twice() {
+        // The backend turns caption-less media into "📷 Image" and friends.
+        assert_eq!(
+            preview_label(&preview("📷 Image", Some(MediaType::Image))),
+            "📷 Image"
+        );
+        assert_eq!(
+            preview_label(&preview("🎤 Voice Message", Some(MediaType::Voice))),
+            "🎤 Voice Message"
+        );
+    }
+
+    #[test]
+    fn reactions_are_named_not_rendered_as_payload() {
+        assert_eq!(
+            preview_label(&preview("[Reaction] 👍", None)),
+            "Reakce"
+        );
+    }
+}
+
+/// Lays out message text, tinting `@jméno` tokens the way WhatsApp does.
+///
+/// The token is only a display cue here — what actually goes on the wire is
+/// `ContextInfo.mentioned_jid`, built when the message is sent.
+fn mention_layout_job(
+    text: &str,
+    font: egui::FontId,
+    color: egui::Color32,
+    wrap_width: f32,
+) -> egui::text::LayoutJob {
+    let plain = egui::TextFormat {
+        font_id: font.clone(),
+        color,
+        ..Default::default()
+    };
+    let accent = egui::TextFormat {
+        font_id: font.clone(),
+        color: crate::theme::ACCENT,
+        ..Default::default()
+    };
+
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = wrap_width;
+
+    let mut rest = text;
+    while let Some(at) = rest.find('@') {
+        if at > 0 {
+            job.append(&rest[..at], 0.0, plain.clone());
+        }
+        let after = &rest[at + 1..];
+        let len = after.find(|c: char| c.is_whitespace()).unwrap_or(after.len());
+        if len == 0 {
+            job.append("@", 0.0, plain.clone());
+            rest = after;
+            continue;
+        }
+        job.append(&format!("@{}", &after[..len]), 0.0, accent.clone());
+        rest = &after[len..];
+    }
+    if !rest.is_empty() {
+        job.append(rest, 0.0, plain);
+    }
+    job
 }

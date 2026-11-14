@@ -3,6 +3,7 @@
 use egui::{Align, Color32, FontId, Frame, Layout, Margin, RichText, ScrollArea, TextEdit};
 use crate::search::{search_messages, SearchContentType, SearchDateRange, SearchScope, SearchSender};
 use crate::state::SharedState;
+use whatsapp_rust::wacore_binary::Jid;
 
 pub fn show_search_dialog(ctx: &egui::Context, state: &SharedState, backend: &crate::backend::BackendHandle) {
     let mut s = state.write();
@@ -11,7 +12,9 @@ pub fn show_search_dialog(ctx: &egui::Context, state: &SharedState, backend: &cr
     }
 
     let mut close = false;
-    let mut selected_chat_to_open = None;
+    // (chat, message) of the result the user clicked; the message id is what
+    // makes the conversation jump to it instead of opening at the bottom.
+    let mut selected_chat_to_open: Option<(Jid, String)> = None;
 
     let results = search_messages(&s, &s.search_filter);
 
@@ -156,7 +159,8 @@ pub fn show_search_dialog(ctx: &egui::Context, state: &SharedState, backend: &cr
 
                                     let text_resp = ui.selectable_label(false, preview);
                                     if text_resp.clicked() {
-                                        selected_chat_to_open = Some(chat_jid);
+                                        selected_chat_to_open =
+                                            Some((chat_jid, item.message.id.clone()));
                                     }
                                 });
                             ui.add_space(4.0);
@@ -174,8 +178,9 @@ pub fn show_search_dialog(ctx: &egui::Context, state: &SharedState, backend: &cr
             });
         });
 
-    if let Some(jid) = selected_chat_to_open {
+    if let Some((jid, message_id)) = selected_chat_to_open {
         s.selected_chat = Some(jid.clone());
+        s.jump_target = Some(crate::state::JumpTarget::new(message_id));
         s.show_search_dialog = false;
         let _ = backend.send_command(crate::commands::Command::SelectChat { chat_jid: Some(jid) });
     }

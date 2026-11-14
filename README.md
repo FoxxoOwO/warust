@@ -22,6 +22,7 @@ Designed as a high-performance alternative to resource-heavy Electron applicatio
 * **Chat Management**: Pin/unpin chats, mute notifications, archive chats, mark as read/unread, and clear conversations.
 * **Contact Resolution**: Merges Phone Number (PN) and LID (Linked Identity) conversations into unified chats with contact names.
 * **Message Editing**: Rewrite an already-sent message from the bubble menu; the original timestamp is kept and the bubble is marked *upraveno*. Edits arriving from other devices rewrite the stored message instead of adding a duplicate.
+* **Forwarding & Multi-select**: Tick any number of messages (bubble context menu → *Vybrat*, or the ✕-bar's counter) and forward them to another chat. Text is rebuilt from the stored body; images, videos, voice notes and documents are re-uploaded from the local copy — a message whose media was never downloaded is forwarded as text only.
 * **QR & Pair Code Login**: Log in by scanning the QR code or pair using an 8-character verification code sent to your phone number.
 
 ### Notifications

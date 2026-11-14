@@ -92,6 +92,81 @@ fn is_false(value: &bool) -> bool {
 
 /// Serde default for the `edited` marker; `skip_serializing_if` keeps the
 /// ~2000-byte-per-message JSON from carrying a `false` on every row.
+/// A poll attached to a message (both polls we and our peers created).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PollData {
+    pub question: String,
+    pub options: Vec<String>,
+    /// 1 = single choice, 2+ = up to N choices, 0 = unlimited.
+    pub selectable_count: u32,
+    /// 32-byte secret from the creation stanza. Votes are unusable without it.
+    pub secret: Vec<u8>,
+    /// Who created the poll: vote decryption is keyed on it.
+    pub creator: Jid,
+    /// Decrypted votes: voter (string form) → picked option names.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub votes: HashMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_quiz: bool,
+}
+
+impl PollData {
+    /// Vote count per option name, in option order.
+    pub fn tallies(&self) -> Vec<(String, usize)> {
+        self.options
+            .iter()
+            .map(|name| {
+                let count = self
+                    .votes
+                    .values()
+                    .filter(|picked| picked.iter().any(|p| p == name))
+                    .count();
+                (name.clone(), count)
+            })
+            .collect()
+    }
+
+    pub fn total_voters(&self) -> usize {
+        self.votes.len()
+    }
+
+    /// Names this user already voted for, if any.
+    pub fn my_vote(&self, me: &str) -> Vec<String> {
+        self.votes.get(me).cloned().unwrap_or_default()
+    }
+
+    pub fn is_multi(&self) -> bool {
+        self.selectable_count != 1
+    }
+}
+
+/// A message the UI should scroll to and flash briefly (search results,
+/// replies, forwarded jumps).
+#[derive(Debug, Clone)]
+pub struct JumpTarget {
+    pub message_id: String,
+    pub at: std::time::Instant,
+    /// Set once the view scrolled here, so later frames do not yank the scroll
+    /// position back while the tint fades out.
+    pub scrolled: bool,
+}
+
+impl JumpTarget {
+    pub const LIFETIME: std::time::Duration = std::time::Duration::from_millis(2500);
+
+    pub fn new(message_id: impl Into<String>) -> Self {
+        Self {
+            message_id: message_id.into(),
+            at: std::time::Instant::now(),
+            scrolled: false,
+        }
+    }
+
+    pub fn expired(&self) -> bool {
+        self.at.elapsed() > Self::LIFETIME
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub id: String,
@@ -133,6 +208,16 @@ pub struct Message {
     pub media_caption: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_jpeg_thumbnail: Option<Vec<u8>>,
+    // Poll fields
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll: Option<PollData>,
+    /// Recipient may open the media exactly once (WhatsApp's "view once").
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub view_once: bool,
+    /// Set once the local copy was shown and deleted; the bubble keeps a
+    /// tombstone instead of the media.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub view_once_opened: bool,
 }
 
 impl Message {
@@ -169,6 +254,9 @@ impl Message {
             media_mimetype: None,
             media_caption: None,
             media_jpeg_thumbnail: None,
+            poll: None,
+            view_once: false,
+            view_once_opened: false,
         }
     }
 }
@@ -184,6 +272,10 @@ pub struct Contact {
     pub is_on_whatsapp: bool,
     pub last_seen: Option<DateTime<Utc>>,
     pub is_online: bool,
+    /// Whether this contact is blocked. Mirrors the server state so the info
+    /// panel can show the right action without re-querying on every frame.
+    #[serde(default)]
+    pub is_blocked: bool,
 }
 
 impl Contact {
@@ -198,6 +290,7 @@ impl Contact {
             is_on_whatsapp: true,
             last_seen: None,
             is_online: false,
+            is_blocked: false,
         }
     }
 }
@@ -337,6 +430,187 @@ pub struct ExportDialogState {
     pub exported_path: Option<std::path::PathBuf>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ForwardDialogState {
+    /// Chat the messages are being forwarded from.
+    pub source_chat: Jid,
+    /// Ids of the ticked messages, in conversation order.
+    pub message_ids: Vec<String>,
+    pub search: String,
+}
+
+/// Group details that are not part of the chat row, filled by
+/// `Command::RequestGroupInfo`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GroupInfoSnapshot {
+    pub subject: String,
+    pub description: Option<String>,
+    /// Participants that may edit the group (the creator counts as one).
+    #[serde(default)]
+    pub admins: HashSet<Jid>,
+    #[serde(default)]
+    pub is_locked: bool,
+    #[serde(default)]
+    pub is_announcement: bool,
+    /// Only present after `Command::GetGroupInviteLink`.
+    pub invite_link: Option<String>,
+}
+
+impl GroupInfoSnapshot {
+    pub fn is_admin(&self, jid: &Jid) -> bool {
+        self.admins.contains(jid)
+    }
+}
+
+/// State of the "new group" dialog.
+#[derive(Debug, Clone, Default)]
+pub struct NewGroupState {
+    pub subject: String,
+    pub search: String,
+    pub selected: HashSet<Jid>,
+    pub error: Option<String>,
+}
+
+/// State of the "add member" dialog for an existing group.
+#[derive(Debug, Clone)]
+pub struct AddMemberState {
+    pub group_jid: Jid,
+    pub search: String,
+    pub selected: HashSet<Jid>,
+}
+
+/// State of the "create poll" dialog.
+#[derive(Debug, Clone)]
+pub struct NewPollState {
+    pub chat_jid: Jid,
+    pub question: String,
+    pub options: Vec<String>,
+    /// Multi-choice poll instead of single choice.
+    pub multi: bool,
+    pub error: Option<String>,
+}
+
+impl NewPollState {
+    pub fn new(chat_jid: Jid) -> Self {
+        Self {
+            chat_jid,
+            question: String::new(),
+            // WhatsApp starts a poll with two empty option rows.
+            options: vec![String::new(), String::new()],
+            multi: false,
+            error: None,
+        }
+    }
+
+    /// Options that actually have text, in order, trimmed.
+    pub fn filled_options(&self) -> Vec<String> {
+        self.options
+            .iter()
+            .map(|opt| opt.trim().to_string())
+            .filter(|opt| !opt.is_empty())
+            .collect()
+    }
+
+    /// Why the poll cannot be created yet, if it cannot.
+    pub fn validation_error(&self) -> Option<String> {
+        if self.question.trim().is_empty() {
+            return Some("Zadej otázku ankety".into());
+        }
+        let options = self.filled_options();
+        if options.len() < 2 {
+            return Some("Anketa potřebuje alespoň dvě možnosti".into());
+        }
+        if options.len() > 12 {
+            return Some("Anketa povoluje nejvýše 12 možností".into());
+        }
+        // Case-insensitive: WhatsApp treats "Ano" and "ano" as the same answer,
+        // and voters would not tell them apart in the tally either.
+        let unique: std::collections::HashSet<String> =
+            options.iter().map(|option| option.to_lowercase()).collect();
+        if unique.len() != options.len() {
+            return Some("Možnosti se nesmí opakovat".into());
+        }
+        None
+    }
+}
+
+/// A message pinned to the top of a chat.
+///
+/// WhatsApp pins for everyone, so this mirrors the server's current pin: one
+/// per chat, replaced by the next pin. `until` is `None` when the duration is
+/// unknown (older clients send no duration) — such a pin lives until unpinned.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PinnedMessage {
+    pub message_id: String,
+    pub pinned_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_by: Option<Jid>,
+}
+
+impl PinnedMessage {
+    pub fn new(
+        message_id: impl Into<String>,
+        duration_secs: Option<u32>,
+        pinned_by: Option<Jid>,
+    ) -> Self {
+        let pinned_at = Utc::now();
+        let until = duration_secs
+            .filter(|secs| *secs > 0)
+            .and_then(|secs| chrono::Duration::try_seconds(secs as i64))
+            .map(|duration| pinned_at + duration);
+        Self {
+            message_id: message_id.into(),
+            pinned_at,
+            until,
+            pinned_by,
+        }
+    }
+
+    pub fn expired(&self) -> bool {
+        self.until.is_some_and(|until| until <= Utc::now())
+    }
+}
+
+/// A destructive action that asks for confirmation first.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ConfirmRequest {
+    pub title: String,
+    pub message: String,
+    pub confirm_label: String,
+    pub action: ConfirmAction,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum ConfirmAction {
+    BlockContact { jid: Jid },
+    LeaveGroup { chat_jid: Jid },
+    ClearChat { chat_jid: Jid },
+    DeleteChat { chat_jid: Jid },
+    RemoveMember { chat_jid: Jid, member: Jid },
+}
+/// Tabs of the media gallery in the chat info panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GalleryTab {
+    #[default]
+    Media,
+    Documents,
+    Links,
+}
+
+impl GalleryTab {
+    pub const ALL: [GalleryTab; 3] = [GalleryTab::Media, GalleryTab::Documents, GalleryTab::Links];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            GalleryTab::Media => "Fotky a videa",
+            GalleryTab::Documents => "Dokumenty",
+            GalleryTab::Links => "Odkazy",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppState {
     pub chats: HashMap<Jid, Chat>,
@@ -355,7 +629,56 @@ pub struct AppState {
     pub pair_phone_number: String,
     pub show_new_chat_dialog: bool,
     pub new_chat_input: String,
+    /// Invite link typed into the ➕ drawer to join a group.
+    pub join_link_input: String,
     pub new_chat_error: Option<String>,
+    /// Group details fetched from the server on demand (description, admins,
+    /// invite link). Keyed by group JID and dropped when it goes stale.
+    /// Keyed by the JID's string form: serde_json object keys must be strings,
+    /// and `Jid` does not serialize as one.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub group_info: HashMap<String, GroupInfoSnapshot>,
+    /// One pinned message per chat, mirroring the server-side pin.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub pinned: HashMap<Jid, PinnedMessage>,
+    /// Selected tab of the media gallery in the chat info panel.
+    #[serde(skip)]
+    pub gallery_tab: GalleryTab,
+    /// Half-typed message per chat, so switching chats does not lose it.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub drafts: HashMap<Jid, String>,
+    /// Next attachment goes out as "view once".
+    #[serde(skip)]
+    pub send_view_once: bool,
+    /// Media currently shown in the view-once viewer (`chat`, `message id`).
+    #[serde(skip)]
+    pub view_once_open: Option<(Jid, String)>,
+    /// New-group dialog, `None` when closed.
+    #[serde(skip)]
+    pub new_group: Option<NewGroupState>,
+    /// "Add member" dialog for an existing group.
+    #[serde(skip)]
+    pub add_member: Option<AddMemberState>,
+    /// Contact browser.
+    #[serde(skip)]
+    pub show_contacts_dialog: bool,
+    #[serde(skip)]
+    pub contacts_search: String,
+    /// Pending destructive action awaiting confirmation.
+    #[serde(skip)]
+    pub confirm: Option<ConfirmRequest>,
+    /// Group JIDs whose metadata we already asked for, so the panel does not
+    /// fire a request on every frame.
+    #[serde(skip)]
+    pub group_info_pending: HashSet<String>,
+    /// Last microphone failure, shown above the composer until it works again.
+    #[serde(skip)]
+    pub recorder_error: Option<String>,
+    /// Inline editors for the group subject and description.
+    #[serde(skip)]
+    pub group_subject_draft: Option<(Jid, String)>,
+    #[serde(skip)]
+    pub group_desc_draft: Option<(Jid, String)>,
     pub lid_to_pn: HashMap<Jid, Jid>,
     #[serde(skip)]
     pub editing_contact: Option<(Jid, String)>,
@@ -397,6 +720,22 @@ pub struct AppState {
     // Emoji Picker state
     #[serde(skip)]
     pub show_emoji_picker: bool,
+    /// Whether the sticker picker window is open.
+    #[serde(skip)]
+    pub show_sticker_picker: bool,
+    /// Ctrl+K chat switcher.
+    #[serde(skip)]
+    pub show_command_palette: bool,
+    #[serde(skip)]
+    pub palette_query: String,
+    #[serde(skip)]
+    pub palette_index: usize,
+    /// Last clipboard-paste failure, shown under the composer.
+    #[serde(skip)]
+    pub clipboard_error: Option<String>,
+    /// Cached media-folder scan for the storage tab.
+    #[serde(skip)]
+    pub storage_scan: Option<(std::time::Instant, crate::media::MediaStats)>,
     #[serde(skip)]
     pub emoji_search: String,
     #[serde(skip)]
@@ -412,6 +751,34 @@ pub struct AppState {
     /// periodic writer can skip no-op serialization of the whole message store.
     #[serde(skip)]
     pub dirty: bool,
+    /// Ids of the messages ticked in the bulk-action bar of the open chat.
+    /// Non-empty means selection mode is active.
+    #[serde(skip)]
+    pub selected_messages: std::collections::BTreeSet<String>,
+    /// Open "forward to…" chat picker.
+    #[serde(skip)]
+    pub forward_dialog: Option<ForwardDialogState>,
+    /// Whether the right-hand info panel is open for the current chat.
+    #[serde(skip)]
+    pub show_chat_info: bool,
+    /// Disappearing-message timer per chat, in seconds. WhatsApp calls this
+    /// "ephemeral" and it applies to 1:1 chats as well as groups; a zero or
+    /// missing entry means the timer is off.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub ephemeral: HashMap<Jid, u32>,
+    // Polls
+    /// Create-poll dialog, `None` when closed.
+    #[serde(skip)]
+    pub new_poll: Option<NewPollState>,
+    /// Multi-choice poll being composed: (message id, selected option names).
+    #[serde(skip)]
+    pub poll_draft: Option<(String, Vec<String>)>,
+    /// Message the UI should scroll to and flash briefly (search, replies).
+    #[serde(skip)]
+    pub jump_target: Option<JumpTarget>,
+    /// Whether the archived section is expanded in the chat list.
+    #[serde(skip)]
+    pub show_archived: bool,
 }
 
 impl Default for AppState {
@@ -433,6 +800,22 @@ impl Default for AppState {
             show_new_chat_dialog: false,
             new_chat_input: String::new(),
             new_chat_error: None,
+            group_info: HashMap::new(),
+            pinned: HashMap::new(),
+            gallery_tab: GalleryTab::default(),
+            drafts: HashMap::new(),
+            send_view_once: false,
+            view_once_open: None,
+            new_group: None,
+            add_member: None,
+            show_contacts_dialog: false,
+            contacts_search: String::new(),
+            confirm: None,
+            group_info_pending: HashSet::new(),
+            recorder_error: None,
+            join_link_input: String::new(),
+            group_subject_draft: None,
+            group_desc_draft: None,
             lid_to_pn: HashMap::new(),
             editing_contact: None,
             scheduled_messages: Vec::new(),
@@ -450,12 +833,26 @@ impl Default for AppState {
             reaction_detail_modal: None,
             active_call: None,
             show_emoji_picker: false,
+            show_sticker_picker: false,
+            show_command_palette: false,
+            palette_query: String::new(),
+            palette_index: 0,
+            clipboard_error: None,
+            storage_scan: None,
             emoji_search: String::new(),
             emoji_active_category: 0,
             reaction_picker_target: None,
             pending_reactions: HashMap::new(),
             initial_history_fetched: false,
             dirty: false,
+            selected_messages: std::collections::BTreeSet::new(),
+            forward_dialog: None,
+            show_chat_info: false,
+            ephemeral: HashMap::new(),
+            new_poll: None,
+            poll_draft: None,
+            jump_target: None,
+            show_archived: false,
         }
     }
 }
@@ -523,6 +920,23 @@ pub fn count_emoji_only(text: &str) -> Option<usize> {
 impl AppState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Remember the composer text under `chat` and clear it for the next one.
+    /// Blank text is not worth a draft, so any old entry is dropped instead.
+    pub fn stash_draft(&mut self, chat: &Jid) {
+        let text = self.composer_text.trim().to_string();
+        if text.is_empty() {
+            self.drafts.remove(chat);
+        } else {
+            self.drafts.insert(chat.clone(), text);
+        }
+        self.composer_text.clear();
+    }
+
+    /// Pull `chat`'s draft back into the composer (empty when there is none).
+    pub fn restore_draft(&mut self, chat: &Jid) {
+        self.composer_text = self.drafts.get(chat).cloned().unwrap_or_default();
     }
 
     pub fn canonical_jid(&self, jid: &Jid) -> Jid {
@@ -892,6 +1306,8 @@ impl AppState {
         best
     }
 
+    /// Chats for the main list. Archived ones are pulled out into their own
+    /// section, except while searching — search should find everything.
     pub fn filtered_chats(&self) -> Vec<&Chat> {
         let mut chats: Vec<_> = self.chats.values().collect();
         
@@ -900,6 +1316,9 @@ impl AppState {
             let query = self.search_query.to_lowercase();
             chats.retain(|c| c.name.to_lowercase().contains(&query));
         } else {
+            // Archived chats have a collapsible section of their own.
+            chats.retain(|c| !c.is_archived);
+
             // When not searching, show chats that:
             // 1. Have a known human name, OR
             // 2. Have messages / last_message, OR
@@ -916,7 +1335,28 @@ impl AppState {
             });
         }
         
-        // Sort: pinned first, then by latest message / activity (newest first)
+        self.sort_chats(&mut chats);
+
+        chats
+    }
+
+    /// Archived chats, in the same order as the main list.
+    pub fn archived_chats(&self) -> Vec<&Chat> {
+        let query = self.search_query.to_lowercase();
+        let mut chats: Vec<_> = self
+            .chats
+            .values()
+            .filter(|c| c.is_archived)
+            .filter(|c| query.is_empty() || c.name.to_lowercase().contains(&query))
+            .collect();
+
+        self.sort_chats(&mut chats);
+
+        chats
+    }
+
+    /// Pinned first, then by latest activity, then alphabetically.
+    fn sort_chats(&self, chats: &mut [&Chat]) {
         chats.sort_by(|a, b| {
             match (a.is_pinned, b.is_pinned) {
                 (true, false) => std::cmp::Ordering::Less,
@@ -931,8 +1371,41 @@ impl AppState {
                 }
             }
         });
-        
-        chats
+    }
+
+    /// The next chat that still has something unread, oldest activity first so a
+    /// repeated press walks the backlog instead of bouncing between two chats.
+    pub fn next_unread_chat(&self, current: Option<&Jid>) -> Option<Jid> {
+        let mut candidates: Vec<&Chat> = self
+            .chats
+            .values()
+            .filter(|c| c.unread_count > 0 && !c.is_archived)
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        candidates.sort_by_key(|c| self.get_chat_latest_timestamp(c));
+
+        let current = current.map(|jid| self.canonical_jid(jid));
+        candidates
+            .iter()
+            .find(|c| Some(self.canonical_jid(&c.jid)) != current)
+            .or_else(|| candidates.first())
+            .map(|c| c.jid.clone())
+    }
+
+    /// First message of the unread block: the `unread_count` newest incoming
+    /// messages are unread, so jumping lands where the user stopped reading.
+    pub fn first_unread_message_id(&self, chat_jid: &Jid) -> Option<String> {
+        let canon = self.canonical_jid(chat_jid);
+        let unread = self.chats.get(&canon)?.unread_count as usize;
+        if unread == 0 {
+            return None;
+        }
+        let messages = self.messages.get(&canon)?;
+        let incoming: Vec<&Message> = messages.iter().filter(|m| !m.from_me).collect();
+        let start = incoming.len().saturating_sub(unread);
+        incoming.get(start).map(|m| m.id.clone())
     }
 
     pub fn apply_reaction(&mut self, chat_jid: &Jid, target_msg_id: &str, sender_jid: &Jid, emoji: &str) -> bool {
@@ -960,6 +1433,17 @@ impl AppState {
             });
         }
         false
+    }
+
+    /// Tick or untick a message in the bulk-action selection.
+    ///
+    /// Un-ticking the last message leaves the set empty, and an empty set is
+    /// what ends selection mode — the same effect as the ✕ in the bar, so no
+    /// separate mode flag is needed.
+    pub fn toggle_selected(&mut self, message_id: &str) {
+        if !self.selected_messages.remove(message_id) {
+            self.selected_messages.insert(message_id.to_string());
+        }
     }
 
     /// Apply an edit to an already-stored message.
@@ -1026,6 +1510,28 @@ impl AppState {
         if self.editing_message.take().is_some() {
             self.composer_text.clear();
         }
+    }
+
+    /// Media files still referenced by a stored message.
+    ///
+    /// Both the full path and the bare file name are included: older messages
+    /// store either, and deleting a file that is still pointed at would leave a
+    /// dead bubble.
+    pub fn referenced_media_paths(&self) -> std::collections::HashSet<std::path::PathBuf> {
+        let mut out = std::collections::HashSet::new();
+        for messages in self.messages.values() {
+            for message in messages {
+                let Some(path) = message.media_path.as_ref() else {
+                    continue;
+                };
+                let path = std::path::PathBuf::from(path);
+                if let Some(name) = path.file_name() {
+                    out.insert(std::path::PathBuf::from(name));
+                }
+                out.insert(path);
+            }
+        }
+        out
     }
 
     pub fn resolve_display_name(&self, jid: &Jid) -> Option<String> {
@@ -1108,9 +1614,250 @@ impl AppState {
 
 pub type SharedState = Arc<RwLock<AppState>>;
 
+// ── @zmínky ────────────────────────────────────────────────────────────────
+
+/// The `@` token currently being typed in the composer, if there is one.
+pub fn active_mention_query(text: &str) -> Option<&str> {
+    let at = text.rfind('@')?;
+    let tail = &text[at + 1..];
+    if tail.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(tail)
+}
+
+/// Rewrites the in-progress `@` token into a complete mention of `name`.
+pub fn apply_mention(text: &mut String, name: &str) {
+    if let Some(at) = text.rfind('@') {
+        text.truncate(at);
+    }
+    text.push('@');
+    text.push_str(name);
+    text.push(' ');
+}
+
+/// Participants matching the in-progress `@` token, alphabetical, capped.
+pub fn mention_suggestions<'a>(text: &str, people: &'a [(Jid, String)]) -> Vec<&'a (Jid, String)> {
+    let Some(query) = active_mention_query(text) else {
+        return Vec::new();
+    };
+    let needle = query.to_lowercase();
+    let mut found: Vec<&(Jid, String)> = people
+        .iter()
+        .filter(|(_, name)| name.to_lowercase().starts_with(&needle))
+        .collect();
+    found.sort_by_key(|(_, name)| name.to_lowercase());
+    found.truncate(6);
+    found
+}
+
+/// JIDs whose `@Jméno` token stands in `text`, in order of appearance.
+///
+/// WhatsApp expects the mentioned JIDs in `ContextInfo.mentioned_jid`; the server
+/// does not derive them from the body, so the client has to. A name only counts
+/// when the character after it is not a word character, otherwise `@Ann` would
+/// also match inside `@Anna`.
+pub fn collect_mentions(text: &str, people: &[(Jid, String)]) -> Vec<Jid> {
+    let mut hits: Vec<(usize, Jid)> = Vec::new();
+    for (jid, name) in people {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let needle = format!("@{name}");
+        for (pos, _) in text.match_indices(&needle) {
+            let after = text[pos + needle.len()..].chars().next();
+            if after.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                continue;
+            }
+            hits.push((pos, jid.clone()));
+        }
+    }
+    hits.sort_by_key(|(pos, _)| *pos);
+    hits.dedup_by(|later, earlier| later.1 == earlier.1);
+    hits.into_iter().map(|(_, jid)| jid).collect()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mention_query_only_lives_inside_an_unfinished_token() {
+        assert_eq!(active_mention_query("ahoj @Pe"), Some("Pe"));
+        assert_eq!(active_mention_query("ahoj @"), Some(""));
+        assert_eq!(active_mention_query("ahoj @Petr "), None);
+        assert_eq!(active_mention_query("bez zminky"), None);
+    }
+
+    #[test]
+    fn applying_a_mention_replaces_the_partial_token() {
+        let mut text = "ahoj @Pe".to_string();
+        apply_mention(&mut text, "Petr Novak");
+        assert_eq!(text, "ahoj @Petr Novak ");
+    }
+
+    #[test]
+    fn suggestions_are_filtered_alphabetically_and_capped() {
+        let people = vec![
+            (Jid::pn("111"), "Petr".to_string()),
+            (Jid::pn("222"), "Pavla".to_string()),
+            (Jid::pn("333"), "Anna".to_string()),
+        ];
+        let found: Vec<String> = mention_suggestions("ahoj @P", &people)
+            .iter()
+            .map(|(_, name)| name.clone())
+            .collect();
+        assert_eq!(found, vec!["Pavla".to_string(), "Petr".to_string()]);
+        assert_eq!(mention_suggestions("ahoj @", &people).len(), 3);
+        assert!(mention_suggestions("ahoj", &people).is_empty());
+    }
+
+    #[test]
+    fn collected_mentions_follow_text_order_and_skip_prefix_names() {
+        let people = vec![
+            (Jid::pn("111"), "Ann".to_string()),
+            (Jid::pn("222"), "Anna".to_string()),
+        ];
+        // `@Anna` must not drag `Ann` along, and order follows the text.
+        assert_eq!(
+            collect_mentions("@Anna a @Ann", &people),
+            vec![Jid::pn("222"), Jid::pn("111")]
+        );
+        assert!(collect_mentions("bez zminek", &people).is_empty());
+    }
+
+
     use super::*;
+
+    #[test]
+    fn archived_chats_are_split_out_unless_searching() {
+        let mut state = AppState::new();
+        let alice = Jid::pn("111");
+        let bob = Jid::pn("222");
+        state.get_or_create_chat(alice.clone(), "Alice".into(), false);
+        state.get_or_create_chat(bob.clone(), "Bob".into(), false);
+        state.chats.get_mut(&bob).unwrap().is_archived = true;
+
+        let main: Vec<String> = state.filtered_chats().iter().map(|c| c.name.clone()).collect();
+        assert!(main.contains(&"Alice".to_string()));
+        assert!(!main.contains(&"Bob".to_string()));
+
+        let archived: Vec<String> = state.archived_chats().iter().map(|c| c.name.clone()).collect();
+        assert_eq!(archived, vec!["Bob".to_string()]);
+
+        // A search is not a listing: it should still find archived chats.
+        state.search_query = "bo".to_string();
+        let found: Vec<String> = state.filtered_chats().iter().map(|c| c.name.clone()).collect();
+        assert_eq!(found, vec!["Bob".to_string()]);
+    }
+
+    #[test]
+    fn next_unread_skips_current_chat_and_archived_ones() {
+        let mut state = AppState::new();
+        let alice = Jid::pn("111");
+        let bob = Jid::pn("222");
+        let carol = Jid::pn("333");
+        for (jid, name) in [(&alice, "Alice"), (&bob, "Bob"), (&carol, "Carol")] {
+            let chat = state.get_or_create_chat(jid.clone(), name.to_string(), false);
+            chat.unread_count = 1;
+        }
+        state.chats.get_mut(&carol).unwrap().is_archived = true;
+
+        assert_eq!(state.next_unread_chat(Some(&alice)), Some(bob.clone()));
+
+        // Only the current chat is unread: pressing again stays there instead
+        // of doing nothing at all.
+        state.chats.get_mut(&bob).unwrap().unread_count = 0;
+        assert_eq!(state.next_unread_chat(Some(&alice)), Some(alice.clone()));
+
+        state.chats.get_mut(&alice).unwrap().unread_count = 0;
+        assert_eq!(state.next_unread_chat(Some(&alice)), None);
+    }
+
+    #[test]
+    fn first_unread_message_is_the_oldest_of_the_unread_block() {
+        let mut state = AppState::new();
+        let chat = Jid::pn("111");
+        state.get_or_create_chat(chat.clone(), "Alice".into(), false);
+        for id in ["m1", "m2", "m3"] {
+            let msg = Message::new_text(
+                id.to_string(),
+                chat.clone(),
+                chat.clone(),
+                format!("text {id}"),
+                Utc::now(),
+                false,
+                MessageStatus::Sent,
+                None,
+                None,
+            );
+            state.messages.entry(chat.clone()).or_default().push(msg);
+        }
+
+        state.chats.get_mut(&chat).unwrap().unread_count = 2;
+        assert_eq!(state.first_unread_message_id(&chat).as_deref(), Some("m2"));
+
+        state.chats.get_mut(&chat).unwrap().unread_count = 0;
+        assert_eq!(state.first_unread_message_id(&chat), None);
+    }
+
+    #[test]
+    fn draft_is_stashed_and_restored_per_chat() {
+        let mut state = AppState::new();
+        let alice = Jid::pn("111");
+        let bob = Jid::pn("222");
+
+        state.composer_text = "rozepsaná zpráva".to_string();
+        state.stash_draft(&alice);
+        assert_eq!(state.composer_text, "");
+        assert_eq!(state.drafts.get(&alice).map(String::as_str), Some("rozepsaná zpráva"));
+
+        state.composer_text = "jiná".to_string();
+        state.stash_draft(&bob);
+        state.restore_draft(&alice);
+        assert_eq!(state.composer_text, "rozepsaná zpráva");
+    }
+
+    #[test]
+    fn blank_draft_forgets_the_previous_one() {
+        let mut state = AppState::new();
+        let alice = Jid::pn("111");
+        state.composer_text = "text".to_string();
+        state.stash_draft(&alice);
+        assert!(state.drafts.contains_key(&alice));
+
+        state.composer_text = "   ".to_string();
+        state.stash_draft(&alice);
+        assert!(!state.drafts.contains_key(&alice));
+
+        // Nothing stored means an empty composer, not a stale one.
+        state.composer_text = "zbytek".to_string();
+        state.restore_draft(&alice);
+        assert_eq!(state.composer_text, "");
+    }
+
+    #[test]
+    fn view_once_flags_survive_json_and_are_omitted_when_false() {
+        let mut msg = Message::new_text(
+            "abc".into(),
+            Jid::pn("111"),
+            Jid::pn("111"),
+            "ahoj".into(),
+            Utc::now(),
+            false,
+            MessageStatus::Sent,
+            None,
+            None,
+        );
+        let plain = serde_json::to_string(&msg).unwrap();
+        assert!(!plain.contains("view_once"), "false flags should not be serialized");
+
+        msg.view_once = true;
+        msg.view_once_opened = true;
+        let encoded = serde_json::to_string(&msg).unwrap();
+        let decoded: Message = serde_json::from_str(&encoded).unwrap();
+        assert!(decoded.view_once);
+        assert!(decoded.view_once_opened);
+    }
 
     #[test]
     fn test_get_or_create_chat() {
@@ -1551,5 +2298,235 @@ mod tests {
 
         assert!(!restored.edited);
         assert_eq!(restored.text, "old");
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    fn jid() -> Jid {
+        Jid::pn("420777888999")
+    }
+
+    #[test]
+    fn toggling_adds_and_removes_the_same_id() {
+        let mut state = AppState::new();
+        state.toggle_selected("a");
+        state.toggle_selected("b");
+        assert_eq!(state.selected_messages.len(), 2);
+
+        state.toggle_selected("a");
+        assert_eq!(
+            state.selected_messages.iter().cloned().collect::<Vec<_>>(),
+            vec!["b".to_string()]
+        );
+
+        state.toggle_selected("b");
+        assert!(state.selected_messages.is_empty(), "unticking the last one must end the mode");
+    }
+
+    #[test]
+    fn selection_order_is_stable_for_the_forward_payload() {
+        let mut state = AppState::new();
+        for id in ["c", "a", "b"] {
+            state.toggle_selected(id);
+        }
+        assert_eq!(
+            state.selected_messages.iter().cloned().collect::<Vec<_>>(),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            "a BTreeSet keeps the forward payload deterministic"
+        );
+    }
+
+    /// Selection is transient UI state: persisting it would resurrect ticks for
+    /// message ids that no longer exist after a restart.
+    #[test]
+    fn selection_and_forward_dialog_are_not_serialized() {
+        let mut state = AppState::new();
+        state.toggle_selected("msg-1");
+        state.forward_dialog = Some(ForwardDialogState {
+            source_chat: jid(),
+            message_ids: vec!["msg-1".into()],
+            search: "rodina".into(),
+        });
+
+        let json = serde_json::to_string(&state).expect("state serializes");
+        assert!(!json.contains("selected_messages"), "selection must stay out of the file");
+        assert!(!json.contains("forward_dialog"), "an open dialog must not be persisted");
+    }
+
+    #[test]
+    fn transient_dialog_state_is_not_serialized() {
+        let mut state = AppState::default();
+        state.new_group = Some(NewGroupState {
+            subject: "Rodina".into(),
+            search: String::new(),
+            selected: Default::default(),
+            error: None,
+        });
+        state.show_contacts_dialog = true;
+        state.confirm = Some(ConfirmRequest {
+            title: "Smazat chat?".into(),
+            message: "Opravdu?".into(),
+            confirm_label: "Smazat".into(),
+            action: ConfirmAction::DeleteChat { chat_jid: jid() },
+        });
+
+        let json = serde_json::to_string(&state).expect("state serializes");
+        assert!(!json.contains("new_group"), "an open dialog must not be persisted");
+        assert!(!json.contains("show_contacts_dialog"), "panel state must stay transient");
+        assert!(!json.contains("confirm"), "a pending confirmation must not be persisted");
+    }
+
+    #[test]
+    fn group_snapshot_round_trips() {
+        let mut state = AppState::default();
+        let group = Jid::group("120363000000000000");
+        let mut snapshot = GroupInfoSnapshot {
+            subject: "Rodina".into(),
+            description: Some("Naše skupina".into()),
+            ..Default::default()
+        };
+        snapshot.admins.insert(jid());
+        state.group_info.insert(group.to_string(), snapshot);
+
+        let json = serde_json::to_string(&state).expect("state serializes");
+        let restored: AppState = serde_json::from_str(&json).expect("state deserializes");
+        let info = restored
+            .group_info
+            .get(&group.to_string())
+            .expect("snapshot survives");
+        assert_eq!(info.subject, "Rodina");
+        assert_eq!(info.description.as_deref(), Some("Naše skupina"));
+        assert!(info.is_admin(&jid()), "admin flags survive the round trip");
+    }
+    #[test]
+    fn poll_tallies_follow_option_order() {
+        let mut poll = PollData {
+            question: "Kde jíme?".into(),
+            options: vec!["Pizza".into(), "Sushi".into(), "Kebab".into()],
+            selectable_count: 1,
+            secret: vec![1, 2, 3],
+            creator: jid(),
+            votes: Default::default(),
+            is_quiz: false,
+        };
+        poll.votes.insert("a@s.whatsapp.net".into(), vec!["Sushi".into()]);
+        poll.votes
+            .insert("b@s.whatsapp.net".into(), vec!["Sushi".into()]);
+        poll.votes.insert("c@s.whatsapp.net".into(), vec!["Kebab".into()]);
+
+        assert_eq!(
+            poll.tallies(),
+            vec![
+                ("Pizza".to_string(), 0),
+                ("Sushi".to_string(), 2),
+                ("Kebab".to_string(), 1)
+            ],
+            "tallies keep the poll's own option order, not vote order"
+        );
+        assert_eq!(poll.total_voters(), 3);
+    }
+
+    #[test]
+    fn poll_my_vote_only_reports_own_selection() {
+        let me = jid().to_string();
+        let mut poll = PollData {
+            question: "Termín?".into(),
+            options: vec!["Pondělí".into(), "Úterý".into()],
+            selectable_count: 2,
+            secret: Vec::new(),
+            creator: jid(),
+            votes: Default::default(),
+            is_quiz: false,
+        };
+        poll.votes
+            .insert(me.clone(), vec!["Pondělí".into(), "Úterý".into()]);
+        poll.votes.insert(
+            "other@s.whatsapp.net".into(),
+            vec!["Pondělí".into()],
+        );
+
+        assert!(poll.is_multi(), "two selectable answers is a multi poll");
+        assert_eq!(poll.my_vote(&me), vec!["Pondělí", "Úterý"]);
+        assert!(poll.my_vote("nobody@s.whatsapp.net").is_empty());
+    }
+
+    #[test]
+    fn new_poll_validation_catches_bad_input() {
+        let mut draft = NewPollState::new(jid());
+
+        draft.question = "  ".into();
+        draft.options = vec!["A".into(), "B".into()];
+        assert!(draft.validation_error().is_some(), "an empty question is rejected");
+
+        draft.question = "Kde?".into();
+        draft.options = vec!["A".into(), "  ".into()];
+        assert!(
+            draft.validation_error().is_some(),
+            "a blank option leaves fewer than two candidates"
+        );
+
+        draft.options = vec!["A".into(), "a".into()];
+        assert!(
+            draft.validation_error().is_some(),
+            "options differ only by case and must not be counted twice"
+        );
+
+        draft.options = vec!["A".into(), "B".into(), "C".into()];
+        assert_eq!(draft.filled_options(), vec!["A", "B", "C"]);
+        assert!(draft.validation_error().is_none(), "three distinct options are fine");
+    }
+
+    #[test]
+    fn poll_round_trips_through_json() {
+        // Serialized per message: `AppState` itself keys its maps by `Jid`,
+        // which serde_json refuses as a key (persistence goes through
+        // `storage::PersistedState` with string keys instead).
+        let chat = jid();
+        let mut poll = PollData {
+            question: "Kdo jde?".into(),
+            options: vec!["Já".into(), "Ty".into()],
+            selectable_count: 1,
+            secret: vec![9, 9, 9],
+            creator: jid(),
+            votes: Default::default(),
+            is_quiz: true,
+        };
+        poll.votes
+            .insert("a@s.whatsapp.net".into(), vec!["Já".into()]);
+        let mut msg = Message::new_text(
+            "POLL123".into(),
+            chat.clone(),
+            chat.clone(),
+            "Kdo jde?".into(),
+            Utc::now(),
+            true,
+            MessageStatus::Sent,
+            None,
+            None,
+        );
+        msg.poll = Some(poll);
+
+        let json = serde_json::to_string(&msg).expect("message serializes");
+        let restored: Message = serde_json::from_str(&json).expect("message deserializes");
+        let poll = restored
+            .poll
+            .as_ref()
+            .expect("the poll survives a restart");
+
+        assert_eq!(poll.question, "Kdo jde?");
+        assert_eq!(poll.secret, vec![9, 9, 9], "the vote key must survive");
+        assert!(poll.is_quiz);
+        assert_eq!(poll.votes.len(), 1);
+    }
+
+    #[test]
+    fn jump_target_starts_unscrolled_and_unexpired() {
+        let target = JumpTarget::new("ABC123");
+        assert_eq!(target.message_id, "ABC123");
+        assert!(!target.scrolled, "the first frame still has to scroll");
+        assert!(!target.expired(), "a fresh target is alive");
     }
 }

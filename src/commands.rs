@@ -21,10 +21,18 @@ pub enum Command {
         to: Jid,
         text: String,
         reply_to: Option<String>,
+        /// JIDs named via `@Jméno` in the body (group mentions).
+        mentioned_jid: Vec<String>,
     },
     SendMessage {
         to: Jid,
         message: whatsapp_rust::waproto::whatsapp::Message,
+    },
+    /// Share a contact as a vCard card.
+    SendContact {
+        chat_jid: Jid,
+        contact_jid: Jid,
+        reply_to: Option<String>,
     },
     /// Rewrite the body of an already-sent message (`Client::edit_message`).
     EditText {
@@ -37,8 +45,37 @@ pub enum Command {
         file_path: std::path::PathBuf,
         caption: Option<String>,
         reply_to: Option<String>,
+        /// Wrap the attachment so the recipient can open it only once.
+        view_once: bool,
+    },
+    /// Send a recorded voice note (already encoded to OGG/Opus by the recorder).
+    SendVoiceNote {
+        chat_jid: Jid,
+        file_path: std::path::PathBuf,
+        duration_seconds: u32,
+        waveform: Vec<u8>,
+    },
+    /// Relay already-sent messages into another chat (`Client::forward_message`).
+    ///
+    /// `from_chat` is where the ids live; the backend rebuilds each body from
+    /// its stored text or media file, because the original protocol envelope is
+    /// not kept around.
+    ForwardMessages {
+        to: Jid,
+        from_chat: Jid,
+        message_ids: Vec<String>,
     },
     DownloadMedia {
+        chat_jid: Jid,
+        message_id: String,
+    },
+    /// Fetch a view-once attachment into the media dir so the viewer can show it.
+    OpenViewOnce {
+        chat_jid: Jid,
+        message_id: String,
+    },
+    /// Drop the local copy of a view-once attachment after it was shown.
+    ConsumeViewOnce {
         chat_jid: Jid,
         message_id: String,
     },
@@ -138,6 +175,13 @@ pub enum Command {
         is_admin: bool,
         original_sender: Option<Jid>,
     },
+
+    /// Pin a message for everyone. `duration_secs: None` unpins instead.
+    PinMessage {
+        chat_jid: Jid,
+        message_id: String,
+        duration_secs: Option<u32>,
+    },
     
     // Contact actions
     SaveContact {
@@ -181,6 +225,10 @@ pub enum Command {
     GetGroupInviteLink {
         chat_jid: Jid,
     },
+    /// Fetch description, admin flags and settings for a group.
+    RequestGroupInfo {
+        chat_jid: Jid,
+    },
     SetGroupSubject {
         chat_jid: Jid,
         subject: String,
@@ -189,9 +237,35 @@ pub enum Command {
         chat_jid: Jid,
         description: String,
     },
-    SetGroupEphemeral {
+    SetEphemeral {
         chat_jid: Jid,
         expiration: u32,
+    },
+    /// Only admins may send messages while this is on.
+    SetGroupAnnounce {
+        chat_jid: Jid,
+        enabled: bool,
+    },
+    /// Only admins may edit the group subject, description and picture.
+    SetGroupLocked {
+        chat_jid: Jid,
+        enabled: bool,
+    },
+    /// Create a poll in a chat. `selectable_count` is 1 for single choice.
+    /// The message secret the vendor returns is kept so votes can be read.
+    CreatePoll {
+        chat_jid: Jid,
+        question: String,
+        options: Vec<String>,
+        selectable_count: u32,
+    },
+    /// Vote on an existing poll. `option_names` are the full selection.
+    VotePoll {
+        chat_jid: Jid,
+        message_id: String,
+        poll_creator: Jid,
+        message_secret: Vec<u8>,
+        option_names: Vec<String>,
     },
     
     // Presence
@@ -244,15 +318,19 @@ pub enum Command {
 #[allow(dead_code)]
 impl Command {
     pub fn send_text(to: Jid, text: String) -> Self {
-        Self::SendText { to, text, reply_to: None }
+        Self::SendText { to, text, reply_to: None, mentioned_jid: Vec::new() }
     }
     
     pub fn send_text_reply(to: Jid, text: String, reply_to: String) -> Self {
-        Self::SendText { to, text, reply_to: Some(reply_to) }
+        Self::SendText { to, text, reply_to: Some(reply_to), mentioned_jid: Vec::new() }
     }
 
     pub fn edit_text(to: Jid, message_id: String, text: String) -> Self {
         Self::EditText { to, message_id, text }
+    }
+
+    pub fn forward_messages(to: Jid, from_chat: Jid, message_ids: Vec<String>) -> Self {
+        Self::ForwardMessages { to, from_chat, message_ids }
     }
     
     pub fn mark_as_read(chat_jid: Jid, message_ids: Vec<String>) -> Self {
