@@ -46,7 +46,10 @@ pub fn show_chat_list(ui: &mut Ui, state: &SharedState, backend: &crate::backend
                                 let is_selected = s.selected_chat.as_ref() == Some(&chat.jid);
                                 let jid = chat.jid.clone();
                                 
-                                let response = ChatItem::new(chat, is_selected).ui(ui);
+                                let draft = s.drafts.get(&jid).map(|d| d.as_str());
+                                let response = ChatItem::new(chat, is_selected)
+                                    .draft(draft)
+                                    .ui(ui);
                                 
                                 if response.clicked() {
                                     clicked_jid = Some(jid.clone());

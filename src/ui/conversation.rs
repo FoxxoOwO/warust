@@ -465,6 +465,8 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
     let poll_submit = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
     // (message id, duration) — `None` duration means "unpin".
     let pin_action = std::rc::Rc::new(std::cell::RefCell::new(None::<(String, Option<u32>)>));
+    // message id whose view-once payload the user asked to open
+    let view_once_action = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
     let pinned_id = state
         .pinned
         .get(chat_jid)
@@ -563,6 +565,7 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
                     let poll_click_handle = poll_click.clone();
                     let poll_submit_handle = poll_submit.clone();
                     let pin_handle = pin_action.clone();
+                    let view_once_handle = view_once_action.clone();
                     let is_pinned = pinned_id.as_deref() == Some(msg.id.as_str());
 
                     let bubble_resp = MessageBubble::new(msg, is_own)
@@ -604,6 +607,12 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
                             let msg_id = msg.id.clone();
                             move |_id: &str, secs: Option<u32>| {
                                 *pin_handle.borrow_mut() = Some((msg_id.clone(), secs));
+                            }
+                        })
+                        .on_open_view_once({
+                            let msg_id = msg.id.clone();
+                            move || {
+                                *view_once_handle.borrow_mut() = Some(msg_id.clone());
                             }
                         })
                         .highlight(jump_here)
@@ -690,6 +699,14 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
             chat_jid: chat_jid.clone(),
             message_id: id,
         });
+    }
+
+    if let Some(id) = view_once_action.borrow().clone() {
+        let _ = backend.send_command(Command::OpenViewOnce {
+            chat_jid: chat_jid.clone(),
+            message_id: id.clone(),
+        });
+        state.view_once_open = Some((chat_jid.clone(), id));
     }
 
     let pin_request = pin_action.borrow().clone();
@@ -1114,6 +1131,27 @@ fn show_composer(ui: &mut Ui, state: &mut AppState, chat_jid: &Jid, backend: &cr
                 if attach_btn.clicked() {
                     if let Some(path) = crate::media::pick_file() {
                         state.pending_attachment = Some(path);
+                        state.send_view_once = false;
+                    }
+                }
+
+                // View-once toggle only makes sense once something is attached.
+                if state.pending_attachment.is_some() {
+                    let vo_btn = ui.add(
+                        egui::Button::new(
+                            RichText::new("1")
+                                .font(FontId::proportional(15.0))
+                                .color(if state.send_view_once { Color32::BLACK } else { crate::theme::ACCENT })
+                        )
+                        .frame(true)
+                        .fill(if state.send_view_once { crate::theme::ACCENT } else { Color32::TRANSPARENT })
+                    ).on_hover_text(if state.send_view_once {
+                        "Zobrazit jednou: příjemce uvidí médium pouze jednou"
+                    } else {
+                        "Odeslat jako zobrazení jednou"
+                    });
+                    if vo_btn.clicked() {
+                        state.send_view_once = !state.send_view_once;
                     }
                 }
 
@@ -1220,11 +1258,14 @@ fn show_composer(ui: &mut Ui, state: &mut AppState, chat_jid: &Jid, backend: &cr
                     
                     if let Some(file_path) = state.pending_attachment.take() {
                         let caption = if text.is_empty() { None } else { Some(text) };
+                        let view_once = state.send_view_once;
+                        state.send_view_once = false;
                         let _ = backend.send_command(Command::SendMedia {
                             chat_jid: chat_jid.clone(),
                             file_path,
                             caption,
                             reply_to,
+                            view_once,
                         });
                     } else {
                         let _ = backend.send_command(Command::SendText { 
@@ -1234,6 +1275,8 @@ fn show_composer(ui: &mut Ui, state: &mut AppState, chat_jid: &Jid, backend: &cr
                         });
                     }
                     state.composer_text.clear();
+                    // The text is gone, so must be its remembered draft.
+                    state.drafts.remove(chat_jid);
                 }
             });
         });

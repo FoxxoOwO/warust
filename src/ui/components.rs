@@ -149,6 +149,8 @@ pub struct ChatItem<'a> {
     pub chat: &'a crate::state::Chat,
     pub is_selected: bool,
     pub on_click: Option<Box<dyn FnOnce() + 'a>>,
+    /// Unsent text for this chat; shown as a draft instead of the last message.
+    pub draft: Option<&'a str>,
 }
 
 impl<'a> ChatItem<'a> {
@@ -157,9 +159,15 @@ impl<'a> ChatItem<'a> {
             chat,
             is_selected,
             on_click: None,
+            draft: None,
         }
     }
     
+    pub fn draft(mut self, text: Option<&'a str>) -> Self {
+        self.draft = text;
+        self
+    }
+
     pub fn on_click(mut self, f: impl FnOnce() + 'a) -> Self {
         self.on_click = Some(Box::new(f));
         self
@@ -265,6 +273,16 @@ impl<'a> Widget for ChatItem<'a> {
                     3.5,
                 );
                 ui.ctx().request_repaint();
+            } else if let Some(draft) = self.draft.filter(|d| !d.trim().is_empty()) {
+                // Drafts win over the last message, as they do on the phone.
+                let preview_text = truncate(&format!("Koncept: {}", draft.trim()), 40);
+                painter.text(
+                    egui::pos2(text_x, preview_y),
+                    egui::Align2::LEFT_TOP,
+                    &preview_text,
+                    FontId::proportional(13.0),
+                    Color32::from_rgb(0x25, 0xD3, 0x66),
+                );
             } else if let Some(preview) = &self.chat.last_message {
                 let clean_text = preview_label(preview);
 
@@ -395,6 +413,8 @@ pub struct MessageBubble<'a> {
     pub poll_draft: Vec<String>,
     /// Our own JID (string form), used to mark the options we voted for.
     pub me: Option<&'a str>,
+    /// Fired when the view-once tile is clicked and the media must be fetched.
+    pub on_open_view_once: Option<Box<dyn FnOnce() + 'a>>,
 }
 
 impl<'a> MessageBubble<'a> {
@@ -421,6 +441,7 @@ impl<'a> MessageBubble<'a> {
             on_poll_submit: None,
             poll_draft: Vec::new(),
             me: None,
+            on_open_view_once: None,
         }
     }
     
@@ -496,6 +517,11 @@ impl<'a> MessageBubble<'a> {
         self
     }
 
+    pub fn on_open_view_once(mut self, f: impl FnOnce() + 'a) -> Self {
+        self.on_open_view_once = Some(Box::new(f));
+        self
+    }
+
     pub fn on_download(mut self, f: impl Fn(&'a str) + 'a) -> Self {
         self.on_download = Some(Box::new(f));
         self
@@ -517,6 +543,65 @@ impl<'a> MessageBubble<'a> {
     }
 }
 
+/// Tile standing in for a view-once attachment: no thumbnail and no size, so
+/// nothing about the payload leaks before it is opened.
+fn paint_view_once_tile<'a>(
+    ctx: &egui::Context,
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    mt: crate::state::MediaType,
+    message: &crate::state::Message,
+    on_open: &mut Option<Box<dyn FnOnce() + 'a>>,
+) {
+    painter.rect_filled(rect, 8.0, Color32::from_rgb(0x1E, 0x2B, 0x32));
+
+    let badge_center = rect.center() + Vec2::new(0.0, -12.0);
+    painter.circle_stroke(badge_center, 12.0, Stroke::new(2.0, crate::theme::ACCENT));
+    painter.text(
+        badge_center,
+        egui::Align2::CENTER_CENTER,
+        "1",
+        FontId::proportional(13.0),
+        crate::theme::ACCENT,
+    );
+
+    let kind = match mt {
+        crate::state::MediaType::Image | crate::state::MediaType::Sticker => "Fotka",
+        crate::state::MediaType::Video => "Video",
+        _ => "Médium",
+    };
+    let label = if message.view_once_opened {
+        "Jednorázové médium bylo zobrazeno".to_string()
+    } else {
+        format!("{kind} (zobrazit jednou)")
+    };
+    painter.text(
+        rect.center() + Vec2::new(0.0, 16.0),
+        egui::Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(11.0),
+        Color32::from_rgb(0xA9, 0xB6, 0xBD),
+    );
+
+    if message.view_once_opened {
+        return;
+    }
+
+    // Hit-tested against the pointer instead of `ui.interact`: the bubble paints
+    // through a painter borrowed from `ui`, so `ui` cannot be borrowed mutably here.
+    let hovered = ctx
+        .pointer_hover_pos()
+        .map_or(false, |pos| rect.contains(pos));
+    if hovered {
+        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        if ctx.input(|i| i.pointer.primary_clicked()) {
+            if let Some(f) = on_open.take() {
+                f();
+            }
+        }
+    }
+}
+
 impl<'a> Widget for MessageBubble<'a> {
     fn ui(self, ui: &mut Ui) -> egui::Response {
         let max_bubble_width = (ui.available_width() * 0.72).max(180.0);
@@ -529,6 +614,14 @@ impl<'a> Widget for MessageBubble<'a> {
         let mut cached_texture: Option<(egui::TextureHandle, [f32; 2])> = None;
 
         if let Some(mt) = media_type {
+            if self.message.view_once {
+                // Opaque tile: neither the bytes nor a thumbnail are shown
+                // until the recipient asks for them.
+                media_size = Vec2::new(
+                    220.0_f32.min(max_bubble_width - bubble_padding.x * 2.0),
+                    96.0,
+                );
+            } else {
             match mt {
                 crate::state::MediaType::Image | crate::state::MediaType::Sticker => {
                     if let Some((tex, dim)) = crate::media::image_texture(ui.ctx(), self.message) {
@@ -568,6 +661,7 @@ impl<'a> Widget for MessageBubble<'a> {
                 crate::state::MediaType::Document => {
                     media_size = Vec2::new(240.0_f32.min(max_bubble_width - bubble_padding.x * 2.0), 52.0);
                 }
+            }
             }
         }
 
@@ -666,6 +760,7 @@ impl<'a> Widget for MessageBubble<'a> {
         let mut video_scrub_used = false;
         let mut on_poll_option = self.on_poll_option;
         let mut on_poll_submit = self.on_poll_submit;
+        let mut on_open_view_once = self.on_open_view_once;
 
         let bubble_rect = if self.is_own {
             egui::Rect::from_min_size(
@@ -754,6 +849,9 @@ impl<'a> Widget for MessageBubble<'a> {
                     media_size,
                 );
 
+                if self.message.view_once {
+                    paint_view_once_tile(ui.ctx(), painter, media_rect, mt, self.message, &mut on_open_view_once);
+                } else {
                 let is_downloaded = self.message.media_path.as_ref().map_or(false, |p| std::path::Path::new(p).exists());
                 let file_len = self.message.media_file_length.unwrap_or(0);
 
@@ -1013,6 +1111,8 @@ impl<'a> Widget for MessageBubble<'a> {
                                 .request_repaint_after(std::time::Duration::from_millis(60));
                         }
                     }
+                }
+
                 }
 
                 y_offset += media_height;
@@ -1306,6 +1406,11 @@ impl<'a> Widget for MessageBubble<'a> {
                     f(&self.message.id);
                 }
             }
+            return response;
+        }
+
+        // View-once attachments open through the viewer modal only.
+        if self.message.view_once {
             return response;
         }
 

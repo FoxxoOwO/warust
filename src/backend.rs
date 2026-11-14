@@ -1009,6 +1009,15 @@ async fn handle_incoming_message(
         msg.media_caption = media.caption;
         msg.media_jpeg_thumbnail = media.jpeg_thumbnail;
     }
+
+    if message.is_view_once() {
+        msg.view_once = true;
+        // Nothing may survive locally before the user asks to open it: a
+        // thumbnail on disk (or a leftover copy from an earlier download)
+        // would defeat the point of "zobrazit jednou".
+        msg.media_jpeg_thumbnail = None;
+        msg.media_path = None;
+    }
     
     if let Some(poll) = extract_poll_creation(&message, &sender_jid) {
         msg.poll = Some(poll);
@@ -2120,6 +2129,92 @@ async fn refresh_group_info(client: &Client, state: &SharedState, chat_jid: &Jid
     }
 }
 
+/// Fetch one media message in the background and remember where it landed.
+///
+/// Shared by `DownloadMedia` and `OpenViewOnce`: the only difference is who
+/// asked for the bytes and what happens afterwards.
+fn spawn_media_download(
+    client: Arc<Client>,
+    state: SharedState,
+    canon_chat: Jid,
+    message_id: String,
+) {
+    let msg_clone = {
+        let s = state.read();
+        s.get_chat_messages(&canon_chat)
+            .and_then(|msgs| msgs.iter().find(|m| m.id == message_id))
+            .cloned()
+    };
+    let Some(msg) = msg_clone else {
+        return;
+    };
+    let (Some(direct_path), Some(media_key), Some(file_sha256), Some(media_type)) = (
+        msg.media_direct_path,
+        msg.media_key,
+        msg.media_file_sha256,
+        msg.media_type,
+    ) else {
+        return;
+    };
+
+    let wa_type = match media_type {
+        crate::state::MediaType::Image => whatsapp_rust::download::MediaType::Image,
+        crate::state::MediaType::Video => whatsapp_rust::download::MediaType::Video,
+        crate::state::MediaType::Audio | crate::state::MediaType::Voice => {
+            whatsapp_rust::download::MediaType::Audio
+        }
+        crate::state::MediaType::Document => whatsapp_rust::download::MediaType::Document,
+        crate::state::MediaType::Sticker => whatsapp_rust::download::MediaType::Sticker,
+    };
+    let enc_sha = msg.media_file_enc_sha256.as_deref();
+    let length = msg.media_file_length.unwrap_or(0);
+    let params = whatsapp_rust::download::DownloadParams::encrypted(
+        direct_path,
+        &media_key,
+        &file_sha256,
+        enc_sha.unwrap_or(&file_sha256),
+        length,
+        wa_type,
+    );
+
+    let target_path = crate::media::get_local_path(
+        &message_id,
+        msg.media_caption.as_deref(),
+        msg.media_mimetype.as_deref(),
+        media_type,
+    );
+
+    tokio::spawn(async move {
+        tracing::info!(
+            "Starting download for media message {} -> {}",
+            message_id,
+            target_path.display()
+        );
+        match client.download_from_params(&params).await {
+            Ok(bytes) => {
+                let _ = std::fs::create_dir_all(crate::media::media_dir());
+                if let Err(e) = tokio::fs::write(&target_path, bytes).await {
+                    tracing::error!("Failed to save media to {}: {}", target_path.display(), e);
+                } else {
+                    tracing::info!("Media successfully saved to {}", target_path.display());
+                    {
+                        let mut s = state.write();
+                        if let Some(msgs) = s.messages.get_mut(&canon_chat) {
+                            if let Some(m) = msgs.iter_mut().find(|m| m.id == message_id) {
+                                m.media_path = Some(target_path.to_string_lossy().to_string());
+                            }
+                        }
+                        s.dirty = true;
+                    }
+                    crate::media::MEDIA_REV.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let _ = crate::storage::persist_state(&state).await;
+                }
+            }
+            Err(e) => tracing::error!("Failed to download media for {}: {}", message_id, e),
+        }
+    });
+}
+
 async fn handle_command(
     cmd: Command,
     active_client: &Arc<tokio::sync::RwLock<Arc<Client>>>,
@@ -2199,7 +2294,7 @@ async fn handle_command(
             }
         }
         
-        Command::SendMedia { chat_jid, file_path, caption, reply_to } => {
+        Command::SendMedia { chat_jid, file_path, caption, reply_to, view_once } => {
             let canon_to = state.read().canonical_jid(&chat_jid);
             let quote_context = reply_to.as_ref().and_then(|reply_id| {
                 let s = state.read();
@@ -2271,7 +2366,33 @@ async fn handle_command(
                                         })
                                     }
                                 };
-                                
+
+                                // "Zobrazit jednou": the payload travels inside a
+                                // future-proof wrapper, which is what keeps clients
+                                // from caching it.
+                                let wa_msg = if view_once {
+                                    let mut inner = wa_msg;
+                                    if let Some(img) = inner.image_message.as_option_mut() {
+                                        img.view_once = Some(true);
+                                    }
+                                    if let Some(vid) = inner.video_message.as_option_mut() {
+                                        vid.view_once = Some(true);
+                                    }
+                                    wa::Message {
+                                        view_once_message_v2: whatsapp_rust::waproto::buffa::MessageField::some(
+                                            wa::message::FutureProofMessage {
+                                                message: whatsapp_rust::waproto::buffa::MessageField::from_box(
+                                                    Box::new(inner),
+                                                ),
+                                                ..Default::default()
+                                            },
+                                        ),
+                                        ..Default::default()
+                                    }
+                                } else {
+                                    wa_msg
+                                };
+
                                 match client_clone.send_message(canon_to.clone(), wa_msg).await {
                                     Ok(res) => {
                                         tracing::info!("Media message sent successfully with id {}", res.message_id);
@@ -2386,73 +2507,41 @@ async fn handle_command(
 
         Command::DownloadMedia { chat_jid, message_id } => {
             let canon_chat = state.read().canonical_jid(&chat_jid);
-            let msg_clone = {
+            spawn_media_download(client.clone(), state.clone(), canon_chat, message_id);
+        }
+
+        Command::OpenViewOnce { chat_jid, message_id } => {
+            let canon_chat = state.read().canonical_jid(&chat_jid);
+            spawn_media_download(client.clone(), state.clone(), canon_chat, message_id);
+        }
+
+        Command::ConsumeViewOnce { chat_jid, message_id } => {
+            let canon_chat = state.read().canonical_jid(&chat_jid);
+            let stored_path = {
                 let s = state.read();
                 s.get_chat_messages(&canon_chat)
                     .and_then(|msgs| msgs.iter().find(|m| m.id == message_id))
-                    .cloned()
+                    .and_then(|m| m.media_path.clone())
             };
-            if let Some(msg) = msg_clone {
-                if let (Some(direct_path), Some(media_key), Some(file_sha256), Some(media_type)) =
-                    (msg.media_direct_path, msg.media_key, msg.media_file_sha256, msg.media_type)
-                {
-                    let wa_type = match media_type {
-                        crate::state::MediaType::Image => whatsapp_rust::download::MediaType::Image,
-                        crate::state::MediaType::Video => whatsapp_rust::download::MediaType::Video,
-                        crate::state::MediaType::Audio | crate::state::MediaType::Voice => whatsapp_rust::download::MediaType::Audio,
-                        crate::state::MediaType::Document => whatsapp_rust::download::MediaType::Document,
-                        crate::state::MediaType::Sticker => whatsapp_rust::download::MediaType::Sticker,
-                    };
-                    let enc_sha = msg.media_file_enc_sha256.as_deref();
-                    let length = msg.media_file_length.unwrap_or(0);
-                    let params = whatsapp_rust::download::DownloadParams::encrypted(
-                        direct_path,
-                        &media_key,
-                        &file_sha256,
-                        enc_sha.unwrap_or(&file_sha256),
-                        length,
-                        wa_type,
-                    );
-                    
-                    let client_clone = client.clone();
-                    let state_clone = state.clone();
-                    let target_path = crate::media::get_local_path(
-                        &message_id,
-                        msg.media_caption.as_deref(),
-                        msg.media_mimetype.as_deref(),
-                        media_type,
-                    );
-                    
-                    tokio::spawn(async move {
-                        tracing::info!("Starting download for media message {} -> {}", message_id, target_path.display());
-                        match client_clone.download_from_params(&params).await {
-                            Ok(bytes) => {
-                                let _ = std::fs::create_dir_all(crate::media::media_dir());
-                                if let Err(e) = tokio::fs::write(&target_path, bytes).await {
-                                    tracing::error!("Failed to save media to {}: {}", target_path.display(), e);
-                                } else {
-                                    tracing::info!("Media successfully saved to {}", target_path.display());
-                                    {
-                                        let mut s = state_clone.write();
-                                        if let Some(msgs) = s.messages.get_mut(&canon_chat) {
-                                            if let Some(m) = msgs.iter_mut().find(|m| m.id == message_id) {
-                                                m.media_path = Some(target_path.to_string_lossy().to_string());
-                                            }
-                                        }
-                                    }
-                                    crate::media::MEDIA_REV.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    let _ = crate::storage::persist_state(&state_clone).await;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to download media for {}: {}", message_id, e);
-                            }
-                        }
-                    });
-                }
+            if let Some(path) = stored_path {
+                // The point of a view-once message is that no copy survives.
+                let _ = tokio::fs::remove_file(&path).await;
             }
+            {
+                let mut s = state.write();
+                if let Some(msgs) = s.messages.get_mut(&canon_chat) {
+                    if let Some(m) = msgs.iter_mut().find(|m| m.id == message_id) {
+                        m.media_path = None;
+                        m.media_jpeg_thumbnail = None;
+                        m.view_once_opened = true;
+                    }
+                }
+                s.dirty = true;
+            }
+            crate::media::MEDIA_REV.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let _ = crate::storage::persist_state(state).await;
         }
-        
+
         Command::SendReaction { chat_jid, message_id, emoji } => {
             let canon_chat = {
                 let s = state.read();

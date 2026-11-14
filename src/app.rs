@@ -216,6 +216,9 @@ impl eframe::App for WarustApp {
             crate::ui::schedule_dialog::show_scheduled_manager(ctx, &self.state, backend);
             crate::ui::conversation::show_reaction_detail_modal(ctx, &self.state, backend);
             crate::ui::call_dialog::show_call_overlay(ctx, &self.state, backend);
+            // Above the call overlay: a view-once payload is the most modal thing there is.
+            crate::ui::view_once_modal::show_view_once_modal(ctx, &self.state, backend);
+            crate::ui::view_once_modal::show_view_once_modal(ctx, &self.state, backend);
         }
 
         // Surface audio playback failures (missing ffmpeg, no output device...)

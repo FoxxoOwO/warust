@@ -211,6 +211,13 @@ pub struct Message {
     // Poll fields
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll: Option<PollData>,
+    /// Recipient may open the media exactly once (WhatsApp's "view once").
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub view_once: bool,
+    /// Set once the local copy was shown and deleted; the bubble keeps a
+    /// tombstone instead of the media.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub view_once_opened: bool,
 }
 
 impl Message {
@@ -248,6 +255,8 @@ impl Message {
             media_caption: None,
             media_jpeg_thumbnail: None,
             poll: None,
+            view_once: false,
+            view_once_opened: false,
         }
     }
 }
@@ -635,6 +644,15 @@ pub struct AppState {
     /// Selected tab of the media gallery in the chat info panel.
     #[serde(skip)]
     pub gallery_tab: GalleryTab,
+    /// Half-typed message per chat, so switching chats does not lose it.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub drafts: HashMap<Jid, String>,
+    /// Next attachment goes out as "view once".
+    #[serde(skip)]
+    pub send_view_once: bool,
+    /// Media currently shown in the view-once viewer (`chat`, `message id`).
+    #[serde(skip)]
+    pub view_once_open: Option<(Jid, String)>,
     /// New-group dialog, `None` when closed.
     #[serde(skip)]
     pub new_group: Option<NewGroupState>,
@@ -766,6 +784,9 @@ impl Default for AppState {
             group_info: HashMap::new(),
             pinned: HashMap::new(),
             gallery_tab: GalleryTab::default(),
+            drafts: HashMap::new(),
+            send_view_once: false,
+            view_once_open: None,
             new_group: None,
             add_member: None,
             show_contacts_dialog: false,
@@ -873,6 +894,23 @@ pub fn count_emoji_only(text: &str) -> Option<usize> {
 impl AppState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Remember the composer text under `chat` and clear it for the next one.
+    /// Blank text is not worth a draft, so any old entry is dropped instead.
+    pub fn stash_draft(&mut self, chat: &Jid) {
+        let text = self.composer_text.trim().to_string();
+        if text.is_empty() {
+            self.drafts.remove(chat);
+        } else {
+            self.drafts.insert(chat.clone(), text);
+        }
+        self.composer_text.clear();
+    }
+
+    /// Pull `chat`'s draft back into the composer (empty when there is none).
+    pub fn restore_draft(&mut self, chat: &Jid) {
+        self.composer_text = self.drafts.get(chat).cloned().unwrap_or_default();
     }
 
     pub fn canonical_jid(&self, jid: &Jid) -> Jid {
@@ -1472,6 +1510,65 @@ pub type SharedState = Arc<RwLock<AppState>>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draft_is_stashed_and_restored_per_chat() {
+        let mut state = AppState::new();
+        let alice = Jid::pn("111");
+        let bob = Jid::pn("222");
+
+        state.composer_text = "rozepsaná zpráva".to_string();
+        state.stash_draft(&alice);
+        assert_eq!(state.composer_text, "");
+        assert_eq!(state.drafts.get(&alice).map(String::as_str), Some("rozepsaná zpráva"));
+
+        state.composer_text = "jiná".to_string();
+        state.stash_draft(&bob);
+        state.restore_draft(&alice);
+        assert_eq!(state.composer_text, "rozepsaná zpráva");
+    }
+
+    #[test]
+    fn blank_draft_forgets_the_previous_one() {
+        let mut state = AppState::new();
+        let alice = Jid::pn("111");
+        state.composer_text = "text".to_string();
+        state.stash_draft(&alice);
+        assert!(state.drafts.contains_key(&alice));
+
+        state.composer_text = "   ".to_string();
+        state.stash_draft(&alice);
+        assert!(!state.drafts.contains_key(&alice));
+
+        // Nothing stored means an empty composer, not a stale one.
+        state.composer_text = "zbytek".to_string();
+        state.restore_draft(&alice);
+        assert_eq!(state.composer_text, "");
+    }
+
+    #[test]
+    fn view_once_flags_survive_json_and_are_omitted_when_false() {
+        let mut msg = Message::new_text(
+            "abc".into(),
+            Jid::pn("111"),
+            Jid::pn("111"),
+            "ahoj".into(),
+            Utc::now(),
+            false,
+            MessageStatus::Sent,
+            None,
+            None,
+        );
+        let plain = serde_json::to_string(&msg).unwrap();
+        assert!(!plain.contains("view_once"), "false flags should not be serialized");
+
+        msg.view_once = true;
+        msg.view_once_opened = true;
+        let encoded = serde_json::to_string(&msg).unwrap();
+        let decoded: Message = serde_json::from_str(&encoded).unwrap();
+        assert!(decoded.view_once);
+        assert!(decoded.view_once_opened);
+    }
 
     #[test]
     fn test_get_or_create_chat() {
