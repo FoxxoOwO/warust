@@ -11,6 +11,7 @@ pub mod video;
 pub mod recorder;
 pub mod autostart;
 mod backend;
+mod clipboard;
 mod commands;
 pub mod export;
 mod avatars;

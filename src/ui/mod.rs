@@ -12,6 +12,7 @@ pub mod qr_pairing;
 pub mod settings;
 pub mod export_dialog;
 pub mod search_dialog;
+pub mod palette;
 pub mod sticker_dialog;
 pub mod view_once_modal;
 pub mod schedule_dialog;
@@ -80,4 +81,66 @@ pub fn open_chat(state: &mut AppState, jid: &Jid, backend: &BackendHandle) {
             count: 50,
         });
     }
+}
+
+/// Closes the topmost open window or dialog — what Escape does.
+///
+/// Order matters: whatever was opened last must close first, so confirmations
+/// go before the dialog that raised them.
+pub fn close_topmost_dialog(state: &mut AppState) -> bool {
+    if state.confirm.take().is_some() {
+        return true;
+    }
+    if state.show_command_palette {
+        state.show_command_palette = false;
+        return true;
+    }
+    if state.show_sticker_picker {
+        state.show_sticker_picker = false;
+        return true;
+    }
+    if state.show_emoji_picker {
+        state.show_emoji_picker = false;
+        return true;
+    }
+    if state.show_contacts_dialog {
+        state.show_contacts_dialog = false;
+        return true;
+    }
+    if state.new_poll.take().is_some() {
+        state.poll_draft = None;
+        return true;
+    }
+    if state.add_member.take().is_some() {
+        return true;
+    }
+    if state.new_group.take().is_some() {
+        return true;
+    }
+    if state.forward_dialog.take().is_some() {
+        return true;
+    }
+    if state.view_once_open.take().is_some() {
+        return true;
+    }
+    if state.reaction_detail_modal.take().is_some() {
+        return true;
+    }
+    if state.show_schedule_dialog {
+        state.show_schedule_dialog = false;
+        return true;
+    }
+    if state.show_scheduled_manager {
+        state.show_scheduled_manager = false;
+        return true;
+    }
+    if state.show_new_chat_dialog {
+        state.show_new_chat_dialog = false;
+        return true;
+    }
+    if state.show_search_dialog {
+        state.show_search_dialog = false;
+        return true;
+    }
+    false
 }
