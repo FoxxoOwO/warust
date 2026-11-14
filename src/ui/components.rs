@@ -381,6 +381,16 @@ pub struct MessageBubble<'a> {
     /// Bulk-action mode: a click ticks the bubble instead of using the media.
     pub selection_mode: bool,
     pub selected: bool,
+    /// Briefly tinted and outlined, e.g. after jumping here from search.
+    pub highlight: bool,
+    /// Fired with the option name when a poll option row is clicked.
+    pub on_poll_option: Option<Box<dyn FnOnce(String) + 'a>>,
+    /// Fired by the "Hlasovat" button of a multi-choice poll.
+    pub on_poll_submit: Option<Box<dyn FnOnce() + 'a>>,
+    /// Options ticked in a multi-choice poll but not sent yet.
+    pub poll_draft: Vec<String>,
+    /// Our own JID (string form), used to mark the options we voted for.
+    pub me: Option<&'a str>,
 }
 
 impl<'a> MessageBubble<'a> {
@@ -400,6 +410,11 @@ impl<'a> MessageBubble<'a> {
             on_select: None,
             selection_mode: false,
             selected: false,
+            highlight: false,
+            on_poll_option: None,
+            on_poll_submit: None,
+            poll_draft: Vec::new(),
+            me: None,
         }
     }
     
@@ -437,6 +452,31 @@ impl<'a> MessageBubble<'a> {
 
     pub fn selected(mut self, on: bool) -> Self {
         self.selected = on;
+        self
+    }
+
+    pub fn highlight(mut self, on: bool) -> Self {
+        self.highlight = on;
+        self
+    }
+
+    pub fn on_poll_option(mut self, f: impl FnOnce(String) + 'a) -> Self {
+        self.on_poll_option = Some(Box::new(f));
+        self
+    }
+
+    pub fn on_poll_submit(mut self, f: impl FnOnce() + 'a) -> Self {
+        self.on_poll_submit = Some(Box::new(f));
+        self
+    }
+
+    pub fn poll_draft(mut self, names: Vec<String>) -> Self {
+        self.poll_draft = names;
+        self
+    }
+
+    pub fn me(mut self, jid: &'a str) -> Self {
+        self.me = Some(jid);
         self
     }
 
@@ -570,12 +610,24 @@ impl<'a> Widget for MessageBubble<'a> {
         let text_height = galley.as_ref().map_or(0.0, |g| g.size().y + 4.0);
         let time_height = 16.0;
 
+        // Polls grow a tally block under the question: one row per option plus
+        // a header line and, for multi-choice polls, a submit button.
+        let poll_row_count = self.message.poll.as_ref().map_or(0, |p| p.options.len());
+        let poll_is_multi = self.message.poll.as_ref().is_some_and(|p| p.is_multi());
+        let poll_height = if poll_row_count == 0 {
+            0.0
+        } else {
+            22.0 + poll_row_count as f32 * 28.0 + if poll_is_multi { 28.0 } else { 4.0 }
+        };
+
         let content_width = {
             let tw = galley.as_ref().map_or(0.0, |g| g.size().x);
-            (tw.max(media_size.x) + bubble_padding.x * 2.0).max(110.0)
+            // Tally bars need room for an option name next to its count.
+            let floor = if poll_row_count > 0 { 240.0 } else { 110.0 };
+            (tw.max(media_size.x) + bubble_padding.x * 2.0).max(floor)
         };
         let bubble_width = content_width.min(max_bubble_width);
-        let bubble_height = bubble_padding.y * 2.0 + sender_height + reply_height + media_height + text_height + time_height + 4.0;
+        let bubble_height = bubble_padding.y * 2.0 + sender_height + reply_height + media_height + text_height + time_height + poll_height + 4.0;
         
         let reaction_text = if !self.message.reactions.is_empty() {
             let mut emojis: Vec<String> = self.message.reactions.iter().map(|r| r.emoji.clone()).collect();
@@ -596,6 +648,8 @@ impl<'a> Widget for MessageBubble<'a> {
         
         let mut audio_clicked = false;
         let mut video_scrub_used = false;
+        let mut on_poll_option = self.on_poll_option;
+        let mut on_poll_submit = self.on_poll_submit;
 
         let bubble_rect = if self.is_own {
             egui::Rect::from_min_size(
@@ -955,6 +1009,137 @@ impl<'a> Widget for MessageBubble<'a> {
                     g.clone(),
                     text_color,
                 );
+                y_offset += g.size().y + 4.0;
+            }
+
+            // Poll: one tally bar per option, click to vote.
+            if let Some(poll) = &self.message.poll {
+                let left = bubble_rect.min.x + bubble_padding.x;
+                let inner_width = bubble_rect.width() - bubble_padding.x * 2.0;
+                let tallies = poll.tallies();
+                let total_votes: usize = tallies.iter().map(|(_, count)| *count).sum();
+                let my_vote = self.me.map(|me| poll.my_vote(me)).unwrap_or_default();
+
+                painter.text(
+                    egui::pos2(left, y_offset),
+                    egui::Align2::LEFT_TOP,
+                    if poll.is_quiz { "🧠 Kvíz" } else { "📊 Anketa" },
+                    FontId::proportional(10.0),
+                    bubble::REPLY_NAME,
+                );
+                painter.text(
+                    egui::pos2(bubble_rect.max.x - bubble_padding.x, y_offset),
+                    egui::Align2::RIGHT_TOP,
+                    format!(
+                        "{} {}",
+                        total_votes,
+                        if total_votes == 1 { "hlas" } else { "hlasů" }
+                    ),
+                    FontId::proportional(10.0),
+                    Color32::from_rgb(0x86, 0x96, 0xA0),
+                );
+                y_offset += 22.0;
+
+                for (name, count) in &tallies {
+                    let row = egui::Rect::from_min_size(
+                        egui::pos2(left, y_offset),
+                        Vec2::new(inner_width, 24.0),
+                    );
+                    let ticked = my_vote.iter().any(|picked| picked == name)
+                        || self.poll_draft.iter().any(|picked| picked == name);
+                    let resp = ui.interact(
+                        row,
+                        ui.scope_id()
+                            .with(("poll-opt", self.message.id.as_str(), name.as_str())),
+                        Sense::click(),
+                    );
+                    painter.rect_filled(
+                        row,
+                        6.0,
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 14),
+                    );
+                    if total_votes > 0 && *count > 0 {
+                        let share = (*count as f32 / total_votes as f32).min(1.0);
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(
+                                row.min,
+                                Vec2::new(row.width() * share, row.height()),
+                            ),
+                            6.0,
+                            if ticked {
+                                Color32::from_rgba_unmultiplied(0x00, 0xA8, 0x84, 110)
+                            } else {
+                                Color32::from_rgba_unmultiplied(255, 255, 255, 30)
+                            },
+                        );
+                    }
+                    if ticked {
+                        painter.rect_stroke(
+                            row,
+                            6.0,
+                            egui::Stroke::new(1.5, crate::theme::ACCENT),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    painter.text(
+                        egui::pos2(row.min.x + 8.0, row.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        name,
+                        FontId::proportional(12.0),
+                        text_color,
+                    );
+                    if *count > 0 {
+                        painter.text(
+                            egui::pos2(row.max.x - 8.0, row.center().y),
+                            egui::Align2::RIGHT_CENTER,
+                            count.to_string(),
+                            FontId::proportional(11.0),
+                            Color32::from_rgb(0x86, 0x96, 0xA0),
+                        );
+                    }
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if resp.clicked() {
+                        if let Some(f) = on_poll_option.take() {
+                            f(name.clone());
+                        }
+                    }
+                    y_offset += 28.0;
+                }
+
+                if poll.is_multi() {
+                    let button = egui::Rect::from_min_size(
+                        egui::pos2(left, y_offset),
+                        Vec2::new(inner_width, 24.0),
+                    );
+                    let resp = ui.interact(
+                        button,
+                        ui.scope_id().with(("poll-submit", self.message.id.as_str())),
+                        Sense::click(),
+                    );
+                    painter.rect_filled(
+                        button,
+                        6.0,
+                        if resp.hovered() {
+                            Color32::from_rgb(0x06, 0xC0, 0x8A)
+                        } else {
+                            Color32::from_rgb(0x00, 0x8A, 0x6E)
+                        },
+                    );
+                    painter.text(
+                        button.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Hlasovat",
+                        FontId::proportional(12.0),
+                        Color32::WHITE,
+                    );
+                    if resp.clicked() {
+                        if let Some(f) = on_poll_submit.take() {
+                            f();
+                        }
+                    }
+                }
             }
             
             // Timestamp and status
@@ -1086,8 +1271,8 @@ impl<'a> Widget for MessageBubble<'a> {
         
         // Selection mode swallows the click, so tapping a bubble ticks it
         // instead of opening, playing or downloading the attachment.
-        if self.selection_mode {
-            if self.selected {
+        if self.selection_mode || self.highlight {
+            if self.highlight || self.selected {
                 ui.painter().rect_filled(
                     bubble_rect,
                     egui::CornerRadius::same(9),

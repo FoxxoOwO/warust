@@ -206,6 +206,7 @@ impl eframe::App for WarustApp {
             crate::ui::forward_dialog::show_forward_dialog(ctx, &self.state, backend);
             crate::ui::group_dialog::show_new_group_dialog(ctx, &self.state, backend);
             crate::ui::group_dialog::show_add_member_dialog(ctx, &self.state, backend);
+            crate::ui::poll_dialog::show_new_poll_dialog(ctx, &self.state, backend);
             crate::ui::contacts_dialog::show_contacts_dialog(ctx, &self.state, backend);
             // Last, so a confirmation always sits on top of the dialog that
             // raised it.
