@@ -8,6 +8,7 @@ use egui::{Color32, FontId, RichText};
 use whatsapp_rust::wacore_binary::Jid;
 
 use crate::backend::BackendHandle;
+use crate::commands::Command;
 use crate::state::SharedState;
 use crate::ui::components::Avatar;
 
@@ -19,6 +20,7 @@ pub fn show_contacts_dialog(ctx: &egui::Context, state: &SharedState, backend: &
 
     let mut open = true;
     let mut open_jid: Option<Jid> = None;
+    let mut share_jid: Option<Jid> = None;
 
     egui::Window::new(RichText::new("👥  Kontakty").font(FontId::proportional(15.0)))
         .open(&mut open)
@@ -67,6 +69,7 @@ pub fn show_contacts_dialog(ctx: &egui::Context, state: &SharedState, backend: &
                 return;
             }
 
+            let has_open_chat = s.selected_chat.is_some();
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -90,6 +93,17 @@ pub fn show_contacts_dialog(ctx: &egui::Context, state: &SharedState, backend: &
                                             .color(Color32::from_rgb(0xF2, 0x8B, 0x82)),
                                     );
                                 }
+                                if ui
+                                    .add_enabled(
+                                        has_open_chat,
+                                        egui::Button::new(RichText::new("↗").font(FontId::proportional(13.0)))
+                                            .frame(false),
+                                    )
+                                    .on_hover_text("Sdílet kontakt do otevřeného chatu")
+                                    .clicked()
+                                {
+                                    share_jid = Some(jid.clone());
+                                }
                             })
                             .response;
                         let response = response.interact(egui::Sense::click());
@@ -101,6 +115,16 @@ pub fn show_contacts_dialog(ctx: &egui::Context, state: &SharedState, backend: &
                 });
         });
 
+    // Sharing keeps the browser open — you may want to send several cards.
+    if let Some(contact_jid) = share_jid.take() {
+        if let Some(chat_jid) = s.selected_chat.clone() {
+            let _ = backend.send_command(Command::SendContact {
+                chat_jid,
+                contact_jid,
+                reply_to: None,
+            });
+        }
+    }
     if let Some(jid) = open_jid {
         s.show_contacts_dialog = false;
         crate::ui::open_chat(&mut s, &jid, backend);

@@ -720,6 +720,9 @@ pub struct AppState {
     // Emoji Picker state
     #[serde(skip)]
     pub show_emoji_picker: bool,
+    /// Whether the sticker picker window is open.
+    #[serde(skip)]
+    pub show_sticker_picker: bool,
     #[serde(skip)]
     pub emoji_search: String,
     #[serde(skip)]
@@ -817,6 +820,7 @@ impl Default for AppState {
             reaction_detail_modal: None,
             active_call: None,
             show_emoji_picker: false,
+            show_sticker_picker: false,
             emoji_search: String::new(),
             emoji_active_category: 0,
             reaction_picker_target: None,

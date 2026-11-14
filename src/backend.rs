@@ -1299,6 +1299,10 @@ fn extract_message_text(message: &wa::Message) -> &str {
     if message.sticker_message.is_set() {
         return "🎨 Sticker";
     }
+    // Shared contact card
+    if message.contact_message.is_set() {
+        return "👤 Kontakt";
+    }
     // Check for audio / voice note
     if let Some(audio) = message.audio_message.as_option() {
         if audio.ptt.unwrap_or(false) {
@@ -2304,6 +2308,67 @@ async fn handle_command(
             let _ = crate::storage::persist_state(state).await;
         }
         
+        Command::SendContact { chat_jid, contact_jid, reply_to } => {
+            let canon_to = state.read().canonical_jid(&chat_jid);
+            let (display_name, phone) = {
+                let s = state.read();
+                let name = s
+                    .resolve_display_name(&contact_jid)
+                    .unwrap_or_else(|| crate::util::format_jid(&contact_jid));
+                let phone = crate::vcard::jid_digits(&contact_jid.to_string());
+                (name, phone)
+            };
+            if phone.is_empty() {
+                warn!("Cannot share {}: the JID carries no phone number", contact_jid);
+                return Ok(());
+            }
+            let quote_context = reply_to.as_ref().and_then(|reply_id| {
+                let s = state.read();
+                let reply_msg = s
+                    .get_chat_messages(&canon_to)
+                    .and_then(|msgs| msgs.iter().find(|m| m.id == *reply_id))?;
+                Some(build_quote_context_with_info(
+                    reply_id,
+                    &reply_msg.sender_jid,
+                    &canon_to,
+                    &canon_to,
+                    &wa::Message::default(),
+                ))
+            });
+            let msg = wa::Message {
+                contact_message: whatsapp_rust::waproto::buffa::MessageField::some(
+                    wa::message::ContactMessage {
+                        display_name: Some(display_name.clone()),
+                        vcard: Some(crate::vcard::build_vcard(&display_name, &phone)),
+                        context_info: quote_context
+                            .map(|ci| whatsapp_rust::waproto::buffa::MessageField::some(ci))
+                            .unwrap_or_default(),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            };
+            let res = client.send_message(canon_to.clone(), msg).await?;
+            let sender = client.pn().or(client.lid()).unwrap_or_else(|| canon_to.clone());
+            let message = Message::new_text(
+                res.message_id,
+                canon_to.clone(),
+                sender,
+                format!("👤 Kontakt: {display_name}"),
+                Utc::now(),
+                true,
+                MessageStatus::Sent,
+                reply_to,
+                None,
+            );
+            {
+                let mut s = state.write();
+                s.add_message(message);
+                s.consolidate_canonical_chats();
+            }
+            let _ = crate::storage::persist_state(state).await;
+        }
+
         Command::SendMessage { to, message } => {
             client.send_message(to, message).await?;
         }
@@ -2397,10 +2462,34 @@ async fn handle_command(
                                         })
                                     }
                                     crate::state::MediaType::Sticker => {
-                                        whatsapp_rust::media::image_message(upload, whatsapp_rust::media::ImageOptions {
-                                            caption: caption.clone(),
+                                        // Stickers are their own payload type; sending
+                                        // a .webp as an image makes clients offer a
+                                        // download instead of sticking it in the chat.
+                                        let (width, height) = crate::media::image_dimensions(&file_path)
+                                            .unwrap_or((512, 512));
+                                        let sticker = wa::message::StickerMessage {
+                                            url: Some(upload.url),
+                                            direct_path: Some(upload.direct_path),
+                                            media_key: Some(upload.media_key.to_vec()),
+                                            file_sha256: Some(upload.file_sha256.to_vec()),
+                                            file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+                                            file_length: Some(upload.file_length),
+                                            media_key_timestamp: Some(upload.media_key_timestamp),
+                                            mimetype: Some("image/webp".to_string()),
+                                            width: Some(width),
+                                            height: Some(height),
+                                            is_animated: Some(crate::media::webp_is_animated(&file_path)),
+                                            sticker_sent_ts: Some(Utc::now().timestamp_millis()),
+                                            context_info: quote_context
+                                                .clone()
+                                                .map(|ci| whatsapp_rust::waproto::buffa::MessageField::some(*ci))
+                                                .unwrap_or_default(),
                                             ..Default::default()
-                                        })
+                                        };
+                                        wa::Message {
+                                            sticker_message: whatsapp_rust::waproto::buffa::MessageField::some(sticker),
+                                            ..Default::default()
+                                        }
                                     }
                                 };
 

@@ -1209,6 +1209,17 @@ fn show_composer(ui: &mut Ui, state: &mut AppState, chat_jid: &Jid, backend: &cr
                     state.new_poll = Some(crate::state::NewPollState::new(chat_jid.clone()));
                 }
 
+                // Sticker picker button
+                let sticker_btn = ui.add(
+                    egui::Button::new(RichText::new("🎨").font(FontId::proportional(18.0)))
+                        .frame(false)
+                        .fill(Color32::TRANSPARENT)
+                ).on_hover_text("Poslat samolepku");
+
+                if sticker_btn.clicked() {
+                    state.show_sticker_picker = !state.show_sticker_picker;
+                }
+
                 // Emoji picker button
                 let emoji_btn = ui.add(
                     egui::Button::new(RichText::new("😊").font(FontId::proportional(18.0)))
