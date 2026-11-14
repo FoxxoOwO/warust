@@ -79,6 +79,8 @@ pub fn show_chat_list(ui: &mut Ui, state: &SharedState, backend: &crate::backend
 
                 if let Some(jid) = clicked_jid {
                     let canon = s.canonical_jid(&jid);
+                    // Message ids only mean something inside one chat.
+                    s.selected_messages.clear();
                     s.selected_chat = Some(canon.clone());
                     let target_key = if s.chats.contains_key(&canon) { canon.clone() } else { jid.clone() };
                     if let Some(chat_mut) = s.chats.get_mut(&target_key) {
@@ -228,6 +230,7 @@ fn show_header(ui: &mut Ui, state: &mut AppState, backend: &crate::backend::Back
                         let name = crate::util::format_jid(&target_jid);
                         let _ = state.get_or_create_chat(target_jid.clone(), name, false);
                         state.selected_chat = Some(target_jid.clone());
+                        state.selected_messages.clear();
                         state.show_new_chat_dialog = false;
                         state.new_chat_input.clear();
                         state.new_chat_error = None;

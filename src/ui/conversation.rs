@@ -59,26 +59,84 @@ fn show_welcome_screen(ui: &mut Ui, _state: &AppState) {
 }
 
 fn show_chat_view(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Chat, messages: &[Message], chat_jid: &Jid, backend: &crate::backend::BackendHandle) {
-    // Header bar
-    show_chat_header(ui, state, chat, backend);
-    
+    let selecting = !state.selected_messages.is_empty();
+
+    // While messages are ticked the header turns into the bulk-action bar and
+    // the composer is hidden: sending a draft mid-selection would be surprising.
+    if selecting {
+        show_selection_bar(ui, state, chat_jid, backend);
+    } else {
+        show_chat_header(ui, state, chat, backend);
+    }
+
     ui.separator();
     
     // Bottom-up layout pins composer to the absolute bottom of the window (no empty gap)
     ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-        ui.allocate_ui_with_layout(
-            egui::vec2(ui.available_width(), 0.0),
-            egui::Layout::top_down(egui::Align::Min),
-            |ui| {
-                show_composer(ui, state, chat_jid, backend);
-            },
-        );
-        ui.separator();
+        if !selecting {
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    show_composer(ui, state, chat_jid, backend);
+                },
+            );
+            ui.separator();
+        }
         
         ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
             show_messages_area(ui, state, chat, messages, chat_jid, backend);
         });
     });
+}
+
+/// Bulk-action bar shown in place of the chat header while messages are ticked.
+fn show_selection_bar(ui: &mut Ui, state: &mut AppState, chat_jid: &Jid, _backend: &crate::backend::BackendHandle) {
+    let count = state.selected_messages.len();
+    let mut clear = false;
+    let mut open_forward = false;
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        if ui.button(RichText::new("✕").font(FontId::proportional(16.0))).clicked() {
+            clear = true;
+        }
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(format!("Vybráno: {}", count))
+                .font(FontId::proportional(15.0))
+                .color(Color32::WHITE),
+        );
+
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.add_space(8.0);
+            let forward_btn = ui.add_enabled(
+                count > 0,
+                egui::Button::new(
+                    RichText::new("↪  Přeposlat")
+                        .font(FontId::proportional(13.0))
+                        .color(Color32::from_rgb(0x0B, 0x14, 0x18)),
+                )
+                .fill(crate::theme::ACCENT)
+                .corner_radius(egui::CornerRadius::same(6)),
+            );
+            if forward_btn.clicked() {
+                open_forward = true;
+            }
+        });
+    });
+    ui.add_space(8.0);
+
+    if clear {
+        state.selected_messages.clear();
+    } else if open_forward {
+        state.forward_dialog = Some(crate::state::ForwardDialogState {
+            source_chat: chat_jid.clone(),
+            message_ids: state.selected_messages.iter().cloned().collect(),
+            search: String::new(),
+        });
+    }
 }
 
 fn show_chat_header(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Chat, backend: &crate::backend::BackendHandle) {
@@ -237,6 +295,8 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
     let should_scroll_to_bottom = state.auto_scroll_to_bottom;
     let mut selected_reply: Option<usize> = None;
     let mut selected_edit: Option<String> = None;
+    let mut selected_toggle: Option<String> = None;
+    let selection_active = !state.selected_messages.is_empty();
     let mut message_to_delete = None;
     let mut selected_reaction: Option<(String, String)> = None;
     let mut view_reactions_id: Option<String> = None;
@@ -307,6 +367,11 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
                         .on_edit(|id| {
                             selected_edit = Some(id.to_string());
                         })
+                        .selection_mode(selection_active)
+                        .selected(selection_active && state.selected_messages.contains(&msg.id))
+                        .on_select(|id| {
+                            selected_toggle = Some(id.to_string());
+                        })
                         .on_delete(|id| {
                             message_to_delete = Some(id.to_string());
                         })
@@ -338,6 +403,10 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
             ui.add_space(24.0);
         });
         
+    if let Some(id) = selected_toggle {
+        state.toggle_selected(&id);
+    }
+
     if let Some(idx) = selected_reply {
         state.replying_to = messages.get(idx).cloned();
     }
@@ -772,7 +841,7 @@ pub fn show_reaction_detail_modal(ctx: &Context, state: &SharedState, backend: &
                         };
 
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(&r.emoji).font(FontId::proportional(22.0)));
+                            ui.label(RichText::new(&r.emoji).font(crate::theme::message_font(22.0)));
                             ui.add_space(8.0);
                             ui.label(RichText::new(name_display).font(FontId::proportional(14.0)).color(Color32::from_rgb(0xE9, 0xED, 0xEF)));
                             if is_mine {

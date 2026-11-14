@@ -344,6 +344,10 @@ pub struct MessageBubble<'a> {
     pub on_react: Option<Box<dyn FnOnce(&'a str, &'a str) + 'a>>,
     pub on_view_reactions: Option<Box<dyn FnOnce(&'a str) + 'a>>,
     pub on_open_emoji_picker: Option<Box<dyn FnOnce(&'a str) + 'a>>,
+    pub on_select: Option<Box<dyn FnOnce(&'a str) + 'a>>,
+    /// Bulk-action mode: a click ticks the bubble instead of using the media.
+    pub selection_mode: bool,
+    pub selected: bool,
 }
 
 impl<'a> MessageBubble<'a> {
@@ -360,6 +364,9 @@ impl<'a> MessageBubble<'a> {
             on_react: None,
             on_view_reactions: None,
             on_open_emoji_picker: None,
+            on_select: None,
+            selection_mode: false,
+            selected: false,
         }
     }
     
@@ -381,6 +388,22 @@ impl<'a> MessageBubble<'a> {
 
     pub fn on_edit(mut self, f: impl FnOnce(&'a str) + 'a) -> Self {
         self.on_edit = Some(Box::new(f));
+        self
+    }
+
+    pub fn on_select(mut self, f: impl FnOnce(&'a str) + 'a) -> Self {
+        self.on_select = Some(Box::new(f));
+        self
+    }
+
+    /// Turn the bubble into a selectable row for the bulk-action bar.
+    pub fn selection_mode(mut self, on: bool) -> Self {
+        self.selection_mode = on;
+        self
+    }
+
+    pub fn selected(mut self, on: bool) -> Self {
+        self.selected = on;
         self
     }
 
@@ -490,7 +513,7 @@ impl<'a> Widget for MessageBubble<'a> {
         let galley = if has_text {
             Some(ui.painter().layout(
                 display_text,
-                FontId::proportional(font_size),
+                crate::theme::message_font(font_size),
                 text_color,
                 text_wrap_width,
             ))
@@ -954,7 +977,7 @@ impl<'a> Widget for MessageBubble<'a> {
                     pill_rect.center(),
                     egui::Align2::CENTER_CENTER,
                     &reaction_text,
-                    FontId::proportional(11.0),
+                    crate::theme::message_font(11.0),
                     Color32::WHITE,
                 );
 
@@ -1004,7 +1027,7 @@ impl<'a> Widget for MessageBubble<'a> {
                 ui.horizontal(|ui| {
                     for emoji in ["👍", "❤️", "😂", "😮", "😢", "🙏", "🔥", "🎉"] {
                         let has_this_reaction = self.message.reactions.iter().any(|r| r.emoji == emoji);
-                        let btn = egui::Button::new(RichText::new(emoji).font(FontId::proportional(18.0)))
+                        let btn = egui::Button::new(RichText::new(emoji).font(crate::theme::message_font(18.0)))
                             .fill(if has_this_reaction { Color32::from_rgb(0x00, 0x5C, 0x4B) } else { Color32::TRANSPARENT })
                             .corner_radius(egui::CornerRadius::same(6));
                         if ui.add(btn).on_hover_text(if has_this_reaction { "Odebrat reakci" } else { "Reagovat" }).clicked() {
@@ -1028,6 +1051,30 @@ impl<'a> Widget for MessageBubble<'a> {
             });
         }
         
+        // Selection mode swallows the click, so tapping a bubble ticks it
+        // instead of opening, playing or downloading the attachment.
+        if self.selection_mode {
+            if self.selected {
+                ui.painter().rect_filled(
+                    bubble_rect,
+                    egui::CornerRadius::same(9),
+                    Color32::from_rgba_unmultiplied(0x00, 0xA8, 0x84, 0x24),
+                );
+                ui.painter().rect_stroke(
+                    bubble_rect.expand(1.0),
+                    egui::CornerRadius::same(10),
+                    egui::Stroke::new(2.0, crate::theme::ACCENT),
+                    egui::StrokeKind::Outside,
+                );
+            }
+            if response.clicked() {
+                if let Some(f) = self.on_select {
+                    f(&self.message.id);
+                }
+            }
+            return response;
+        }
+
         // Handle click on media
         let is_audio_bubble = matches!(
             self.message.media_type,
@@ -1075,7 +1122,7 @@ impl<'a> Widget for MessageBubble<'a> {
             ui.horizontal(|ui| {
                 for emoji in ["👍", "❤️", "😂", "😮", "😢", "🙏", "🔥", "🎉"] {
                     let has_this_reaction = self.message.reactions.iter().any(|r| r.emoji == emoji);
-                    let btn = egui::Button::new(RichText::new(emoji).font(FontId::proportional(18.0)))
+                    let btn = egui::Button::new(RichText::new(emoji).font(crate::theme::message_font(18.0)))
                         .fill(if has_this_reaction { Color32::from_rgb(0x00, 0x5C, 0x4B) } else { Color32::TRANSPARENT })
                         .corner_radius(egui::CornerRadius::same(6));
                     if ui.add(btn).on_hover_text(if has_this_reaction { "Odebrat reakci" } else { "Reagovat" }).clicked() {
@@ -1119,6 +1166,13 @@ impl<'a> Widget for MessageBubble<'a> {
             }
             if ui.button("Reply").clicked() {
                 if let Some(f) = self.on_reply {
+                    f(&self.message.id);
+                }
+                ui.close();
+            }
+            let mut on_select = self.on_select;
+            if on_select.is_some() && ui.button("Vybrat").clicked() {
+                if let Some(f) = on_select.take() {
                     f(&self.message.id);
                 }
                 ui.close();
@@ -1416,4 +1470,22 @@ mod bubble_tests {
     fn unedited_bubble_renders() {
         render(&message("plain", false), false);
     }
+
+    /// Selection mode intercepts the click and paints an outline; it must lay
+    /// out in both states without touching the media path.
+    #[test]
+    fn selection_highlight_renders() {
+        let ctx = egui::Context::default();
+        for selected in [true, false] {
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                ui.set_max_width(360.0);
+                MessageBubble::new(&message("tick me", false), false)
+                    .selection_mode(true)
+                    .selected(selected)
+                    .ui(ui);
+            });
+            output.textures_delta.clear();
+        }
+    }
+
 }

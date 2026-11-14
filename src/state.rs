@@ -337,6 +337,15 @@ pub struct ExportDialogState {
     pub exported_path: Option<std::path::PathBuf>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ForwardDialogState {
+    /// Chat the messages are being forwarded from.
+    pub source_chat: Jid,
+    /// Ids of the ticked messages, in conversation order.
+    pub message_ids: Vec<String>,
+    pub search: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppState {
     pub chats: HashMap<Jid, Chat>,
@@ -412,6 +421,13 @@ pub struct AppState {
     /// periodic writer can skip no-op serialization of the whole message store.
     #[serde(skip)]
     pub dirty: bool,
+    /// Ids of the messages ticked in the bulk-action bar of the open chat.
+    /// Non-empty means selection mode is active.
+    #[serde(skip)]
+    pub selected_messages: std::collections::BTreeSet<String>,
+    /// Open "forward to…" chat picker.
+    #[serde(skip)]
+    pub forward_dialog: Option<ForwardDialogState>,
 }
 
 impl Default for AppState {
@@ -456,6 +472,8 @@ impl Default for AppState {
             pending_reactions: HashMap::new(),
             initial_history_fetched: false,
             dirty: false,
+            selected_messages: std::collections::BTreeSet::new(),
+            forward_dialog: None,
         }
     }
 }
@@ -960,6 +978,17 @@ impl AppState {
             });
         }
         false
+    }
+
+    /// Tick or untick a message in the bulk-action selection.
+    ///
+    /// Un-ticking the last message leaves the set empty, and an empty set is
+    /// what ends selection mode — the same effect as the ✕ in the bar, so no
+    /// separate mode flag is needed.
+    pub fn toggle_selected(&mut self, message_id: &str) {
+        if !self.selected_messages.remove(message_id) {
+            self.selected_messages.insert(message_id.to_string());
+        }
     }
 
     /// Apply an edit to an already-stored message.
@@ -1551,5 +1580,61 @@ mod tests {
 
         assert!(!restored.edited);
         assert_eq!(restored.text, "old");
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    fn jid() -> Jid {
+        Jid::pn("420777888999")
+    }
+
+    #[test]
+    fn toggling_adds_and_removes_the_same_id() {
+        let mut state = AppState::new();
+        state.toggle_selected("a");
+        state.toggle_selected("b");
+        assert_eq!(state.selected_messages.len(), 2);
+
+        state.toggle_selected("a");
+        assert_eq!(
+            state.selected_messages.iter().cloned().collect::<Vec<_>>(),
+            vec!["b".to_string()]
+        );
+
+        state.toggle_selected("b");
+        assert!(state.selected_messages.is_empty(), "unticking the last one must end the mode");
+    }
+
+    #[test]
+    fn selection_order_is_stable_for_the_forward_payload() {
+        let mut state = AppState::new();
+        for id in ["c", "a", "b"] {
+            state.toggle_selected(id);
+        }
+        assert_eq!(
+            state.selected_messages.iter().cloned().collect::<Vec<_>>(),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            "a BTreeSet keeps the forward payload deterministic"
+        );
+    }
+
+    /// Selection is transient UI state: persisting it would resurrect ticks for
+    /// message ids that no longer exist after a restart.
+    #[test]
+    fn selection_and_forward_dialog_are_not_serialized() {
+        let mut state = AppState::new();
+        state.toggle_selected("msg-1");
+        state.forward_dialog = Some(ForwardDialogState {
+            source_chat: jid(),
+            message_ids: vec!["msg-1".into()],
+            search: "rodina".into(),
+        });
+
+        let json = serde_json::to_string(&state).expect("state serializes");
+        assert!(!json.contains("selected_messages"), "selection must stay out of the file");
+        assert!(!json.contains("forward_dialog"), "an open dialog must not be persisted");
     }
 }

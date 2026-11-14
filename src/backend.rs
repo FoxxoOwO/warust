@@ -1102,6 +1102,70 @@ fn extract_reply_to(message: &wa::Message) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Rebuild a sendable envelope for a stored message so it can be forwarded.
+///
+/// `Client::forward_message` would normally relay the original CDN blob, but we
+/// keep only the decrypted local file and the plain text, never the raw
+/// protocol envelope — so media is uploaded again from `media_path`.
+async fn build_forward_body(client: &Arc<Client>, msg: &Message) -> Option<wa::Message> {
+    if let (Some(kind), Some(path)) = (msg.media_type, msg.media_path.as_ref()) {
+        let path = std::path::PathBuf::from(path);
+        if path.exists() {
+            let bytes = tokio::fs::read(&path).await.ok()?;
+            let wa_type = match kind {
+                crate::state::MediaType::Image | crate::state::MediaType::Sticker => {
+                    whatsapp_rust::download::MediaType::Image
+                }
+                crate::state::MediaType::Video => whatsapp_rust::download::MediaType::Video,
+                crate::state::MediaType::Audio | crate::state::MediaType::Voice => {
+                    whatsapp_rust::download::MediaType::Audio
+                }
+                crate::state::MediaType::Document => whatsapp_rust::download::MediaType::Document,
+            };
+            let upload = client.upload(bytes, wa_type, Default::default()).await.ok()?;
+            let file_name = path.file_name().map(|n| n.to_string_lossy().to_string());
+            let caption = msg
+                .media_caption
+                .clone()
+                .or_else(|| (!msg.text.is_empty()).then(|| msg.text.clone()));
+            return Some(match kind {
+                crate::state::MediaType::Image | crate::state::MediaType::Sticker => {
+                    whatsapp_rust::media::image_message(
+                        upload,
+                        whatsapp_rust::media::ImageOptions { caption, ..Default::default() },
+                    )
+                }
+                crate::state::MediaType::Video => whatsapp_rust::media::video_message(
+                    upload,
+                    whatsapp_rust::media::VideoOptions { caption, ..Default::default() },
+                ),
+                crate::state::MediaType::Audio | crate::state::MediaType::Voice => {
+                    whatsapp_rust::media::audio_message(
+                        upload,
+                        whatsapp_rust::media::AudioOptions {
+                            ptt: Some(kind == crate::state::MediaType::Voice),
+                            ..Default::default()
+                        },
+                    )
+                }
+                crate::state::MediaType::Document => whatsapp_rust::media::document_message(
+                    upload,
+                    whatsapp_rust::media::DocumentOptions {
+                        file_name,
+                        caption,
+                        ..Default::default()
+                    },
+                ),
+            });
+        }
+    }
+
+    if !msg.text.is_empty() {
+        return Some(wa::Message::text(msg.text.clone()));
+    }
+    None
+}
+
 fn is_jid_group(jid: &Jid) -> bool {
     // Check if it's a group JID by looking at the server type
     // Group JIDs end with @g.us
@@ -1996,6 +2060,66 @@ async fn handle_command(
                     }
                 }
             });
+        }
+
+        Command::ForwardMessages { to, from_chat, message_ids } => {
+            let (canon_to, self_jid, msgs) = {
+                let s = state.read();
+                let canon_to = s.canonical_jid(&to);
+                let canon_from = s.canonical_jid(&from_chat);
+                let msgs: Vec<Message> = s
+                    .get_chat_messages(&canon_from)
+                    .map(|all| {
+                        all.iter()
+                            .filter(|m| message_ids.contains(&m.id))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (canon_to, s.self_jid.clone(), msgs)
+            };
+
+            if msgs.is_empty() {
+                warn!("Forward requested but none of {:?} is still stored", message_ids);
+            } else {
+                let client_clone = client.clone();
+                let state_clone = state.clone();
+                tokio::spawn(async move {
+                    let sender = self_jid
+                        .or_else(|| client_clone.pn())
+                        .unwrap_or_else(|| canon_to.clone());
+                    let mut delivered = 0usize;
+                    for msg in msgs {
+                        let Some(body) = build_forward_body(&client_clone, &msg).await else {
+                            warn!("Skipping forward of {} — no text and no local media", msg.id);
+                            continue;
+                        };
+                        match client_clone.forward_message(canon_to.clone(), &body).await {
+                            Ok(res) => {
+                                delivered += 1;
+                                let mut copy = msg.clone();
+                                copy.id = res.message_id;
+                                copy.chat_jid = canon_to.clone();
+                                copy.sender_jid = sender.clone();
+                                copy.from_me = true;
+                                copy.status = MessageStatus::Sent;
+                                copy.timestamp = chrono::Utc::now();
+                                copy.reply_to = None;
+                                copy.edited = false;
+                                copy.reactions.clear();
+                                state_clone.write().add_message(copy);
+                            }
+                            Err(e) => error!("Failed to forward {}: {}", msg.id, e),
+                        }
+                    }
+                    tracing::info!("Forwarded {} message(s) to {}", delivered, canon_to);
+                    {
+                        let mut s = state_clone.write();
+                        s.consolidate_canonical_chats();
+                    }
+                    let _ = crate::storage::persist_state(&state_clone).await;
+                });
+            }
         }
 
         Command::DownloadMedia { chat_jid, message_id } => {
