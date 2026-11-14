@@ -760,6 +760,9 @@ pub struct AppState {
     /// Message the UI should scroll to and flash briefly (search, replies).
     #[serde(skip)]
     pub jump_target: Option<JumpTarget>,
+    /// Whether the archived section is expanded in the chat list.
+    #[serde(skip)]
+    pub show_archived: bool,
 }
 
 impl Default for AppState {
@@ -827,6 +830,7 @@ impl Default for AppState {
             new_poll: None,
             poll_draft: None,
             jump_target: None,
+            show_archived: false,
         }
     }
 }
@@ -1280,6 +1284,8 @@ impl AppState {
         best
     }
 
+    /// Chats for the main list. Archived ones are pulled out into their own
+    /// section, except while searching — search should find everything.
     pub fn filtered_chats(&self) -> Vec<&Chat> {
         let mut chats: Vec<_> = self.chats.values().collect();
         
@@ -1288,6 +1294,9 @@ impl AppState {
             let query = self.search_query.to_lowercase();
             chats.retain(|c| c.name.to_lowercase().contains(&query));
         } else {
+            // Archived chats have a collapsible section of their own.
+            chats.retain(|c| !c.is_archived);
+
             // When not searching, show chats that:
             // 1. Have a known human name, OR
             // 2. Have messages / last_message, OR
@@ -1304,7 +1313,28 @@ impl AppState {
             });
         }
         
-        // Sort: pinned first, then by latest message / activity (newest first)
+        self.sort_chats(&mut chats);
+
+        chats
+    }
+
+    /// Archived chats, in the same order as the main list.
+    pub fn archived_chats(&self) -> Vec<&Chat> {
+        let query = self.search_query.to_lowercase();
+        let mut chats: Vec<_> = self
+            .chats
+            .values()
+            .filter(|c| c.is_archived)
+            .filter(|c| query.is_empty() || c.name.to_lowercase().contains(&query))
+            .collect();
+
+        self.sort_chats(&mut chats);
+
+        chats
+    }
+
+    /// Pinned first, then by latest activity, then alphabetically.
+    fn sort_chats(&self, chats: &mut [&Chat]) {
         chats.sort_by(|a, b| {
             match (a.is_pinned, b.is_pinned) {
                 (true, false) => std::cmp::Ordering::Less,
@@ -1319,8 +1349,41 @@ impl AppState {
                 }
             }
         });
-        
-        chats
+    }
+
+    /// The next chat that still has something unread, oldest activity first so a
+    /// repeated press walks the backlog instead of bouncing between two chats.
+    pub fn next_unread_chat(&self, current: Option<&Jid>) -> Option<Jid> {
+        let mut candidates: Vec<&Chat> = self
+            .chats
+            .values()
+            .filter(|c| c.unread_count > 0 && !c.is_archived)
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        candidates.sort_by_key(|c| self.get_chat_latest_timestamp(c));
+
+        let current = current.map(|jid| self.canonical_jid(jid));
+        candidates
+            .iter()
+            .find(|c| Some(self.canonical_jid(&c.jid)) != current)
+            .or_else(|| candidates.first())
+            .map(|c| c.jid.clone())
+    }
+
+    /// First message of the unread block: the `unread_count` newest incoming
+    /// messages are unread, so jumping lands where the user stopped reading.
+    pub fn first_unread_message_id(&self, chat_jid: &Jid) -> Option<String> {
+        let canon = self.canonical_jid(chat_jid);
+        let unread = self.chats.get(&canon)?.unread_count as usize;
+        if unread == 0 {
+            return None;
+        }
+        let messages = self.messages.get(&canon)?;
+        let incoming: Vec<&Message> = messages.iter().filter(|m| !m.from_me).collect();
+        let start = incoming.len().saturating_sub(unread);
+        incoming.get(start).map(|m| m.id.clone())
     }
 
     pub fn apply_reaction(&mut self, chat_jid: &Jid, target_msg_id: &str, sender_jid: &Jid, emoji: &str) -> bool {
@@ -1510,6 +1573,78 @@ pub type SharedState = Arc<RwLock<AppState>>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archived_chats_are_split_out_unless_searching() {
+        let mut state = AppState::new();
+        let alice = Jid::pn("111");
+        let bob = Jid::pn("222");
+        state.get_or_create_chat(alice.clone(), "Alice".into(), false);
+        state.get_or_create_chat(bob.clone(), "Bob".into(), false);
+        state.chats.get_mut(&bob).unwrap().is_archived = true;
+
+        let main: Vec<String> = state.filtered_chats().iter().map(|c| c.name.clone()).collect();
+        assert!(main.contains(&"Alice".to_string()));
+        assert!(!main.contains(&"Bob".to_string()));
+
+        let archived: Vec<String> = state.archived_chats().iter().map(|c| c.name.clone()).collect();
+        assert_eq!(archived, vec!["Bob".to_string()]);
+
+        // A search is not a listing: it should still find archived chats.
+        state.search_query = "bo".to_string();
+        let found: Vec<String> = state.filtered_chats().iter().map(|c| c.name.clone()).collect();
+        assert_eq!(found, vec!["Bob".to_string()]);
+    }
+
+    #[test]
+    fn next_unread_skips_current_chat_and_archived_ones() {
+        let mut state = AppState::new();
+        let alice = Jid::pn("111");
+        let bob = Jid::pn("222");
+        let carol = Jid::pn("333");
+        for (jid, name) in [(&alice, "Alice"), (&bob, "Bob"), (&carol, "Carol")] {
+            let chat = state.get_or_create_chat(jid.clone(), name.to_string(), false);
+            chat.unread_count = 1;
+        }
+        state.chats.get_mut(&carol).unwrap().is_archived = true;
+
+        assert_eq!(state.next_unread_chat(Some(&alice)), Some(bob.clone()));
+
+        // Only the current chat is unread: pressing again stays there instead
+        // of doing nothing at all.
+        state.chats.get_mut(&bob).unwrap().unread_count = 0;
+        assert_eq!(state.next_unread_chat(Some(&alice)), Some(alice.clone()));
+
+        state.chats.get_mut(&alice).unwrap().unread_count = 0;
+        assert_eq!(state.next_unread_chat(Some(&alice)), None);
+    }
+
+    #[test]
+    fn first_unread_message_is_the_oldest_of_the_unread_block() {
+        let mut state = AppState::new();
+        let chat = Jid::pn("111");
+        state.get_or_create_chat(chat.clone(), "Alice".into(), false);
+        for id in ["m1", "m2", "m3"] {
+            let msg = Message::new_text(
+                id.to_string(),
+                chat.clone(),
+                chat.clone(),
+                format!("text {id}"),
+                Utc::now(),
+                false,
+                MessageStatus::Sent,
+                None,
+                None,
+            );
+            state.messages.entry(chat.clone()).or_default().push(msg);
+        }
+
+        state.chats.get_mut(&chat).unwrap().unread_count = 2;
+        assert_eq!(state.first_unread_message_id(&chat).as_deref(), Some("m2"));
+
+        state.chats.get_mut(&chat).unwrap().unread_count = 0;
+        assert_eq!(state.first_unread_message_id(&chat), None);
+    }
 
     #[test]
     fn draft_is_stashed_and_restored_per_chat() {
