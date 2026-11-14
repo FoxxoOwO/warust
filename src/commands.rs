@@ -21,6 +21,8 @@ pub enum Command {
         to: Jid,
         text: String,
         reply_to: Option<String>,
+        /// JIDs named via `@Jméno` in the body (group mentions).
+        mentioned_jid: Vec<String>,
     },
     SendMessage {
         to: Jid,
@@ -310,11 +312,11 @@ pub enum Command {
 #[allow(dead_code)]
 impl Command {
     pub fn send_text(to: Jid, text: String) -> Self {
-        Self::SendText { to, text, reply_to: None }
+        Self::SendText { to, text, reply_to: None, mentioned_jid: Vec::new() }
     }
     
     pub fn send_text_reply(to: Jid, text: String, reply_to: String) -> Self {
-        Self::SendText { to, text, reply_to: Some(reply_to) }
+        Self::SendText { to, text, reply_to: Some(reply_to), mentioned_jid: Vec::new() }
     }
 
     pub fn edit_text(to: Jid, message_id: String, text: String) -> Self {

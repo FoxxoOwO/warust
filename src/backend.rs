@@ -26,6 +26,27 @@ pub struct CallManager {
     pub video_tx: tokio::sync::Mutex<Option<async_channel::Sender<Vec<u8>>>>,
 }
 
+/// Whether the message names us through `ContextInfo.mentioned_jid` (a group @mention).
+///
+/// Mentions are plain JID strings, so the comparison ignores any device suffix
+/// and looks at the user part only.
+fn message_mentions_me(message: &wa::Message, state: &crate::state::AppState) -> bool {
+    let Some(ctx) = find_context_info_ref(message) else {
+        return false;
+    };
+    if ctx.mentioned_jid.is_empty() {
+        return false;
+    }
+    let Some(me) = state.self_jid.as_ref() else {
+        return false;
+    };
+    let me = me.to_string();
+    let me_user = me.split('@').next().unwrap_or_default();
+    ctx.mentioned_jid
+        .iter()
+        .any(|mentioned| mentioned.split('@').next().unwrap_or_default() == me_user)
+}
+
 /// Helper function to find ContextInfo in a message (replaces find_context_info_ref! macro)
 fn find_context_info_ref(message: &wa::Message) -> Option<&wa::ContextInfo> {
     // Check all message types that can carry ContextInfo
@@ -1081,6 +1102,9 @@ async fn handle_incoming_message(
         }
     }
     
+    // A message that names us deserves a louder ping than a plain one.
+    let mentioned_me = !from_me && message_mentions_me(&message, &state.read());
+
     // Desktop notification / chime for messages the user is not looking at.
     // Muted chats stay silent; previews honour the privacy preference.
     if !from_me {
@@ -1112,11 +1136,14 @@ async fn handle_incoming_message(
         };
 
         if !muted {
-            let body = if show_previews {
+            let mut body = if show_previews {
                 crate::notifications::preview(&text)
             } else {
                 "Nová zpráva".to_string()
             };
+            if mentioned_me {
+                body = format!("Zmínka · {body}");
+            }
             if desktop {
                 crate::notifications::notify(&title, &body, sound);
             } else if sound {
@@ -2231,21 +2258,31 @@ async fn handle_command(
             let _ = tx_status.send(ConnectionStatus::Connected);
         }
 
-        Command::SendText { to, text, reply_to } => {
+        Command::SendText { to, text, reply_to, mentioned_jid } => {
             let canon_to = state.read().canonical_jid(&to);
-            let mut msg = wa::Message::text(text.clone());
+            let mut context: Option<wa::ContextInfo> = None;
             if let Some(ref reply_id) = reply_to {
                 if let Some(reply_msg) = state.read().get_chat_messages(&canon_to).and_then(|msgs| msgs.iter().find(|m| m.id == *reply_id)) {
-                    let context = build_quote_context_with_info(
+                    context = Some(build_quote_context_with_info(
                         reply_id,
                         &reply_msg.sender_jid,
                         &canon_to,
                         &canon_to,
                         &wa::Message::default(),
-                    );
-                    msg = wa::Message::text_with_context(text.clone(), context);
+                    ));
                 }
             }
+            // Mentions share ContextInfo with a quote, so a reply that also names
+            // somebody keeps both.
+            if !mentioned_jid.is_empty() {
+                let mut ctx = context.unwrap_or_default();
+                ctx.mentioned_jid = mentioned_jid;
+                context = Some(ctx);
+            }
+            let msg = match context {
+                Some(ctx) => wa::Message::text_with_context(text.clone(), ctx),
+                None => wa::Message::text(text.clone()),
+            };
             let res = client.send_message(canon_to.clone(), msg).await?;
             let sender = client.pn().or(client.lid()).unwrap_or_else(|| canon_to.clone());
             let message = Message::new_text(
