@@ -7,6 +7,7 @@ pub mod contacts_dialog;
 pub mod confirm_dialog;
 pub mod conversation;
 pub mod group_dialog;
+pub mod poll_dialog;
 pub mod qr_pairing;
 pub mod settings;
 pub mod export_dialog;
@@ -32,6 +33,12 @@ pub fn open_chat(state: &mut AppState, jid: &Jid, backend: &BackendHandle) {
     let canon = state.canonical_jid(jid);
     // Message ids only mean something inside one chat.
     state.selected_messages.clear();
+    // A half-filled poll belongs to the chat it was opened from.
+    if state.new_poll.as_ref().is_some_and(|draft| draft.chat_jid != canon) {
+        crate::ui::poll_dialog::cancel(state);
+    }
+    state.poll_draft = None;
+    state.jump_target = None;
     state.selected_chat = Some(canon.clone());
 
     let target_key = if state.chats.contains_key(&canon) {

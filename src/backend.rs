@@ -678,6 +678,129 @@ pub async fn spawn_backend(state: SharedState) -> Result<BackendHandle> {
     })
 }
 
+/// Pull a poll's question, options and vote secret out of a creation stanza.
+///
+/// Single-choice polls travel as `poll_creation_message_v3`, multi-choice as
+/// `poll_creation_message`, and older peers as `poll_creation_message_v2`; all
+/// three share one proto shape.
+fn extract_poll_creation(message: &wa::Message, sender: &Jid) -> Option<crate::state::PollData> {
+    let base = message.get_base_message();
+    let poll = base
+        .poll_creation_message_v3
+        .as_option()
+        .or_else(|| base.poll_creation_message_v2.as_option())
+        .or_else(|| base.poll_creation_message.as_option())?;
+    let question = poll.name.clone().unwrap_or_default();
+    let options: Vec<String> = poll
+        .options
+        .iter()
+        .filter_map(|opt| opt.option_name.clone())
+        .filter(|name| !name.is_empty())
+        .collect();
+    if question.is_empty() || options.is_empty() {
+        return None;
+    }
+    // Voters derive their encryption keys from the secret WhatsApp embeds in
+    // the creation stanza's context info. Without it no vote can be read, so a
+    // poll received without one simply shows zero tallies.
+    let secret = base
+        .message_context_info
+        .as_option()
+        .and_then(|ctx| ctx.message_secret.clone())
+        .unwrap_or_default();
+    let is_quiz = poll.poll_type == Some(wa::message::PollType::QUIZ)
+        || poll.correct_answer.as_option().is_some();
+    Some(crate::state::PollData {
+        question,
+        options,
+        selectable_count: poll.selectable_options_count.unwrap_or(1),
+        secret,
+        creator: sender.clone(),
+        votes: std::collections::HashMap::new(),
+        is_quiz,
+    })
+}
+
+/// Decrypt one inbound vote and fold it into the stored poll's tally.
+///
+/// Votes are separate messages carrying only ciphertext, so they are never
+/// stored as bubbles: the option hashes are mapped back to the option names we
+/// keep for the poll and counted from there.
+async fn apply_poll_vote(
+    client: Arc<Client>,
+    state: SharedState,
+    chat_jid: Jid,
+    poll_id: String,
+    payload: Vec<u8>,
+    iv: Vec<u8>,
+    voter: Jid,
+    is_group: bool,
+) {
+    if poll_id.is_empty() {
+        return;
+    }
+    let found = {
+        let s = state.read();
+        let canon = if is_group { chat_jid.clone() } else { s.canonical_jid(&chat_jid) };
+        s.messages
+            .get(&canon)
+            .and_then(|msgs| msgs.iter().find(|m| m.id == poll_id))
+            .and_then(|m| m.poll.as_ref())
+            .map(|p| (canon, p.secret.clone(), p.creator.clone(), p.options.clone()))
+    };
+    let Some((canon, secret, creator, options)) = found else {
+        // The creation stanza has not landed (or was pruned): nothing to count.
+        debug!("Vote for unknown poll {} in {}", poll_id, chat_jid);
+        return;
+    };
+    if secret.is_empty() {
+        debug!("Vote for poll {} dropped: no message secret", poll_id);
+        return;
+    }
+    let ciphertext = whatsapp_rust::wacore::poll::PollVoteCiphertext {
+        enc_payload: &payload,
+        enc_iv: &iv,
+    };
+    let hashes = match client
+        .polls()
+        .decrypt_vote(ciphertext, &secret, &poll_id, &creator, &voter)
+        .await
+    {
+        Ok(hashes) => hashes,
+        Err(err) => {
+            debug!("Undecryptable vote for poll {} from {}: {}", poll_id, voter, err);
+            return;
+        }
+    };
+    let picked: Vec<String> = hashes
+        .iter()
+        .filter_map(|hash| {
+            options
+                .iter()
+                .find(|name| {
+                    whatsapp_rust::wacore::poll::compute_option_hash(name).as_slice() == hash.as_slice()
+                })
+                .cloned()
+        })
+        .collect();
+    {
+        let mut s = state.write();
+        let mut touched = false;
+        if let Some(msgs) = s.messages.get_mut(&canon) {
+            if let Some(msg) = msgs.iter_mut().find(|m| m.id == poll_id) {
+                if let Some(poll) = msg.poll.as_mut() {
+                    poll.votes.insert(voter.to_string(), picked);
+                    touched = true;
+                }
+            }
+        }
+        if touched {
+            s.dirty = true;
+        }
+    }
+    let _ = crate::storage::persist_state(&state).await;
+}
+
 async fn handle_incoming_message(
     info: MessageInfo,
     message: wa::Message,
@@ -757,6 +880,33 @@ async fn handle_incoming_message(
         return;
     }
 
+    // Poll votes arrive as their own messages. They must never become bubbles:
+    // the ciphertext is opened with the poll's secret and merged into its tally.
+    if let Some(update) = base_msg.poll_update_message.as_option() {
+        let poll_id = update
+            .poll_creation_message_key
+            .as_option()
+            .and_then(|key| key.id.clone())
+            .unwrap_or_default();
+        let enc = update.vote.as_option();
+        let payload = enc.and_then(|v| v.enc_payload.clone());
+        let iv = enc.and_then(|v| v.enc_iv.clone());
+        if let (Some(payload), Some(iv)) = (payload, iv) {
+            apply_poll_vote(
+                client.clone(),
+                state.clone(),
+                chat_jid.clone(),
+                poll_id,
+                payload,
+                iv,
+                sender_jid.clone(),
+                info.source.is_group,
+            )
+            .await;
+        }
+        return;
+    }
+
     // Extract text content
     let text = extract_message_text(&message).to_string();
     
@@ -810,6 +960,10 @@ async fn handle_incoming_message(
         msg.media_jpeg_thumbnail = media.jpeg_thumbnail;
     }
     
+    if let Some(poll) = extract_poll_creation(&message, &sender_jid) {
+        msg.poll = Some(poll);
+    }
+
     // Update state
     {
         let mut s = state.write();
@@ -1085,8 +1239,19 @@ fn extract_message_text(message: &wa::Message) -> &str {
     if message.reaction_message.is_set() {
         return "";
     }
-    // Check for poll
-    if message.poll_creation_message.is_set() {
+    // Check for poll - the question doubles as the bubble text, the options
+    // are drawn from the structured payload.
+    for poll in [
+        message.poll_creation_message_v3.as_option(),
+        message.poll_creation_message_v2.as_option(),
+        message.poll_creation_message.as_option(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(name) = poll.name.as_deref() {
+            return name;
+        }
         return "[Poll]";
     }
     // Check for poll update
@@ -3018,6 +3183,83 @@ async fn handle_command(
             });
         }
         
+        Command::CreatePoll { chat_jid, question, options, selectable_count } => {
+            let canon_to = state.read().canonical_jid(&chat_jid);
+            let selectable = selectable_count.max(1);
+            match client
+                .polls()
+                .create(canon_to.clone(), &question, &options, selectable)
+                .await
+            {
+                Ok((res, secret)) => {
+                    let sender = client
+                        .pn()
+                        .or(client.lid())
+                        .unwrap_or_else(|| canon_to.clone());
+                    let mut local_msg = Message::new_text(
+                        res.message_id,
+                        canon_to.clone(),
+                        sender.clone(),
+                        question.clone(),
+                        chrono::Utc::now(),
+                        true,
+                        MessageStatus::Sent,
+                        None,
+                        None,
+                    );
+                    local_msg.poll = Some(crate::state::PollData {
+                        question,
+                        options,
+                        selectable_count: selectable,
+                        secret,
+                        creator: sender,
+                        votes: Default::default(),
+                        is_quiz: false,
+                    });
+                    {
+                        let mut s = state.write();
+                        s.add_message(local_msg);
+                        s.consolidate_canonical_chats();
+                    }
+                    let _ = crate::storage::persist_state(&state).await;
+                }
+                Err(err) => error!("Failed to create poll: {err}"),
+            }
+        }
+
+        Command::VotePoll { chat_jid, message_id, poll_creator, message_secret, option_names } => {
+            // Same normalisation as `CreatePoll`: a chat may be addressed by its
+            // LID while the poll lives under the PN (or the other way round).
+            let canon_chat = state.read().canonical_jid(&chat_jid);
+            match client
+                .polls()
+                .vote(canon_chat.clone(), &message_id, &poll_creator, &message_secret, &option_names)
+                .await
+            {
+                Ok(_) => {
+                    let me = client
+                        .pn()
+                        .or(client.lid())
+                        .unwrap_or_else(|| poll_creator.clone())
+                        .to_string();
+                    let mut s = state.write();
+                    let mut touched = false;
+                    if let Some(msgs) = s.messages.get_mut(&canon_chat) {
+                        if let Some(msg) = msgs.iter_mut().find(|m| m.id == message_id) {
+                            if let Some(poll) = msg.poll.as_mut() {
+                                poll.votes.insert(me, option_names);
+                                touched = true;
+                            }
+                        }
+                    }
+                    if touched {
+                        s.dirty = true;
+                    }
+                }
+                Err(err) => error!("Failed to vote in poll {message_id}: {err}"),
+            }
+        }
+
         Command::LeaveGroup { chat_jid } => {
             client.groups().leave(&chat_jid).await?;
             let mut s = state.write();

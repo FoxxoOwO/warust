@@ -349,8 +349,20 @@ fn show_chat_header(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Chat
 fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Chat, messages: &[Message], chat_jid: &Jid, backend: &crate::backend::BackendHandle) {
     let available_height = ui.available_height();
     
-    // Check if we should auto-scroll to bottom
-    let should_scroll_to_bottom = state.auto_scroll_to_bottom;
+    // Check if we should auto-scroll to bottom. A pending jump owns the scroll
+    // position for its first frame instead.
+    let should_scroll_to_bottom = state.auto_scroll_to_bottom && state.jump_target.is_none();
+    // Shared cells, not plain locals: the bubble callbacks are `move` closures
+    // built once per message inside the scroll loop.
+    let poll_click = std::rc::Rc::new(std::cell::RefCell::new(None::<(String, String)>));
+    let poll_submit = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+    let me_jid = state
+        .self_jid
+        .as_ref()
+        .map(|jid| jid.to_string())
+        .unwrap_or_default();
+    // Cloned once: `state` is borrowed again inside the bubble callbacks.
+    let draft_owner = state.poll_draft.clone();
     let mut selected_reply: Option<usize> = None;
     let mut selected_edit: Option<String> = None;
     let mut selected_toggle: Option<String> = None;
@@ -417,7 +429,27 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
                     
                     let sender_name_str = sender_name.as_deref().unwrap_or("");
 
-                    MessageBubble::new(msg, is_own)
+                    let jump_here = state
+                        .jump_target
+                        .as_ref()
+                        .is_some_and(|target| target.message_id == msg.id);
+                    let draft_for_msg = if draft_owner
+                        .as_ref()
+                        .is_some_and(|(id, _)| id == &msg.id)
+                    {
+                        draft_owner
+                            .as_ref()
+                            .map(|(_, names)| names.clone())
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+
+                    // One handle pair per bubble: the callbacks are `move`.
+                    let poll_click_handle = poll_click.clone();
+                    let poll_submit_handle = poll_submit.clone();
+
+                    let bubble_resp = MessageBubble::new(msg, is_own)
                         .show_sender(sender_name_str)
                         .on_reply(|_id| {
                             selected_reply = Some(idx);
@@ -451,8 +483,40 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
                                 *to_open_picker.borrow_mut() = Some(id.to_string());
                             }
                         })
+                        .highlight(jump_here)
+                        .me(me_jid.as_str())
+                        .poll_draft(draft_for_msg)
+                        .on_poll_option({
+                            let msg_id = msg.id.clone();
+                            move |option: String| {
+                                *poll_click_handle.borrow_mut() = Some((msg_id.clone(), option));
+                            }
+                        })
+                        .on_poll_submit({
+                            let msg_id = msg.id.clone();
+                            move || {
+                                *poll_submit_handle.borrow_mut() = Some(msg_id.clone());
+                            }
+                        })
                         .ui(ui);
-                    
+
+                    // Scroll to a jumped-to message once, then let the tint
+                    // fade on its own so the user can keep scrolling.
+                    if jump_here {
+                        let needs_scroll = state
+                            .jump_target
+                            .as_ref()
+                            .map_or(false, |target| !target.scrolled);
+                        if needs_scroll {
+                            ui.scroll_to_rect(bubble_resp.rect, Some(egui::Align::Center));
+                            if let Some(target) = state.jump_target.as_mut() {
+                                target.scrolled = true;
+                            }
+                        }
+                        ui.ctx()
+                            .request_repaint_after(std::time::Duration::from_millis(300));
+                    }
+
                     ui.add_space(2.0);
                 }
             }
@@ -504,6 +568,121 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
             message_id: id,
         });
     }
+
+    let clicked_option = poll_click.borrow().clone();
+    let submitted_poll = poll_submit.borrow().clone();
+    if let Some((message_id, option)) = clicked_option {
+        poll_option_clicked(state, messages, chat_jid, &message_id, &option, backend);
+    }
+    if let Some(message_id) = submitted_poll {
+        poll_submit_clicked(state, messages, chat_jid, &message_id, backend);
+    }
+
+    // The highlight is a short flash, not a mode: drop it once it has served
+    // its purpose so auto-scroll takes over again.
+    if state.jump_target.as_ref().is_some_and(|target| target.expired()) {
+        state.jump_target = None;
+    }
+}
+
+/// Click on one poll option. Single-choice polls replace the vote at once,
+/// the way WhatsApp Web does; multi-choice polls only move a tick and wait for
+/// the "Hlasovat" button.
+fn poll_option_clicked(
+    state: &mut AppState,
+    messages: &[Message],
+    chat_jid: &Jid,
+    message_id: &str,
+    option: &str,
+    backend: &crate::backend::BackendHandle,
+) {
+    let Some(poll) = messages
+        .iter()
+        .find(|m| m.id == message_id)
+        .and_then(|m| m.poll.clone())
+    else {
+        return;
+    };
+    let me = state
+        .self_jid
+        .as_ref()
+        .map(|jid| jid.to_string())
+        .unwrap_or_default();
+
+    if !poll.is_multi() {
+        // Tapping the ticked option clears the vote, like WhatsApp Web.
+        let selection = if poll.my_vote(&me).iter().any(|picked| picked == option) {
+            Vec::new()
+        } else {
+            vec![option.to_string()]
+        };
+        state.poll_draft = None;
+        send_vote(chat_jid, &poll, message_id, selection, backend);
+        return;
+    }
+
+    let limit = if poll.selectable_count == 0 {
+        poll.options.len()
+    } else {
+        poll.selectable_count as usize
+    };
+    let draft = state
+        .poll_draft
+        .get_or_insert_with(|| (message_id.to_string(), Vec::new()));
+    if draft.0 != message_id {
+        *draft = (message_id.to_string(), Vec::new());
+    }
+    let picked = &mut draft.1;
+    if let Some(pos) = picked.iter().position(|name| name == option) {
+        picked.remove(pos);
+    } else if picked.len() < limit {
+        picked.push(option.to_string());
+    }
+}
+
+/// Commit the ticks of a multi-choice poll.
+fn poll_submit_clicked(
+    state: &mut AppState,
+    messages: &[Message],
+    chat_jid: &Jid,
+    message_id: &str,
+    backend: &crate::backend::BackendHandle,
+) {
+    let Some(poll) = messages
+        .iter()
+        .find(|m| m.id == message_id)
+        .and_then(|m| m.poll.clone())
+    else {
+        return;
+    };
+    let Some((owner, selection)) = state.poll_draft.take() else {
+        return;
+    };
+    if owner != message_id || selection.is_empty() {
+        return;
+    }
+    send_vote(chat_jid, &poll, message_id, selection, backend);
+}
+
+/// Hand a vote to the backend. Polls received without a secret cannot be voted
+/// on at all: the encryption key is derived from it.
+fn send_vote(
+    chat_jid: &Jid,
+    poll: &crate::state::PollData,
+    message_id: &str,
+    selection: Vec<String>,
+    backend: &crate::backend::BackendHandle,
+) {
+    if poll.secret.is_empty() {
+        return;
+    }
+    let _ = backend.send_command(Command::VotePoll {
+        chat_jid: chat_jid.clone(),
+        message_id: message_id.to_string(),
+        poll_creator: poll.creator.clone(),
+        message_secret: poll.secret.clone(),
+        option_names: selection,
+    });
 }
 
 fn show_date_separator(ui: &mut Ui, date: chrono::NaiveDate) {
@@ -804,6 +983,17 @@ fn show_composer(ui: &mut Ui, state: &mut AppState, chat_jid: &Jid, backend: &cr
                     if let Some(path) = crate::media::pick_file() {
                         state.pending_attachment = Some(path);
                     }
+                }
+
+                // Poll button
+                let poll_btn = ui.add(
+                    egui::Button::new(RichText::new("📊").font(FontId::proportional(18.0)))
+                        .frame(false)
+                        .fill(Color32::TRANSPARENT)
+                ).on_hover_text("Vytvořit anketu");
+
+                if poll_btn.clicked() {
+                    state.new_poll = Some(crate::state::NewPollState::new(chat_jid.clone()));
                 }
 
                 // Emoji picker button

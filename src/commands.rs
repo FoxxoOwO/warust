@@ -224,6 +224,22 @@ pub enum Command {
         chat_jid: Jid,
         enabled: bool,
     },
+    /// Create a poll in a chat. `selectable_count` is 1 for single choice.
+    /// The message secret the vendor returns is kept so votes can be read.
+    CreatePoll {
+        chat_jid: Jid,
+        question: String,
+        options: Vec<String>,
+        selectable_count: u32,
+    },
+    /// Vote on an existing poll. `option_names` are the full selection.
+    VotePoll {
+        chat_jid: Jid,
+        message_id: String,
+        poll_creator: Jid,
+        message_secret: Vec<u8>,
+        option_names: Vec<String>,
+    },
     
     // Presence
     SetPresence {

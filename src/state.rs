@@ -92,6 +92,81 @@ fn is_false(value: &bool) -> bool {
 
 /// Serde default for the `edited` marker; `skip_serializing_if` keeps the
 /// ~2000-byte-per-message JSON from carrying a `false` on every row.
+/// A poll attached to a message (both polls we and our peers created).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PollData {
+    pub question: String,
+    pub options: Vec<String>,
+    /// 1 = single choice, 2+ = up to N choices, 0 = unlimited.
+    pub selectable_count: u32,
+    /// 32-byte secret from the creation stanza. Votes are unusable without it.
+    pub secret: Vec<u8>,
+    /// Who created the poll: vote decryption is keyed on it.
+    pub creator: Jid,
+    /// Decrypted votes: voter (string form) → picked option names.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub votes: HashMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_quiz: bool,
+}
+
+impl PollData {
+    /// Vote count per option name, in option order.
+    pub fn tallies(&self) -> Vec<(String, usize)> {
+        self.options
+            .iter()
+            .map(|name| {
+                let count = self
+                    .votes
+                    .values()
+                    .filter(|picked| picked.iter().any(|p| p == name))
+                    .count();
+                (name.clone(), count)
+            })
+            .collect()
+    }
+
+    pub fn total_voters(&self) -> usize {
+        self.votes.len()
+    }
+
+    /// Names this user already voted for, if any.
+    pub fn my_vote(&self, me: &str) -> Vec<String> {
+        self.votes.get(me).cloned().unwrap_or_default()
+    }
+
+    pub fn is_multi(&self) -> bool {
+        self.selectable_count != 1
+    }
+}
+
+/// A message the UI should scroll to and flash briefly (search results,
+/// replies, forwarded jumps).
+#[derive(Debug, Clone)]
+pub struct JumpTarget {
+    pub message_id: String,
+    pub at: std::time::Instant,
+    /// Set once the view scrolled here, so later frames do not yank the scroll
+    /// position back while the tint fades out.
+    pub scrolled: bool,
+}
+
+impl JumpTarget {
+    pub const LIFETIME: std::time::Duration = std::time::Duration::from_millis(2500);
+
+    pub fn new(message_id: impl Into<String>) -> Self {
+        Self {
+            message_id: message_id.into(),
+            at: std::time::Instant::now(),
+            scrolled: false,
+        }
+    }
+
+    pub fn expired(&self) -> bool {
+        self.at.elapsed() > Self::LIFETIME
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub id: String,
@@ -133,6 +208,9 @@ pub struct Message {
     pub media_caption: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_jpeg_thumbnail: Option<Vec<u8>>,
+    // Poll fields
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll: Option<PollData>,
 }
 
 impl Message {
@@ -169,6 +247,7 @@ impl Message {
             media_mimetype: None,
             media_caption: None,
             media_jpeg_thumbnail: None,
+            poll: None,
         }
     }
 }
@@ -391,6 +470,61 @@ pub struct AddMemberState {
     pub selected: HashSet<Jid>,
 }
 
+/// State of the "create poll" dialog.
+#[derive(Debug, Clone)]
+pub struct NewPollState {
+    pub chat_jid: Jid,
+    pub question: String,
+    pub options: Vec<String>,
+    /// Multi-choice poll instead of single choice.
+    pub multi: bool,
+    pub error: Option<String>,
+}
+
+impl NewPollState {
+    pub fn new(chat_jid: Jid) -> Self {
+        Self {
+            chat_jid,
+            question: String::new(),
+            // WhatsApp starts a poll with two empty option rows.
+            options: vec![String::new(), String::new()],
+            multi: false,
+            error: None,
+        }
+    }
+
+    /// Options that actually have text, in order, trimmed.
+    pub fn filled_options(&self) -> Vec<String> {
+        self.options
+            .iter()
+            .map(|opt| opt.trim().to_string())
+            .filter(|opt| !opt.is_empty())
+            .collect()
+    }
+
+    /// Why the poll cannot be created yet, if it cannot.
+    pub fn validation_error(&self) -> Option<String> {
+        if self.question.trim().is_empty() {
+            return Some("Zadej otázku ankety".into());
+        }
+        let options = self.filled_options();
+        if options.len() < 2 {
+            return Some("Anketa potřebuje alespoň dvě možnosti".into());
+        }
+        if options.len() > 12 {
+            return Some("Anketa povoluje nejvýše 12 možností".into());
+        }
+        // Case-insensitive: WhatsApp treats "Ano" and "ano" as the same answer,
+        // and voters would not tell them apart in the tally either.
+        let unique: std::collections::HashSet<String> =
+            options.iter().map(|option| option.to_lowercase()).collect();
+        if unique.len() != options.len() {
+            return Some("Možnosti se nesmí opakovat".into());
+        }
+        None
+    }
+}
+
 /// A destructive action that asks for confirmation first.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConfirmRequest {
@@ -532,6 +666,16 @@ pub struct AppState {
     /// missing entry means the timer is off.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub ephemeral: HashMap<Jid, u32>,
+    // Polls
+    /// Create-poll dialog, `None` when closed.
+    #[serde(skip)]
+    pub new_poll: Option<NewPollState>,
+    /// Multi-choice poll being composed: (message id, selected option names).
+    #[serde(skip)]
+    pub poll_draft: Option<(String, Vec<String>)>,
+    /// Message the UI should scroll to and flash briefly (search, replies).
+    #[serde(skip)]
+    pub jump_target: Option<JumpTarget>,
 }
 
 impl Default for AppState {
@@ -591,6 +735,9 @@ impl Default for AppState {
             forward_dialog: None,
             show_chat_info: false,
             ephemeral: HashMap::new(),
+            new_poll: None,
+            poll_draft: None,
+            jump_target: None,
         }
     }
 }
@@ -1799,5 +1946,133 @@ mod selection_tests {
         assert_eq!(info.subject, "Rodina");
         assert_eq!(info.description.as_deref(), Some("Naše skupina"));
         assert!(info.is_admin(&jid()), "admin flags survive the round trip");
+    }
+    #[test]
+    fn poll_tallies_follow_option_order() {
+        let mut poll = PollData {
+            question: "Kde jíme?".into(),
+            options: vec!["Pizza".into(), "Sushi".into(), "Kebab".into()],
+            selectable_count: 1,
+            secret: vec![1, 2, 3],
+            creator: jid(),
+            votes: Default::default(),
+            is_quiz: false,
+        };
+        poll.votes.insert("a@s.whatsapp.net".into(), vec!["Sushi".into()]);
+        poll.votes
+            .insert("b@s.whatsapp.net".into(), vec!["Sushi".into()]);
+        poll.votes.insert("c@s.whatsapp.net".into(), vec!["Kebab".into()]);
+
+        assert_eq!(
+            poll.tallies(),
+            vec![
+                ("Pizza".to_string(), 0),
+                ("Sushi".to_string(), 2),
+                ("Kebab".to_string(), 1)
+            ],
+            "tallies keep the poll's own option order, not vote order"
+        );
+        assert_eq!(poll.total_voters(), 3);
+    }
+
+    #[test]
+    fn poll_my_vote_only_reports_own_selection() {
+        let me = jid().to_string();
+        let mut poll = PollData {
+            question: "Termín?".into(),
+            options: vec!["Pondělí".into(), "Úterý".into()],
+            selectable_count: 2,
+            secret: Vec::new(),
+            creator: jid(),
+            votes: Default::default(),
+            is_quiz: false,
+        };
+        poll.votes
+            .insert(me.clone(), vec!["Pondělí".into(), "Úterý".into()]);
+        poll.votes.insert(
+            "other@s.whatsapp.net".into(),
+            vec!["Pondělí".into()],
+        );
+
+        assert!(poll.is_multi(), "two selectable answers is a multi poll");
+        assert_eq!(poll.my_vote(&me), vec!["Pondělí", "Úterý"]);
+        assert!(poll.my_vote("nobody@s.whatsapp.net").is_empty());
+    }
+
+    #[test]
+    fn new_poll_validation_catches_bad_input() {
+        let mut draft = NewPollState::new(jid());
+
+        draft.question = "  ".into();
+        draft.options = vec!["A".into(), "B".into()];
+        assert!(draft.validation_error().is_some(), "an empty question is rejected");
+
+        draft.question = "Kde?".into();
+        draft.options = vec!["A".into(), "  ".into()];
+        assert!(
+            draft.validation_error().is_some(),
+            "a blank option leaves fewer than two candidates"
+        );
+
+        draft.options = vec!["A".into(), "a".into()];
+        assert!(
+            draft.validation_error().is_some(),
+            "options differ only by case and must not be counted twice"
+        );
+
+        draft.options = vec!["A".into(), "B".into(), "C".into()];
+        assert_eq!(draft.filled_options(), vec!["A", "B", "C"]);
+        assert!(draft.validation_error().is_none(), "three distinct options are fine");
+    }
+
+    #[test]
+    fn poll_round_trips_through_json() {
+        // Serialized per message: `AppState` itself keys its maps by `Jid`,
+        // which serde_json refuses as a key (persistence goes through
+        // `storage::PersistedState` with string keys instead).
+        let chat = jid();
+        let mut poll = PollData {
+            question: "Kdo jde?".into(),
+            options: vec!["Já".into(), "Ty".into()],
+            selectable_count: 1,
+            secret: vec![9, 9, 9],
+            creator: jid(),
+            votes: Default::default(),
+            is_quiz: true,
+        };
+        poll.votes
+            .insert("a@s.whatsapp.net".into(), vec!["Já".into()]);
+        let mut msg = Message::new_text(
+            "POLL123".into(),
+            chat.clone(),
+            chat.clone(),
+            "Kdo jde?".into(),
+            Utc::now(),
+            true,
+            MessageStatus::Sent,
+            None,
+            None,
+        );
+        msg.poll = Some(poll);
+
+        let json = serde_json::to_string(&msg).expect("message serializes");
+        let restored: Message = serde_json::from_str(&json).expect("message deserializes");
+        let poll = restored
+            .poll
+            .as_ref()
+            .expect("the poll survives a restart");
+
+        assert_eq!(poll.question, "Kdo jde?");
+        assert_eq!(poll.secret, vec![9, 9, 9], "the vote key must survive");
+        assert!(poll.is_quiz);
+        assert_eq!(poll.votes.len(), 1);
+    }
+
+    #[test]
+    fn jump_target_starts_unscrolled_and_unexpired() {
+        let target = JumpTarget::new("ABC123");
+        assert_eq!(target.message_id, "ABC123");
+        assert!(!target.scrolled, "the first frame still has to scroll");
+        assert!(!target.expired(), "a fresh target is alive");
     }
 }
