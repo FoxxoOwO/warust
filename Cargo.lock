@@ -5968,7 +5968,7 @@ dependencies = [
 
 [[package]]
 name = "warust"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -5989,6 +5989,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "qrcode",
  "rodio",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",

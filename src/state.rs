@@ -165,6 +165,26 @@ impl JumpTarget {
     pub fn expired(&self) -> bool {
         self.at.elapsed() > Self::LIFETIME
     }
+
+    /// How strongly the jump tint should show right now: a quick rise so the eye
+    /// catches it, a hold, then a longer fall so it leaves on its own.
+    pub fn intensity(&self) -> f32 {
+        const RISE: f32 = 0.18;
+        const FALL: f32 = 0.70;
+        fn smooth(t: f32) -> f32 {
+            let t = t.clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        }
+        let elapsed = self.at.elapsed().as_secs_f32();
+        let total = Self::LIFETIME.as_secs_f32();
+        if elapsed < RISE {
+            smooth(elapsed / RISE)
+        } else if elapsed + FALL < total {
+            1.0
+        } else {
+            smooth((total - elapsed) / FALL)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -375,6 +395,12 @@ pub struct UserPreferences {
     pub close_to_tray: bool,
     #[serde(default)]
     pub start_with_windows: bool,
+    /// Kontrolovat nové verze na pozadí.
+    #[serde(default = "default_true")]
+    pub check_updates: bool,
+    /// Nainstalovat nalezenou aktualizaci bez ptaní.
+    #[serde(default)]
+    pub auto_install_updates: bool,
 }
 
 impl Default for UserPreferences {
@@ -393,6 +419,8 @@ impl Default for UserPreferences {
             run_in_tray: true,
             close_to_tray: true,
             start_with_windows: false,
+            check_updates: true,
+            auto_install_updates: false,
         }
     }
 }
@@ -736,6 +764,15 @@ pub struct AppState {
     /// Cached media-folder scan for the storage tab.
     #[serde(skip)]
     pub storage_scan: Option<(std::time::Instant, crate::media::MediaStats)>,
+    /// Latest release newer than this build, if one was found.
+    #[serde(skip)]
+    pub update_available: Option<crate::updater::UpdateInfo>,
+    /// Progress of the update check.
+    #[serde(skip)]
+    pub update_status: crate::updater::UpdateStatus,
+    /// Whether the update window is open.
+    #[serde(skip)]
+    pub show_update_dialog: bool,
     #[serde(skip)]
     pub emoji_search: String,
     #[serde(skip)]
@@ -839,6 +876,9 @@ impl Default for AppState {
             palette_index: 0,
             clipboard_error: None,
             storage_scan: None,
+            update_available: None,
+            update_status: crate::updater::UpdateStatus::default(),
+            show_update_dialog: false,
             emoji_search: String::new(),
             emoji_active_category: 0,
             reaction_picker_target: None,

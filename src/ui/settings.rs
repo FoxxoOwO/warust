@@ -280,7 +280,7 @@ fn show_storage_settings(ui: &mut Ui, s: &mut crate::state::AppState, backend: &
     setting_card(ui, "Verze aplikace", |ui| {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Warust:").strong());
-            ui.monospace(option_env!("CARGO_PKG_VERSION").unwrap_or("0.1.2"));
+            ui.monospace(format!("v{}", crate::updater::CURRENT_VERSION));
         });
         ui.horizontal(|ui| {
             ui.label(RichText::new("whatsapp-rust:").strong());
@@ -399,6 +399,74 @@ fn show_storage_settings(ui: &mut Ui, s: &mut crate::state::AppState, backend: &
                 .font(FontId::proportional(11.0))
                 .color(Color32::from_rgb(0x00, 0xA8, 0x84)),
             );
+        }
+    });
+
+    setting_card(ui, "Aktualizace", |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Nainstalovaná verze:").strong());
+            ui.monospace(format!("v{}", crate::updater::CURRENT_VERSION));
+        });
+        let status = s.update_status.label();
+        if !status.is_empty() {
+            let color = if matches!(s.update_status, crate::updater::UpdateStatus::Failed(_)) {
+                Color32::from_rgb(0xFF, 0x6B, 0x6B)
+            } else {
+                Color32::from_rgb(0x86, 0x96, 0xA0)
+            };
+            ui.label(
+                RichText::new(status)
+                    .font(FontId::proportional(11.5))
+                    .color(color),
+            );
+        }
+        ui.add_space(6.0);
+
+        let busy = s.update_status.is_busy();
+        let mut check_now = false;
+        let mut install_now = false;
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!busy, egui::Button::new("🔄  Zkontrolovat aktualizace"))
+                .clicked()
+            {
+                check_now = true;
+            }
+            if let Some(info) = s.update_available.clone() {
+                let label = if info.has_asset() {
+                    format!("⬇  Stáhnout a nainstalovat v{}", info.version)
+                } else {
+                    format!("⬆  v{} (bez balíčku)", info.version)
+                };
+                if ui
+                    .add_enabled(info.has_asset() && !busy, egui::Button::new(label))
+                    .clicked()
+                {
+                    install_now = true;
+                }
+                if ui.button("Co je nového…").clicked() {
+                    s.show_update_dialog = true;
+                }
+            }
+        });
+
+        ui.add_space(4.0);
+        ui.checkbox(
+            &mut s.preferences.check_updates,
+            "Kontrolovat nové verze na pozadí (každých 6 hodin)",
+        );
+        ui.checkbox(
+            &mut s.preferences.auto_install_updates,
+            "Instalovat aktualizace automaticky (aplikace se restartuje)",
+        );
+
+        if check_now {
+            crate::updater::spawn_check(backend.state.clone());
+        }
+        if install_now {
+            if let Some(info) = s.update_available.clone() {
+                crate::updater::spawn_install(backend.state.clone(), info);
+            }
         }
     });
 

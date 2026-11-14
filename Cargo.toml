@@ -1,6 +1,6 @@
 [package]
 name = "warust"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "WhatsApp desktop client in Rust (egui + whatsapp-rust)"
 license = "MIT OR Apache-2.0"
@@ -33,6 +33,7 @@ epaint = { version = "0.37", features = ["color_fonts"] }
 qrcode = { version = "0.14", features = ["image"] }
 image = "0.25"
 arboard = "3.7"
+semver = "1"
 ureq = "3"
 
 # --- Async & Runtime ---
