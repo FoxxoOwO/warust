@@ -9,7 +9,7 @@ use crate::ui::components::{Avatar, ChatItem};
 /// Chat list panel - left sidebar like WhatsApp Web
 pub fn show_chat_list(ui: &mut Ui, state: &SharedState, backend: &crate::backend::BackendHandle) {
     let mut s = state.write();
-    
+
     // Panel frame with WhatsApp background
     Frame::new()
         .fill(chat_list::BACKGROUND)
@@ -17,61 +17,79 @@ pub fn show_chat_list(ui: &mut Ui, state: &SharedState, backend: &crate::backend
         .show(ui, |ui| {
             ui.vertical(|ui| {
                 // Header bar with search
-                show_header(ui, &mut s, backend);
-                
+                let jump_requested = show_header(ui, &mut s, backend);
+
                 ui.separator();
-                
+
                 // Connection status indicator
                 show_connection_status(ui, &s, backend);
-                
-                // Chat list
+
                 let chats = s.filtered_chats();
-                let mut clicked_jid = None;
-                let mut edit_contact_req = None;
-                let mut export_chat_req = None;
-                let mut schedule_chat_req = None;
-                let mut info_chat_req = None;
-                let mut confirm_req = None;
-                
+                let archived = s.archived_chats();
+                let show_archived = s.show_archived;
+                let mut toggle_archived = false;
+                let mut actions = ListActions::default();
+
                 ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
                     .show(ui, |ui| {
                         ui.add_space(4.0);
-                        
+
                         if chats.is_empty() {
                             show_empty_state(ui);
                         } else {
                             for chat in &chats {
                                 let is_selected = s.selected_chat.as_ref() == Some(&chat.jid);
-                                let jid = chat.jid.clone();
-                                
-                                let draft = s.drafts.get(&jid).map(|d| d.as_str());
-                                let response = ChatItem::new(chat, is_selected)
-                                    .draft(draft)
-                                    .ui(ui);
-                                
-                                if response.clicked() {
-                                    clicked_jid = Some(jid.clone());
-                                }
-                                
-                                // Context menu
-                                response.context_menu(|ui| {
-                                    show_chat_context_menu(ui, chat, backend, &mut edit_contact_req, &mut export_chat_req, &mut schedule_chat_req, &mut info_chat_req, &mut confirm_req);
-                                });
-                                
+                                let draft = s.drafts.get(&chat.jid).map(|d| d.as_str());
+                                show_chat_row(ui, chat, is_selected, draft, backend, &mut actions);
                                 ui.add_space(1.0);
                             }
                         }
+
+                        // Archived chats keep out of the way until asked for.
+                        if !archived.is_empty() {
+                            ui.add_space(6.0);
+                            let arrow = if show_archived { "▾" } else { "▸" };
+                            let label = format!("{arrow}  Archivované ({})", archived.len());
+                            let toggle = ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(label).font(FontId::proportional(13.0)),
+                                    )
+                                    .frame(false)
+                                    .fill(Color32::TRANSPARENT),
+                                )
+                                .on_hover_text("Zobrazit archivované chaty");
+                            if toggle.clicked() {
+                                toggle_archived = true;
+                            }
+
+                            if show_archived {
+                                ui.add_space(2.0);
+                                for chat in &archived {
+                                    let is_selected = s.selected_chat.as_ref() == Some(&chat.jid);
+                                    let draft = s.drafts.get(&chat.jid).map(|d| d.as_str());
+                                    show_chat_row(ui, chat, is_selected, draft, backend, &mut actions);
+                                    ui.add_space(1.0);
+                                }
+                            }
+                        }
+
+                        ui.add_space(8.0);
                     });
-                
-                if let Some(req) = confirm_req {
+
+                if toggle_archived {
+                    s.show_archived = !show_archived;
+                }
+
+                if let Some(req) = actions.confirm.take() {
                     s.confirm = Some(req);
                 }
-                if let Some((jid, name)) = edit_contact_req {
+                if let Some((jid, name)) = actions.edit_contact.take() {
                     s.editing_contact = Some((jid, name));
                 }
-                if let Some((jid, name)) = export_chat_req {
+                if let Some((jid, name)) = actions.export_chat.take() {
                     s.export_dialog = Some(crate::state::ExportDialogState {
                         chat_jid: jid,
                         chat_name: name,
@@ -80,33 +98,28 @@ pub fn show_chat_list(ui: &mut Ui, state: &SharedState, backend: &crate::backend
                         exported_path: None,
                     });
                 }
-                if let Some(jid) = schedule_chat_req {
+                if let Some(jid) = actions.schedule_chat.take() {
                     s.schedule_target_chat = Some(jid);
                     s.show_schedule_dialog = true;
                 }
 
                 // "Contact info" selects the chat first, then opens the panel.
-                let info_requested = info_chat_req.is_some();
-                if clicked_jid.is_none() {
-                    clicked_jid = info_chat_req.take();
+                let info_requested = actions.info_chat.is_some();
+                if actions.clicked.is_none() {
+                    actions.clicked = actions.info_chat.take();
                 }
 
-                if let Some(jid) = clicked_jid {
-                    let canon = s.canonical_jid(&jid);
-                    // Message ids only mean something inside one chat.
-                    s.selected_messages.clear();
-                    s.selected_chat = Some(canon.clone());
-                    let target_key = if s.chats.contains_key(&canon) { canon.clone() } else { jid.clone() };
-                    if let Some(chat_mut) = s.chats.get_mut(&target_key) {
-                        chat_mut.unread_count = 0;
-                    }
-                    let has_messages = s.messages.get(&canon).map_or(false, |m| !m.is_empty());
-                    let _ = backend.send_command(crate::commands::Command::SelectChat { chat_jid: Some(canon.clone()) });
-                    if !has_messages {
-                        let _ = backend.send_command(crate::commands::Command::RequestHistorySync {
-                            chat_jid: Some(canon),
-                            count: 50,
-                        });
+                if let Some(jid) = actions.clicked.take() {
+                    crate::ui::open_chat(&mut s, &jid, backend);
+                }
+
+                if jump_requested {
+                    if let Some(target) = s.next_unread_chat(s.selected_chat.clone().as_ref()) {
+                        let message_id = s.first_unread_message_id(&target);
+                        crate::ui::open_chat(&mut s, &target, backend);
+                        if let Some(id) = message_id {
+                            s.jump_target = Some(crate::state::JumpTarget::new(id));
+                        }
                     }
                 }
 
@@ -115,6 +128,7 @@ pub fn show_chat_list(ui: &mut Ui, state: &SharedState, backend: &crate::backend
                 }
             });
         });
+
 
     // Modal dialog for editing contact name
     if let Some((jid, current_name)) = &mut s.editing_contact {
@@ -158,7 +172,10 @@ pub fn show_chat_list(ui: &mut Ui, state: &SharedState, backend: &crate::backend
     }
 }
 
-fn show_header(ui: &mut Ui, state: &mut AppState, backend: &crate::backend::BackendHandle) {
+/// Header with search and quick actions. Returns true when the user asked to
+/// jump to the next chat with unread messages.
+fn show_header(ui: &mut Ui, state: &mut AppState, backend: &crate::backend::BackendHandle) -> bool {
+    let mut jump_requested = false;
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.add_space(12.0);
@@ -212,7 +229,31 @@ fn show_header(ui: &mut Ui, state: &mut AppState, backend: &crate::backend::Back
             state.show_new_chat_dialog = !state.show_new_chat_dialog;
             state.new_chat_error = None;
         }
-        
+
+        // Unread backlog: one click walks the chats that still owe an answer.
+        let unread_total: u32 = state
+            .chats
+            .values()
+            .filter(|c| !c.is_archived)
+            .map(|c| c.unread_count)
+            .sum();
+        if unread_total > 0 {
+            let next_btn = ui
+                .add(
+                    egui::Button::new(
+                        RichText::new(format!("⬇ {}", unread_total))
+                            .font(FontId::proportional(13.0)),
+                    )
+                    .frame(true),
+                )
+                .on_hover_text("Skočit na další nepřečtenou zprávu (Alt+↓)");
+            if next_btn.clicked()
+                || ui.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::ArrowDown))
+            {
+                jump_requested = true;
+            }
+        }
+
         ui.add_space(8.0);
     });
     
@@ -313,8 +354,9 @@ fn show_header(ui: &mut Ui, state: &mut AppState, backend: &crate::backend::Back
                 }
             });
     }
-    
+
     ui.add_space(8.0);
+    jump_requested
 }
 
 fn show_connection_status(ui: &mut Ui, state: &AppState, backend: &crate::backend::BackendHandle) {
@@ -500,4 +542,46 @@ fn show_chat_context_menu(
         *info_chat_req = Some(jid.clone());
         ui.close();
     }
+}
+
+
+/// What a row's interactions asked for, collected so the list can be drawn in a
+/// loop while the state is only touched afterwards.
+#[derive(Default)]
+struct ListActions {
+    clicked: Option<whatsapp_rust::wacore_binary::Jid>,
+    edit_contact: Option<(whatsapp_rust::wacore_binary::Jid, String)>,
+    export_chat: Option<(whatsapp_rust::wacore_binary::Jid, String)>,
+    schedule_chat: Option<whatsapp_rust::wacore_binary::Jid>,
+    info_chat: Option<whatsapp_rust::wacore_binary::Jid>,
+    confirm: Option<crate::state::ConfirmRequest>,
+}
+
+/// One row of the chat list, identical in the main and archived sections.
+fn show_chat_row(
+    ui: &mut Ui,
+    chat: &Chat,
+    is_selected: bool,
+    draft: Option<&str>,
+    backend: &crate::backend::BackendHandle,
+    actions: &mut ListActions,
+) {
+    let response = ChatItem::new(chat, is_selected).draft(draft).ui(ui);
+
+    if response.clicked() {
+        actions.clicked = Some(chat.jid.clone());
+    }
+
+    response.context_menu(|ui| {
+        show_chat_context_menu(
+            ui,
+            chat,
+            backend,
+            &mut actions.edit_contact,
+            &mut actions.export_chat,
+            &mut actions.schedule_chat,
+            &mut actions.info_chat,
+            &mut actions.confirm,
+        );
+    });
 }
