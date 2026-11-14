@@ -312,8 +312,30 @@ fn group_details(ui: &mut egui::Ui, state: &mut AppState, chat: &Chat, backend: 
         }
     }
 
-    if snapshot.is_announcement || snapshot.is_locked {
-        ui.add_space(4.0);
+    // Admin switches for the two group-wide restrictions.
+    ui.add_space(4.0);
+    if is_admin {
+        let mut announce = snapshot.is_announcement;
+        if ui
+            .checkbox(&mut announce, "Zprávy mohou psát jen admini")
+            .changed()
+        {
+            let _ = backend.send_command(Command::SetGroupAnnounce {
+                chat_jid: chat.jid.clone(),
+                enabled: announce,
+            });
+        }
+        let mut locked = snapshot.is_locked;
+        if ui
+            .checkbox(&mut locked, "Info skupiny mohou měnit jen admini")
+            .changed()
+        {
+            let _ = backend.send_command(Command::SetGroupLocked {
+                chat_jid: chat.jid.clone(),
+                enabled: locked,
+            });
+        }
+    } else {
         if snapshot.is_announcement {
             info_row(ui, "Zprávy", "jen administrátoři");
         }
