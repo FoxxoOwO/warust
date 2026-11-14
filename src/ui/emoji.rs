@@ -265,7 +265,7 @@ pub fn show_emoji_picker(
                         ui.spacing_mut().item_spacing = vec2(3.0, 3.0);
                         for &emoji in &emojis_to_show {
                             let btn = egui::Button::new(
-                                RichText::new(emoji).font(FontId::proportional(20.0))
+                                RichText::new(emoji).font(crate::theme::message_font(20.0))
                             )
                             .fill(Color32::TRANSPARENT)
                             .corner_radius(CornerRadius::same(6))

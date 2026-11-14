@@ -69,23 +69,30 @@ pub fn setup_theme(ctx: &egui::Context) {
     fonts.families.entry(FontFamily::Name("Bold".into())).or_default()
         .push("noto_sans_bold".into());
 
+    // Dedicated "Message" font family for message bodies, reactions, and emoji picker
+    // where color emojis are prioritized over monochrome symbol fonts.
+    let mut message_family: Vec<String> = vec!["noto_sans".into()];
+
     #[cfg(windows)]
     {
-        if let Ok(data) = std::fs::read(r"C:\Windows\Fonts\seguiemj.ttf") {
-            fonts.font_data.insert(
-                "segoe_emoji".into(),
-                Arc::new(FontData::from_owned(data)),
-            );
-            fonts.families.get_mut(&FontFamily::Proportional).unwrap().push("segoe_emoji".into());
-            fonts.families.get_mut(&FontFamily::Monospace).unwrap().push("segoe_emoji".into());
-        }
         if let Ok(data) = std::fs::read(r"C:\Windows\Fonts\seguisym.ttf") {
             fonts.font_data.insert(
                 "segoe_symbol".into(),
                 Arc::new(FontData::from_owned(data)),
             );
-            fonts.families.get_mut(&FontFamily::Proportional).unwrap().push("segoe_symbol".into());
-            fonts.families.get_mut(&FontFamily::Monospace).unwrap().push("segoe_symbol".into());
+            // Put monochrome symbol font before default emoji fonts in UI families
+            fonts.families.get_mut(&FontFamily::Proportional).unwrap().insert(1, "segoe_symbol".into());
+            fonts.families.get_mut(&FontFamily::Monospace).unwrap().insert(1, "segoe_symbol".into());
+        }
+        if let Ok(data) = std::fs::read(r"C:\Windows\Fonts\seguiemj.ttf") {
+            fonts.font_data.insert(
+                "segoe_emoji".into(),
+                Arc::new(FontData::from_owned(data)),
+            );
+            message_family.push("segoe_emoji".into());
+        }
+        if fonts.font_data.contains_key("segoe_symbol") {
+            message_family.push("segoe_symbol".into());
         }
     }
 
@@ -96,8 +103,7 @@ pub fn setup_theme(ctx: &egui::Context) {
                 "apple_color_emoji".into(),
                 Arc::new(FontData::from_owned(data)),
             );
-            fonts.families.get_mut(&FontFamily::Proportional).unwrap().push("apple_color_emoji".into());
-            fonts.families.get_mut(&FontFamily::Monospace).unwrap().push("apple_color_emoji".into());
+            message_family.push("apple_color_emoji".into());
         }
     }
 
@@ -113,14 +119,20 @@ pub fn setup_theme(ctx: &egui::Context) {
                     "noto_color_emoji".into(),
                     Arc::new(FontData::from_owned(data)),
                 );
-                fonts.families.get_mut(&FontFamily::Proportional).unwrap().push("noto_color_emoji".into());
-                fonts.families.get_mut(&FontFamily::Monospace).unwrap().push("noto_color_emoji".into());
+                message_family.push("noto_color_emoji".into());
                 break;
             }
         }
     }
 
+    fonts.families.insert(FontFamily::Name("Message".into()), message_family);
+
     ctx.set_fonts(fonts);
+}
+
+/// FontId for message bodies, reactions, and the emoji picker (renders emojis in color).
+pub fn message_font(size: f32) -> egui::FontId {
+    egui::FontId::new(size, FontFamily::Name("Message".into()))
 }
 
 #[cfg(test)]
