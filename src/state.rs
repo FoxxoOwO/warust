@@ -165,6 +165,26 @@ impl JumpTarget {
     pub fn expired(&self) -> bool {
         self.at.elapsed() > Self::LIFETIME
     }
+
+    /// How strongly the jump tint should show right now: a quick rise so the eye
+    /// catches it, a hold, then a longer fall so it leaves on its own.
+    pub fn intensity(&self) -> f32 {
+        const RISE: f32 = 0.18;
+        const FALL: f32 = 0.70;
+        fn smooth(t: f32) -> f32 {
+            let t = t.clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        }
+        let elapsed = self.at.elapsed().as_secs_f32();
+        let total = Self::LIFETIME.as_secs_f32();
+        if elapsed < RISE {
+            smooth(elapsed / RISE)
+        } else if elapsed + FALL < total {
+            1.0
+        } else {
+            smooth((total - elapsed) / FALL)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
