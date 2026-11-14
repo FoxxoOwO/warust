@@ -1,6 +1,6 @@
 //! Conversation View UI - WhatsApp Web/Desktop style
 
-use egui::{Align, Color32, Context, FontId, Frame, Key, Layout, Margin, RichText, ScrollArea, TextEdit, Ui, Widget};
+use egui::{Align, Color32, Context, FontId, Frame, Key, Layout, Margin, Rect, RichText, ScrollArea, TextEdit, Ui, Widget};
 
 /// Delay between two new messages of the same batch fading in.
 const ARRIVAL_STAGGER: f32 = 0.015;
@@ -18,11 +18,14 @@ pub fn show_conversation(ui: &mut Ui, state: &SharedState, backend: &crate::back
     if let Some(chat_jid) = s.selected_chat.clone() {
         let canon_jid = s.canonical_jid(&chat_jid);
         let chat = s.chats.get(&canon_jid).or_else(|| s.chats.get(&chat_jid)).cloned();
-        let messages = s.get_chat_messages(&canon_jid).cloned().unwrap_or_default();
-        
+        // Taken instead of cloned: the state write lock is held for the whole
+        // frame, so the history is put back before anything else can look.
+        let (messages_key, messages) = s.take_chat_messages(&canon_jid);
+
         if let Some(chat) = chat {
             show_chat_view(ui, &mut s, &chat, &messages, &canon_jid, backend);
         }
+        s.put_chat_messages(messages_key, messages);
     } else {
         // No chat selected - show welcome screen
         show_welcome_screen(ui, &s);
@@ -461,6 +464,107 @@ fn show_pinned_banner(
     }
 }
 
+/// Height assumed for a row that has not been drawn yet. Refined frame by frame:
+/// the first frame of a chat uses it for the whole history, every later frame
+/// uses what was measured for the rows it drew.
+const ROW_HEIGHT_FALLBACK: f32 = 64.0;
+/// Height of the "today/yesterday/date" separator above a row, measured once —
+/// it is a fixed one-line label, not text that depends on the message.
+const DATE_SEPARATOR_HEIGHT: f32 = 30.0;
+/// Rows this far outside the viewport are drawn too, so a fast scroll does not
+/// show a gap before the next frame arrives.
+const ROW_OVERSCAN: f32 = 700.0;
+/// Stop remembering heights at some point; a long session with many chats would
+/// otherwise keep a map entry per message ever drawn.
+const ROW_HEIGHT_CACHE_LIMIT: usize = 20_000;
+
+/// Which rows a virtualized list has to draw, and how much empty space stands in
+/// for the rest.
+///
+/// The message list used to lay out the entire history every frame: at 2000
+/// messages that is ~4 ms per frame for twelve visible bubbles. The window is
+/// contiguous, so the rows outside it can be replaced by two spaces.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct VisibleRows {
+    /// Index of the first drawn message; `messages.len()` when nothing is drawn.
+    first: usize,
+    /// How many messages are drawn.
+    count: usize,
+    /// Space replacing the rows above the window.
+    before: f32,
+    /// Space replacing the rows below the window.
+    after: f32,
+}
+
+impl VisibleRows {
+    fn contains(&self, idx: usize) -> bool {
+        idx >= self.first && idx < self.first + self.count
+    }
+}
+
+/// Row heights for the message list: a cached bubble height plus a date
+/// separator decided from the neighbouring message.
+///
+/// Pure, so the range arithmetic can be tested without an egui context — a
+/// scroll area that renders the wrong rows is hard to catch by eye and easy to
+/// catch with numbers.
+struct RowModel<'a> {
+    heights: &'a std::collections::HashMap<String, f32>,
+    messages: &'a [Message],
+}
+
+impl RowModel<'_> {
+    fn has_separator(&self, idx: usize) -> bool {
+        idx == 0
+            || self.messages[idx - 1].timestamp.date_naive() != self.messages[idx].timestamp.date_naive()
+    }
+
+    fn height(&self, idx: usize) -> f32 {
+        let bubble = self
+            .heights
+            .get(&self.messages[idx].id)
+            .copied()
+            .unwrap_or(ROW_HEIGHT_FALLBACK);
+        bubble + if self.has_separator(idx) { DATE_SEPARATOR_HEIGHT } else { 0.0 }
+    }
+
+    /// Total height of the history above `idx`, i.e. where that row starts.
+    fn top_of(&self, idx: usize) -> f32 {
+        (0..idx.min(self.messages.len())).map(|i| self.height(i)).sum()
+    }
+
+    /// The window of rows to draw for `viewport` (in content coordinates), with
+    /// `top` being the content y of the first row.
+    fn visible(&self, top: f32, viewport: Rect, overscan: f32) -> VisibleRows {
+        let from = viewport.min.y - top - overscan;
+        let to = viewport.max.y - top + overscan;
+        let mut y = 0.0f32;
+        let mut first = self.messages.len();
+        let mut count = 0usize;
+        let mut before = 0.0;
+        let mut end = 0.0;
+        for idx in 0..self.messages.len() {
+            let height = self.height(idx);
+            if y + height >= from && y <= to {
+                if count == 0 {
+                    first = idx;
+                    before = y;
+                }
+                count += 1;
+                end = y + height;
+            }
+            y += height;
+        }
+        VisibleRows {
+            first,
+            count,
+            before,
+            // Nothing visible at all: every row is replaced by space.
+            after: if count == 0 { y } else { y - end },
+        }
+    }
+}
+
 fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Chat, messages: &[Message], chat_jid: &Jid, backend: &crate::backend::BackendHandle) {
     let available_height = ui.available_height();
     
@@ -524,12 +628,35 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
         ui.ctx().request_repaint();
     }
 
-    ScrollArea::vertical()
+    // A jump to a message that is not drawn cannot use `scroll_to_rect`: the
+    // bubble does not exist yet. Its offset comes from the row model instead, and
+    // the next frame draws it in place.
+    let jump_offset = state.jump_target.as_ref().and_then(|target| {
+        if target.scrolled {
+            return None;
+        }
+        let idx = messages.iter().position(|m| m.id == target.message_id)?;
+        let rows = RowModel {
+            heights: &state.row_heights,
+            messages,
+        };
+        Some((rows.top_of(idx) - available_height * 0.5).max(0.0))
+    });
+    if jump_offset.is_some() {
+        if let Some(target) = state.jump_target.as_mut() {
+            target.scrolled = true;
+        }
+    }
+
+    let mut scroll_area = ScrollArea::vertical()
         .animated(true)
         .auto_shrink([false, false])
         .stick_to_bottom(should_scroll_to_bottom)
-        .max_height(available_height)
-        .show(ui, |ui| {
+        .max_height(available_height);
+    if let Some(offset) = jump_offset {
+        scroll_area = scroll_area.vertical_scroll_offset(offset);
+    }
+    scroll_area.show_viewport(ui, |ui, viewport| {
             ui.add_space(8.0);
             
             // On-demand message history button (Peer Data Operation to primary phone)
@@ -547,18 +674,34 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
             if messages.is_empty() {
                 show_empty_chat(ui, chat, backend);
             } else {
-                let mut last_date: Option<chrono::NaiveDate> = None;
-                
+                // Only the rows around the viewport are laid out; the rest is two
+                // spacers. Rows are skipped before any text is measured, which is
+                // where the whole cost of a long history used to be.
+                // The model is borrowed only long enough to pick the window: the
+                // loop below writes the measured heights back into the cache.
+                let window = {
+                    let rows = RowModel {
+                        heights: &state.row_heights,
+                        messages,
+                    };
+                    rows.visible(ui.cursor().min.y, viewport, ROW_OVERSCAN)
+                };
+                ui.add_space(window.before);
+
                 // Cloning the full Message (media bytes included) for every bubble just
                 // to support "reply" was wasteful; grab the index instead.
                 for (idx, msg) in messages.iter().enumerate() {
+                    if !window.contains(idx) {
+                        continue;
+                    }
+                    let row_top = ui.min_rect().max.y;
                     // Show date separator
                     let msg_date = msg.timestamp.date_naive();
-                    let show_date = last_date.map(|ld| ld != msg_date).unwrap_or(true);
+                    let show_date = idx == 0
+                        || messages[idx - 1].timestamp.date_naive() != msg_date;
                     
                     if show_date {
                         show_date_separator(ui, msg_date);
-                        last_date = Some(msg_date);
                     }
                     
                     let is_own = msg.from_me;
@@ -618,7 +761,7 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
                     let view_once_handle = view_once_action.clone();
                     let is_pinned = pinned_id.as_deref() == Some(msg.id.as_str());
 
-                    let bubble_resp = MessageBubble::new(msg, is_own)
+                    MessageBubble::new(msg, is_own)
                         .show_sender(sender_name_str)
                         .on_reply(|_id| {
                             selected_reply = Some(idx);
@@ -683,23 +826,27 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
                         })
                         .ui(ui);
 
-                    // Scroll to a jumped-to message once, then let the tint
-                    // fade on its own so the user can keep scrolling.
+                    // The scroll position was set from the row model before the
+                    // list was drawn; the tint only has to keep frames coming
+                    // while it fades.
                     if jump_here {
-                        let needs_scroll = state
-                            .jump_target
-                            .as_ref()
-                            .map_or(false, |target| !target.scrolled);
-                        if needs_scroll {
-                            ui.scroll_to_rect(bubble_resp.rect, Some(egui::Align::Center));
-                            if let Some(target) = state.jump_target.as_mut() {
-                                target.scrolled = true;
-                            }
-                        }
                         ui.ctx().request_repaint();
                     }
 
                     ui.add_space(2.0);
+
+                    // Remember what this row actually took, so the next frame can
+                    // place the rows above and below it without laying them out.
+                    let drawn = ui.min_rect().max.y - row_top;
+                    let bubble_height =
+                        drawn - if show_date { DATE_SEPARATOR_HEIGHT } else { 0.0 };
+                    state
+                        .row_heights
+                        .insert(msg.id.clone(), bubble_height.max(20.0));
+                }
+                ui.add_space(window.after);
+                if state.row_heights.len() > ROW_HEIGHT_CACHE_LIMIT {
+                    state.row_heights.clear();
                 }
             }
             
@@ -1596,6 +1743,244 @@ mod tests {
         let mut msg = base("a", "  nazdar  ");
         msg.media_type = Some(crate::state::MediaType::Image);
         assert_eq!(pinned_preview(&msg), "nazdar");
+    }
+
+    fn history(count: usize, height: Option<f32>) -> (Vec<Message>, std::collections::HashMap<String, f32>) {
+        let messages: Vec<Message> = (0..count)
+            .map(|i| {
+                // One message per day keeps the date separators out of the way
+                // unless a test wants them.
+                let mut msg = base(&format!("m{i}"), "text");
+                msg.timestamp =
+                    chrono::Utc::now() - chrono::Duration::days((count - i) as i64);
+                msg
+            })
+            .collect();
+        let heights = match height {
+            Some(h) => messages
+                .iter()
+                .map(|m| (m.id.clone(), h))
+                .collect::<std::collections::HashMap<_, _>>(),
+            None => std::collections::HashMap::new(),
+        };
+        (messages, heights)
+    }
+
+    fn viewport(top: f32, height: f32) -> Rect {
+        Rect::from_min_size(egui::pos2(0.0, top), egui::vec2(600.0, height))
+    }
+
+    /// The whole point of the change: a long history must not be laid out. The
+    /// window is measured in rows, so this fails loudly if the range arithmetic
+    /// ever starts returning the full history again.
+    #[test]
+    fn a_long_history_only_draws_the_rows_around_the_viewport() {
+        let (messages, heights) = history(2000, Some(60.0));
+        let model = RowModel {
+            heights: &heights,
+            messages: &messages,
+        };
+        for scroll_top in [0.0, 30_000.0, 2000.0 * 60.0 - 700.0] {
+            let window = model.visible(0.0, viewport(scroll_top, 700.0), 0.0);
+            assert!(
+                window.count <= 13,
+                "při scrollu {scroll_top} se kreslí {} řádků",
+                window.count
+            );
+        }
+    }
+
+    /// Spacers have to add up to the same height as the rows they replace,
+    /// otherwise the scrollbar lies and `stick_to_bottom` lands somewhere else.
+    #[test]
+    fn spacers_keep_the_content_height() {
+        let (messages, heights) = history(500, Some(57.5));
+        let model = RowModel {
+            heights: &heights,
+            messages: &messages,
+        };
+        let window = model.visible(0.0, viewport(2_000.0, 700.0), ROW_OVERSCAN);
+        let drawn: f32 = (window.first..window.first + window.count)
+            .map(|idx| model.height(idx))
+            .sum();
+        let total: f32 = (0..messages.len()).map(|idx| model.height(idx)).sum();
+        assert_eq!(window.before + drawn + window.after, total);
+        assert!(window.count > 0 && window.count < messages.len());
+    }
+
+    /// Rows nobody has drawn yet use the fallback, so the first frame of a chat
+    /// still shows something instead of an empty scroll area.
+    #[test]
+    fn undrawn_rows_use_the_fallback_height() {
+        let (messages, heights) = history(40, None);
+        let model = RowModel {
+            heights: &heights,
+            messages: &messages,
+        };
+        assert_eq!(model.height(7), ROW_HEIGHT_FALLBACK + DATE_SEPARATOR_HEIGHT);
+        assert_eq!(
+            model.top_of(10),
+            10.0 * (ROW_HEIGHT_FALLBACK + DATE_SEPARATOR_HEIGHT)
+        );
+    }
+
+    /// A short history is drawn whole — virtualization must not hide the few
+    /// messages a new chat actually has.
+    #[test]
+    fn a_short_history_is_drawn_whole() {
+        let (messages, heights) = history(5, Some(60.0));
+        let model = RowModel {
+            heights: &heights,
+            messages: &messages,
+        };
+        let window = model.visible(0.0, viewport(0.0, 700.0), 0.0);
+        assert_eq!(window.first, 0);
+        assert_eq!(window.count, 5);
+        assert_eq!(window.before, 0.0);
+        assert_eq!(window.after, 0.0);
+    }
+
+    /// Date separators are part of a row's height, and only the first message of
+    /// a day has one — a row model that forgets this shifts every row below it.
+    #[test]
+    fn only_the_first_message_of_a_day_carries_a_separator() {
+        let (mut messages, heights) = history(6, Some(60.0));
+        for msg in messages.iter_mut() {
+            msg.timestamp = chrono::Utc::now();
+        }
+        // A second day starts at message 3 and keeps going to the end; going
+        // back to an earlier date would legitimately start another separator.
+        let tomorrow = chrono::Utc::now() + chrono::Duration::days(1);
+        for msg in messages.iter_mut().skip(3) {
+            msg.timestamp = tomorrow;
+        }
+        let model = RowModel {
+            heights: &heights,
+            messages: &messages,
+        };
+        assert!(model.has_separator(0), "první zpráva má datum");
+        assert!(!model.has_separator(1));
+        assert!(model.has_separator(3), "nový den má datum");
+        assert!(!model.has_separator(4));
+        assert!(!model.has_separator(5));
+        assert_eq!(model.height(3) - model.height(4), DATE_SEPARATOR_HEIGHT);
+    }
+
+    /// Headless cena jednoho snímku panelu zpráv podle délky historie.
+    ///
+    /// Není to test, ale měření — proto `#[ignore]`, aby nezatěžovalo CI:
+    /// `cargo test --release bench_conversation_frames -- --ignored --nocapture`.
+    /// Bez čísla se nedá poznat, jestli vykreslování celé historie stojí za
+    /// opravu, ani jestli oprava něco přinesla.
+    #[test]
+    #[ignore = "měření, ne test"]
+    fn bench_conversation_frames() {
+        for count in [100usize, 500, 2000] {
+            println!(
+                "{count:>5} zpráv: {:.2} ms/snímek, klon s náhledy {:.2} ms, bez náhledů {:.2} ms",
+                frame_cost_ms(count),
+                clone_cost_ms(count, true),
+                clone_cost_ms(count, false)
+            );
+        }
+    }
+
+    /// Cena samotného `cloned()` celé historie, který si panel dělá každý snímek.
+    fn clone_cost_ms(count: usize, with_thumbnails: bool) -> f64 {
+        let jid: Jid = "123@s.whatsapp.net".parse().unwrap();
+        let mut state = AppState::default();
+        let msgs: Vec<Message> = (0..count)
+            .map(|i| {
+                let mut msg = base(&format!("m{i}"), "zpráva s dost dlouhým textem");
+                if with_thumbnails {
+                    msg.media_jpeg_thumbnail = Some(vec![0u8; 2048]);
+                }
+                msg
+            })
+            .collect();
+        state.messages.insert(jid.clone(), msgs);
+        let start = std::time::Instant::now();
+        let rounds = 20;
+        for _ in 0..rounds {
+            let cloned = state.get_chat_messages(&jid).cloned().unwrap_or_default();
+            std::hint::black_box(&cloned);
+        }
+        start.elapsed().as_secs_f64() * 1000.0 / rounds as f64
+    }
+
+    fn frame_cost_ms(count: usize) -> f64 {
+        use crate::backend::BackendHandle;
+        use crate::state::Chat;
+        use std::sync::Arc;
+
+        let jid: Jid = "123@s.whatsapp.net".parse().unwrap();
+        let state: SharedState = Arc::new(parking_lot::RwLock::new(AppState::default()));
+        {
+            let mut s = state.write();
+            s.chats.insert(
+                jid.clone(),
+                Chat {
+                    jid: jid.clone(),
+                    name: "Měření".to_string(),
+                    last_message: None,
+                    unread_count: 0,
+                    is_group: false,
+                    is_archived: false,
+                    is_pinned: false,
+                    mute_until: None,
+                    last_activity: chrono::Utc::now(),
+                    participants: Default::default(),
+                    is_typing: false,
+                    typing_until: None,
+                },
+            );
+            s.messages.insert(
+                jid.clone(),
+                (0..count)
+                    .map(|i| {
+                        let mut msg = base(
+                            &format!("m{i}"),
+                            "zpráva s dost dlouhým textem, aby se musela lámat do řádků",
+                        );
+                        // A thumbnail makes the clone cost visible, which is part
+                        // of what a frame pays for a long history.
+                        msg.media_jpeg_thumbnail = Some(vec![0u8; 2048]);
+                        msg
+                    })
+                    .collect(),
+            );
+            s.selected_chat = Some(jid.clone());
+        }
+
+        let (tx_command, _rx_command) = tokio::sync::mpsc::unbounded_channel();
+        let (_tx_status, rx_status) =
+            tokio::sync::watch::channel(crate::state::ConnectionStatus::Disconnected);
+        let backend = BackendHandle {
+            tx_command,
+            rx_status,
+            state: state.clone(),
+            bot_handle: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+
+        let ctx = egui::Context::default();
+        let screen = egui::vec2(900.0, 700.0);
+        let frames = 10usize;
+        let warmup = 2usize;
+        let mut total = 0.0;
+        for frame in 0..frames {
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen));
+            let start = std::time::Instant::now();
+            let mut output = ctx.run_ui(input, |ui| {
+                ui.set_max_size(screen);
+                show_conversation(ui, &state, &backend);
+            });
+            output.textures_delta.clear();
+            if frame >= warmup {
+                total += start.elapsed().as_secs_f64() * 1000.0;
+            }
+        }
+        total / (frames - warmup) as f64
     }
 
     #[test]

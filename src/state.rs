@@ -672,6 +672,10 @@ pub struct AppState {
     /// Selected tab of the media gallery in the chat info panel.
     #[serde(skip)]
     pub gallery_tab: GalleryTab,
+    /// Measured bubble heights per message id, so the virtualized message list
+    /// can place rows it does not draw. A render cache, not data.
+    #[serde(skip)]
+    pub row_heights: HashMap<String, f32>,
     /// Half-typed message per chat, so switching chats does not lose it.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub drafts: HashMap<Jid, String>,
@@ -840,6 +844,7 @@ impl Default for AppState {
             group_info: HashMap::new(),
             pinned: HashMap::new(),
             gallery_tab: GalleryTab::default(),
+            row_heights: HashMap::new(),
             drafts: HashMap::new(),
             send_view_once: false,
             view_once_open: None,
@@ -1031,6 +1036,45 @@ impl AppState {
             }
         }
         self.messages.get(&canon).or_else(|| self.messages.get(jid))
+    }
+
+    /// Take a chat's history out of the map, remembering the key it was stored
+    /// under so [`put_chat_messages`] can put it back where it was found.
+    ///
+    /// The UI used to `clone()` the whole history every frame — 2000 messages with
+    /// thumbnails cost 1.7 ms per frame, more than drawing them. Taking the `Vec`
+    /// out is free; the caller holds the state write lock for the frame, so the
+    /// empty slot is never observable.
+    pub fn take_chat_messages(&mut self, jid: &Jid) -> (Option<Jid>, Vec<Message>) {
+        let canon = self.canonical_jid(jid);
+        let mut keys = vec![canon.clone()];
+        if canon != *jid {
+            keys.push(jid.clone());
+        }
+        for (lid, pn) in &self.lid_to_pn {
+            if pn == jid || pn == &canon {
+                keys.push(lid.clone());
+            }
+        }
+        if keys.last() != Some(&canon) {
+            keys.push(canon.clone());
+        }
+        for key in keys {
+            if let Some(msgs) = self.messages.get(&key) {
+                if !msgs.is_empty() {
+                    let taken = self.messages.remove(&key).unwrap_or_default();
+                    return (Some(key), taken);
+                }
+            }
+        }
+        (None, Vec::new())
+    }
+
+    /// Put back what [`take_chat_messages`] took, under the same key.
+    pub fn put_chat_messages(&mut self, key: Option<Jid>, messages: Vec<Message>) {
+        if let Some(key) = key {
+            self.messages.insert(key, messages);
+        }
     }
 
     pub fn get_or_create_chat(&mut self, jid: Jid, name: String, is_group: bool) -> &mut Chat {
@@ -1735,6 +1779,62 @@ pub fn collect_mentions(text: &str, people: &[(Jid, String)]) -> Vec<Jid> {
     hits.sort_by_key(|(pos, _)| *pos);
     hits.dedup_by(|later, earlier| later.1 == earlier.1);
     hits.into_iter().map(|(_, jid)| jid).collect()
+}
+
+#[cfg(test)]
+#[cfg(test)]
+mod row_cache_tests {
+    use super::*;
+
+    fn text(id: &str) -> Message {
+        let jid: Jid = "123@s.whatsapp.net".parse().unwrap();
+        Message::new_text(
+            id.to_string(),
+            jid.clone(),
+            jid,
+            format!("zpráva {id}"),
+            Utc::now(),
+            false,
+            MessageStatus::Delivered,
+            None,
+            None,
+        )
+    }
+
+    /// The panel takes the history out of the map instead of cloning it; the
+    /// round trip has to leave the state exactly as it was, under the same key.
+    #[test]
+    fn history_survives_the_take_and_put_roundtrip() {
+        let jid: Jid = "123@s.whatsapp.net".parse().unwrap();
+        let mut state = AppState::default();
+        state
+            .messages
+            .insert(jid.clone(), vec![text("a"), text("b"), text("c")]);
+
+        let (key, taken) = state.take_chat_messages(&jid);
+        assert_eq!(key.as_ref(), Some(&jid));
+        assert_eq!(taken.len(), 3);
+        assert!(
+            state.get_chat_messages(&jid).is_none_or(|m| m.is_empty()),
+            "během snímku je historie mimo mapu"
+        );
+
+        state.put_chat_messages(key, taken);
+        let back = state.get_chat_messages(&jid).expect("historie je zpátky");
+        assert_eq!(back.len(), 3);
+        assert_eq!(back[0].id, "a");
+        assert_eq!(back[2].text, "zpráva c");
+    }
+
+    #[test]
+    fn a_chat_without_history_takes_nothing() {
+        let jid: Jid = "123@s.whatsapp.net".parse().unwrap();
+        let mut state = AppState::default();
+        state.messages.insert(jid.clone(), Vec::new());
+        let (key, taken) = state.take_chat_messages(&jid);
+        assert!(key.is_none());
+        assert!(taken.is_empty());
+    }
 }
 
 #[cfg(test)]
