@@ -86,12 +86,90 @@ pub fn detect_media_type(path: &Path) -> MediaType {
         .unwrap_or("")
         .to_ascii_lowercase();
     match ext.as_str() {
-        "jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp" => MediaType::Image,
+        "jpg" | "jpeg" | "png" | "gif" | "bmp" => MediaType::Image,
+        // A WebP attachment is a sticker; WhatsApp sizes it to 512 px itself.
+        "webp" => MediaType::Sticker,
         "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" => MediaType::Video,
         "ogg" | "opus" => MediaType::Voice,
         "mp3" | "wav" | "m4a" | "aac" | "flac" => MediaType::Audio,
         _ => MediaType::Document,
     }
+}
+
+/// Pixel size of an image file, if the decoder can read the header.
+pub fn image_dimensions(path: &Path) -> Option<(u32, u32)> {
+    image::image_dimensions(path).ok()
+}
+
+/// Whether a WebP stream is animated — WhatsApp marks those `is_animated`.
+pub fn webp_is_animated(path: &Path) -> bool {
+    std::fs::read(path)
+        .map(|bytes| bytes.windows(4).any(|w| w == b"ANIM"))
+        .unwrap_or(false)
+}
+
+/// Sticker-sized WebP files already sitting in the media folder, newest first.
+///
+/// There is no sticker library in the app yet, so "recently received or sent
+/// stickers" doubles as the picker's library.
+pub fn sticker_files() -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(media_dir()) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("webp"))
+        })
+        .collect();
+    files.sort_by_key(|path| {
+        std::cmp::Reverse(std::fs::metadata(path).and_then(|m| m.modified()).ok())
+    });
+    files.truncate(48);
+    files
+}
+
+/// Texture for an arbitrary image file, cached by path.
+pub fn path_texture(ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
+    let id = egui::Id::new("warust_path_texture_cache");
+    let cache: MediaCache = ctx.data_mut(|d| d.get_temp::<MediaCache>(id)).unwrap_or_else(|| {
+        let c: MediaCache = Arc::new(Mutex::new(HashMap::new()));
+        ctx.data_mut(|d| d.insert_temp(id, c.clone()));
+        c
+    });
+
+    let key = path.to_string_lossy().to_string();
+    let rev = MEDIA_REV.load(Ordering::Relaxed);
+    let mut map = cache.lock();
+    if let Some((r, cached)) = map.get(&key) {
+        if *r == rev {
+            return cached.clone().map(|(tex, _)| tex);
+        }
+    }
+
+    let loaded = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| image::load_from_memory(&bytes).ok())
+        .map(|img| {
+            let rgba = img.to_rgba8();
+            let size = [rgba.width() as usize, rgba.height() as usize];
+            let dims = [rgba.width() as f32, rgba.height() as f32];
+            let color_img = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+            let tex = ctx.load_texture(
+                format!("path-{}", clean_filename(&key)),
+                color_img,
+                egui::TextureOptions::LINEAR,
+            );
+            (tex, dims)
+        });
+
+    let handle = loaded.as_ref().map(|(tex, _)| tex.clone());
+    map.insert(key, (rev, loaded));
+    handle
 }
 
 /// Format file size for human display

@@ -28,6 +28,12 @@ pub enum Command {
         to: Jid,
         message: whatsapp_rust::waproto::whatsapp::Message,
     },
+    /// Share a contact as a vCard card.
+    SendContact {
+        chat_jid: Jid,
+        contact_jid: Jid,
+        reply_to: Option<String>,
+    },
     /// Rewrite the body of an already-sent message (`Client::edit_message`).
     EditText {
         to: Jid,
