@@ -777,6 +777,18 @@ async fn handle_incoming_message(
         info.ephemeral_expiration,
     );
 
+    if let Some(exp) = info.ephemeral_expiration {
+        // Every message sent under a disappearing-message timer carries the
+        // expiry, so this keeps the per-chat timer in sync with the server
+        // even when the other side changed it.
+        let mut s = state.write();
+        if exp == 0 {
+            s.ephemeral.remove(&chat_jid);
+        } else {
+            s.ephemeral.insert(chat_jid.clone(), exp);
+        }
+    }
+
     if let Some(media) = extract_media_info(&message) {
         let local_path = crate::media::get_local_path(
             &msg_id,
@@ -2816,11 +2828,24 @@ async fn handle_command(
         }
         
         Command::BlockContact { jid } => {
-            client.blocking().block(&jid).await?;
+            let canon = state.read().canonical_jid(&jid);
+            client.blocking().block(&canon).await?;
+            let mut s = state.write();
+            s.contacts
+                .entry(canon.clone())
+                .or_insert_with(|| crate::state::Contact::new(canon.clone(), None))
+                .is_blocked = true;
+            s.dirty = true;
         }
         
         Command::UnblockContact { jid } => {
-            client.blocking().unblock(&jid).await?;
+            let canon = state.read().canonical_jid(&jid);
+            client.blocking().unblock(&canon).await?;
+            let mut s = state.write();
+            if let Some(contact) = s.contacts.get_mut(&canon) {
+                contact.is_blocked = false;
+            }
+            s.dirty = true;
         }
         
         Command::CreateGroup { subject, participants } => {
@@ -2897,8 +2922,17 @@ async fn handle_command(
             client.groups().set_description(&chat_jid, Some(validated), PreviousDescription::Resolve).await?;
         }
         
-        Command::SetGroupEphemeral { chat_jid, expiration } => {
+        Command::SetEphemeral { chat_jid, expiration } => {
+            // Works for 1:1 chats too, not just groups: the vendor sends the
+            // same protocol message either way.
             client.groups().set_ephemeral(&chat_jid, expiration).await?;
+            let mut s = state.write();
+            if expiration == 0 {
+                s.ephemeral.remove(&chat_jid);
+            } else {
+                s.ephemeral.insert(chat_jid.clone(), expiration);
+            }
+            s.dirty = true;
         }
         
         Command::SetPresence { status } => {

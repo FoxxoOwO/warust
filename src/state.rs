@@ -184,6 +184,10 @@ pub struct Contact {
     pub is_on_whatsapp: bool,
     pub last_seen: Option<DateTime<Utc>>,
     pub is_online: bool,
+    /// Whether this contact is blocked. Mirrors the server state so the info
+    /// panel can show the right action without re-querying on every frame.
+    #[serde(default)]
+    pub is_blocked: bool,
 }
 
 impl Contact {
@@ -198,6 +202,7 @@ impl Contact {
             is_on_whatsapp: true,
             last_seen: None,
             is_online: false,
+            is_blocked: false,
         }
     }
 }
@@ -428,6 +433,14 @@ pub struct AppState {
     /// Open "forward to…" chat picker.
     #[serde(skip)]
     pub forward_dialog: Option<ForwardDialogState>,
+    /// Whether the right-hand info panel is open for the current chat.
+    #[serde(skip)]
+    pub show_chat_info: bool,
+    /// Disappearing-message timer per chat, in seconds. WhatsApp calls this
+    /// "ephemeral" and it applies to 1:1 chats as well as groups; a zero or
+    /// missing entry means the timer is off.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub ephemeral: HashMap<Jid, u32>,
 }
 
 impl Default for AppState {
@@ -474,6 +487,8 @@ impl Default for AppState {
             dirty: false,
             selected_messages: std::collections::BTreeSet::new(),
             forward_dialog: None,
+            show_chat_info: false,
+            ephemeral: HashMap::new(),
         }
     }
 }

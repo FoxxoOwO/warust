@@ -199,7 +199,7 @@ pub enum Command {
         chat_jid: Jid,
         description: String,
     },
-    SetGroupEphemeral {
+    SetEphemeral {
         chat_jid: Jid,
         expiration: u32,
     },
