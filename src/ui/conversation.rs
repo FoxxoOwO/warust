@@ -1109,6 +1109,28 @@ fn show_composer(ui: &mut Ui, state: &mut AppState, chat_jid: &Jid, backend: &cr
         ui.add_space(2.0);
     }
 
+    if let Some(message) = state.clipboard_error.clone() {
+        Frame::new()
+            .fill(Color32::from_rgb(0x3A, 0x1E, 0x22))
+            .inner_margin(Margin::symmetric(14, 6))
+            .corner_radius(egui::CornerRadius::same(6))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("⚠ Schránka: {message}"))
+                            .font(FontId::proportional(12.0))
+                            .color(Color32::from_rgb(0xF2, 0x8B, 0x82)),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("✕").clicked() {
+                            state.clipboard_error = None;
+                        }
+                    });
+                });
+            });
+        ui.add_space(2.0);
+    }
+
     // While a take is running the composer row is replaced by the recorder bar,
     // so a stray Enter cannot send text halfway through a voice note.
     if crate::recorder::is_recording() {
@@ -1250,6 +1272,21 @@ fn show_composer(ui: &mut Ui, state: &mut AppState, chat_jid: &Jid, backend: &cr
                         .margin(egui::vec2(12.0, 10.0))
                 );
                 
+                // Ctrl+V with a picture on the clipboard becomes an attachment;
+                // plain text still pastes normally because we only look for images.
+                if response.has_focus()
+                    && ui.input(|i| i.modifiers.command && i.key_pressed(Key::V))
+                {
+                    match crate::clipboard::save_clipboard_image() {
+                        Ok(Some(path)) => {
+                            state.pending_attachment = Some(path);
+                            state.clipboard_error = None;
+                        }
+                        Ok(None) => {}
+                        Err(err) => state.clipboard_error = Some(err),
+                    }
+                }
+
                 // Handle Enter to send, Shift+Enter for newline
                 let enter_pressed = response.has_focus() && ui.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift);
                 let can_send = state.pending_attachment.is_some() || !state.composer_text.trim().is_empty();

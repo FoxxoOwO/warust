@@ -5971,6 +5971,7 @@ name = "warust"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "arboard",
  "async-channel",
  "chrono",
  "console_error_panic_hook",

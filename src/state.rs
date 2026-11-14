@@ -723,6 +723,19 @@ pub struct AppState {
     /// Whether the sticker picker window is open.
     #[serde(skip)]
     pub show_sticker_picker: bool,
+    /// Ctrl+K chat switcher.
+    #[serde(skip)]
+    pub show_command_palette: bool,
+    #[serde(skip)]
+    pub palette_query: String,
+    #[serde(skip)]
+    pub palette_index: usize,
+    /// Last clipboard-paste failure, shown under the composer.
+    #[serde(skip)]
+    pub clipboard_error: Option<String>,
+    /// Cached media-folder scan for the storage tab.
+    #[serde(skip)]
+    pub storage_scan: Option<(std::time::Instant, crate::media::MediaStats)>,
     #[serde(skip)]
     pub emoji_search: String,
     #[serde(skip)]
@@ -821,6 +834,11 @@ impl Default for AppState {
             active_call: None,
             show_emoji_picker: false,
             show_sticker_picker: false,
+            show_command_palette: false,
+            palette_query: String::new(),
+            palette_index: 0,
+            clipboard_error: None,
+            storage_scan: None,
             emoji_search: String::new(),
             emoji_active_category: 0,
             reaction_picker_target: None,
@@ -1492,6 +1510,28 @@ impl AppState {
         if self.editing_message.take().is_some() {
             self.composer_text.clear();
         }
+    }
+
+    /// Media files still referenced by a stored message.
+    ///
+    /// Both the full path and the bare file name are included: older messages
+    /// store either, and deleting a file that is still pointed at would leave a
+    /// dead bubble.
+    pub fn referenced_media_paths(&self) -> std::collections::HashSet<std::path::PathBuf> {
+        let mut out = std::collections::HashSet::new();
+        for messages in self.messages.values() {
+            for message in messages {
+                let Some(path) = message.media_path.as_ref() else {
+                    continue;
+                };
+                let path = std::path::PathBuf::from(path);
+                if let Some(name) = path.file_name() {
+                    out.insert(std::path::PathBuf::from(name));
+                }
+                out.insert(path);
+            }
+        }
+        out
     }
 
     pub fn resolve_display_name(&self, jid: &Jid) -> Option<String> {
