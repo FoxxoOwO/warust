@@ -375,6 +375,12 @@ pub struct UserPreferences {
     pub close_to_tray: bool,
     #[serde(default)]
     pub start_with_windows: bool,
+    /// Kontrolovat nové verze na pozadí.
+    #[serde(default = "default_true")]
+    pub check_updates: bool,
+    /// Nainstalovat nalezenou aktualizaci bez ptaní.
+    #[serde(default)]
+    pub auto_install_updates: bool,
 }
 
 impl Default for UserPreferences {
@@ -393,6 +399,8 @@ impl Default for UserPreferences {
             run_in_tray: true,
             close_to_tray: true,
             start_with_windows: false,
+            check_updates: true,
+            auto_install_updates: false,
         }
     }
 }
@@ -736,6 +744,15 @@ pub struct AppState {
     /// Cached media-folder scan for the storage tab.
     #[serde(skip)]
     pub storage_scan: Option<(std::time::Instant, crate::media::MediaStats)>,
+    /// Latest release newer than this build, if one was found.
+    #[serde(skip)]
+    pub update_available: Option<crate::updater::UpdateInfo>,
+    /// Progress of the update check.
+    #[serde(skip)]
+    pub update_status: crate::updater::UpdateStatus,
+    /// Whether the update window is open.
+    #[serde(skip)]
+    pub show_update_dialog: bool,
     #[serde(skip)]
     pub emoji_search: String,
     #[serde(skip)]
@@ -839,6 +856,9 @@ impl Default for AppState {
             palette_index: 0,
             clipboard_error: None,
             storage_scan: None,
+            update_available: None,
+            update_status: crate::updater::UpdateStatus::default(),
+            show_update_dialog: false,
             emoji_search: String::new(),
             emoji_active_category: 0,
             reaction_picker_target: None,

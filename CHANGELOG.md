@@ -7,6 +7,14 @@ also published on the [Releases page](https://github.com/FoxxoOwO/warust/release
 
 ## [Unreleased]
 
+### Added
+- Automatic update checks against the GitHub releases API: a background check
+  every six hours, a manual "Check for updates" button and an update dialog with
+  the release notes.
+- Self-update: the app downloads the platform package, replaces its own
+  executable through a detached script, and restarts.
+- Update preferences: background checking and silent auto-install.
+
 ## [0.2.0] - 2026-11-14
 
 A large feature jump since 0.1.2: the whole November 2026 development wave.
