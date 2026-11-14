@@ -10,7 +10,7 @@ use whatsapp_rust::wacore_binary::Jid;
 
 use crate::backend::BackendHandle;
 use crate::commands::Command;
-use crate::state::{AppState, Chat};
+use crate::state::{AppState, Chat, GalleryTab, MediaType, Message};
 use crate::ui::components::Avatar;
 
 const MUTED_TEXT: Color32 = Color32::from_rgb(0x86, 0x96, 0xA0);
@@ -88,6 +88,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState, chat: &Chat, backend: &Back
                 contact_details(ui, state, chat, backend);
             }
 
+            media_gallery(ui, state, chat);
+
             chat_settings(ui, state, chat, backend);
         });
 }
@@ -118,6 +120,248 @@ fn info_row(ui: &mut egui::Ui, label: &str, value: &str) {
             );
         });
     });
+}
+
+
+/// Pull every `http(s)://` link out of `text`, without duplicates.
+///
+/// WhatsApp links plain URLs in message bodies; this is the same idea, kept
+/// deliberately dumb so it never swallows the punctuation around a link.
+pub fn extract_links(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for token in text.split_whitespace() {
+        let trimmed = token.trim_matches(|c: char| {
+            matches!(
+                c,
+                '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '"' | '\'' | ',' | ';'
+            )
+        });
+        let candidate = trimmed.trim_end_matches(['.', ':', '!', '?']);
+        if (candidate.starts_with("http://") || candidate.starts_with("https://"))
+            && !out.iter().any(|existing| existing == candidate)
+        {
+            out.push(candidate.to_string());
+        }
+    }
+    out
+}
+
+/// What to call a document in the gallery list.
+fn document_label(message: &Message) -> String {
+    if let Some(path) = message.media_path.as_deref() {
+        if let Some(name) = std::path::Path::new(path).file_name() {
+            return name.to_string_lossy().to_string();
+        }
+    }
+    let caption = message.text.trim();
+    if !caption.is_empty() {
+        return caption.to_string();
+    }
+    match message.media_mimetype.as_deref() {
+        Some(mime) if !mime.is_empty() => "Dokument".to_string(),
+        _ => "Soubor".to_string(),
+    }
+}
+
+fn is_gallery_media(kind: Option<MediaType>) -> bool {
+    matches!(
+        kind,
+        Some(MediaType::Image) | Some(MediaType::Video) | Some(MediaType::Sticker)
+    )
+}
+
+/// Messages that belong to `tab`, newest first.
+fn gallery_messages<'a>(messages: &'a [Message], tab: GalleryTab) -> Vec<&'a Message> {
+    let mut out: Vec<&Message> = messages
+        .iter()
+        .filter(|message| match tab {
+            GalleryTab::Media => is_gallery_media(message.media_type),
+            GalleryTab::Documents => message.media_type == Some(MediaType::Document),
+            GalleryTab::Links => {
+                !message.text.is_empty() && !extract_links(&message.text).is_empty()
+            }
+        })
+        .collect();
+    out.reverse();
+    out
+}
+
+/// "Média, odkazy a dokumenty" section: the gallery WhatsApp puts above the
+/// per-chat settings.
+fn media_gallery(ui: &mut egui::Ui, state: &mut AppState, chat: &Chat) {
+    let jid = chat.jid.clone();
+    let tab = state.gallery_tab;
+    let counts = {
+        let messages = state.messages.get(&jid).map(|m| m.as_slice()).unwrap_or(&[]);
+        GalleryTab::ALL.map(|candidate| gallery_messages(messages, candidate).len())
+    };
+
+    section_title(ui, "Média, odkazy a dokumenty");
+    ui.horizontal_wrapped(|ui| {
+        for (index, candidate) in GalleryTab::ALL.into_iter().enumerate() {
+            let label = format!("{} ({})", candidate.label(), counts[index]);
+            if ui
+                .selectable_label(
+                    tab == candidate,
+                    RichText::new(label).font(FontId::proportional(11.0)),
+                )
+                .clicked()
+            {
+                state.gallery_tab = candidate;
+            }
+        }
+    });
+    ui.add_space(4.0);
+
+    // Collected first: rendering below needs an immutable borrow of `state` for
+    // thumbnails, and the click result is applied afterwards.
+    let mut jump_to: Option<String> = None;
+    let mut open_url: Option<String> = None;
+
+    match tab {
+        GalleryTab::Media => {
+            let ids: Vec<String> = {
+                let messages = state.messages.get(&jid).map(|m| m.as_slice()).unwrap_or(&[]);
+                gallery_messages(messages, GalleryTab::Media)
+                    .into_iter()
+                    .map(|message| message.id.clone())
+                    .collect()
+            };
+            if ids.is_empty() {
+                ui.label(
+                    RichText::new("Zatím žádné fotky ani videa.")
+                        .font(FontId::proportional(12.0))
+                        .color(MUTED_TEXT),
+                );
+            }
+            egui::ScrollArea::vertical()
+                .id_salt("chat_info_gallery_scroll")
+                .max_height(180.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let cell = 54.0;
+                    let per_row =
+                        ((ui.available_width() + 4.0) / (cell + 4.0)).floor().max(1.0) as usize;
+                    for chunk in ids.chunks(per_row) {
+                        ui.horizontal(|ui| {
+                            for id in chunk {
+                                let message = state
+                                    .messages
+                                    .get(&jid)
+                                    .and_then(|messages| messages.iter().find(|m| &m.id == id));
+                                let Some(message) = message else {
+                                    continue;
+                                };
+                                let response = match crate::media::image_texture(ui.ctx(), message)
+                                {
+                                    Some((texture, _)) => ui.add(
+                                        egui::Image::new(&texture)
+                                            .fit_to_exact_size(egui::vec2(cell, cell))
+                                            .corner_radius(4.0)
+                                            .sense(egui::Sense::click()),
+                                    ),
+                                    None => {
+                                        let icon = if message.media_type == Some(MediaType::Video)
+                                        {
+                                            "🎬"
+                                        } else {
+                                            "🖼"
+                                        };
+                                        ui.add_sized(
+                                            [cell, cell],
+                                            egui::Button::new(
+                                                RichText::new(icon)
+                                                    .font(FontId::proportional(20.0)),
+                                            )
+                                            .fill(Color32::from_rgb(0x1D, 0x28, 0x2E))
+                                            .corner_radius(4.0),
+                                        )
+                                    }
+                                };
+                                if response.clicked() {
+                                    jump_to = Some(id.clone());
+                                }
+                            }
+                        });
+                    }
+                });
+        }
+        GalleryTab::Documents | GalleryTab::Links => {
+            let rows: Vec<(String, String)> = {
+                let messages = state.messages.get(&jid).map(|m| m.as_slice()).unwrap_or(&[]);
+                gallery_messages(messages, tab)
+                    .into_iter()
+                    .map(|message| {
+                        if tab == GalleryTab::Links {
+                            let first = extract_links(&message.text)
+                                .first()
+                                .cloned()
+                                .unwrap_or_default();
+                            (message.id.clone(), first)
+                        } else {
+                            (message.id.clone(), document_label(message))
+                        }
+                    })
+                    .collect()
+            };
+            if rows.is_empty() {
+                let empty = if tab == GalleryTab::Links {
+                    "Zatím žádné odkazy."
+                } else {
+                    "Zatím žádné dokumenty."
+                };
+                ui.label(
+                    RichText::new(empty)
+                        .font(FontId::proportional(12.0))
+                        .color(MUTED_TEXT),
+                );
+            }
+            egui::ScrollArea::vertical()
+                .id_salt("chat_info_list_scroll")
+                .max_height(160.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for (message_id, label) in &rows {
+                        ui.horizontal(|ui| {
+                            let icon = if tab == GalleryTab::Links { "🔗" } else { "📄" };
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(format!("{icon} {label}"))
+                                            .font(FontId::proportional(12.0)),
+                                    )
+                                    .frame(false),
+                                )
+                                .on_hover_text("Zobrazit zprávu")
+                                .clicked()
+                            {
+                                jump_to = Some(message_id.clone());
+                            }
+                            if tab == GalleryTab::Links
+                                && ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("Otevřít")
+                                                .font(FontId::proportional(11.0)),
+                                        )
+                                        .frame(false),
+                                    )
+                                    .clicked()
+                            {
+                                open_url = Some(label.clone());
+                            }
+                        });
+                    }
+                });
+        }
+    }
+
+    if let Some(message_id) = jump_to {
+        state.jump_target = Some(crate::state::JumpTarget::new(message_id));
+    }
+    if let Some(url) = open_url {
+        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+    }
 }
 
 fn contact_details(
@@ -607,5 +851,74 @@ fn chat_settings(ui: &mut egui::Ui, state: &mut AppState, chat: &Chat, backend: 
                 chat_jid: chat.jid.clone(),
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::MessageStatus;
+    use chrono::Utc;
+    use whatsapp_rust::wacore_binary::Jid;
+
+    fn message(id: &str, text: &str, media: Option<MediaType>) -> Message {
+        let jid: Jid = "123@s.whatsapp.net".parse().unwrap();
+        let mut msg = Message::new_text(
+            id.to_string(),
+            jid.clone(),
+            jid,
+            text.to_string(),
+            Utc::now(),
+            false,
+            MessageStatus::Delivered,
+            None,
+            None,
+        );
+        msg.media_type = media;
+        msg
+    }
+
+    #[test]
+    fn extract_links_strips_punctuation_and_dedupes() {
+        let text = "mrkni (https://example.com/a?b=1), nebo http://foo.cz. \
+                    https://example.com/a?b=1 a hotovo";
+        assert_eq!(
+            extract_links(text),
+            vec!["https://example.com/a?b=1".to_string(), "http://foo.cz".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_links_ignores_plain_words() {
+        assert!(extract_links("zadny odkaz tady neni").is_empty());
+        assert!(extract_links("ftp://example.com").is_empty());
+    }
+
+    #[test]
+    fn gallery_splits_messages_into_tabs_newest_first() {
+        let messages = vec![
+            message("a", "podivej https://example.com", None),
+            message("b", "", Some(MediaType::Image)),
+            message("c", "faktura", Some(MediaType::Document)),
+        ];
+
+        let media = gallery_messages(&messages, GalleryTab::Media);
+        assert_eq!(media.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["b"]);
+
+        let docs = gallery_messages(&messages, GalleryTab::Documents);
+        assert_eq!(docs.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["c"]);
+
+        let links = gallery_messages(&messages, GalleryTab::Links);
+        assert_eq!(links.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["a"]);
+    }
+
+    #[test]
+    fn document_label_prefers_file_name_then_caption() {
+        let mut doc = message("d", "naskenovana faktura", Some(MediaType::Document));
+        doc.media_path = Some("C:/media/faktura-2024.pdf".to_string());
+        assert_eq!(document_label(&doc), "faktura-2024.pdf");
+
+        doc.media_path = None;
+        assert_eq!(document_label(&doc), "naskenovana faktura");
     }
 }

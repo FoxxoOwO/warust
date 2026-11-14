@@ -378,6 +378,10 @@ pub struct MessageBubble<'a> {
     pub on_view_reactions: Option<Box<dyn FnOnce(&'a str) + 'a>>,
     pub on_open_emoji_picker: Option<Box<dyn FnOnce(&'a str) + 'a>>,
     pub on_select: Option<Box<dyn FnOnce(&'a str) + 'a>>,
+    /// Pins the message for the given duration, or unpins when `None`.
+    pub on_pin: Option<Box<dyn FnOnce(&'a str, Option<u32>) + 'a>>,
+    /// Whether this message currently carries the chat's pin.
+    pub is_pinned: bool,
     /// Bulk-action mode: a click ticks the bubble instead of using the media.
     pub selection_mode: bool,
     pub selected: bool,
@@ -408,6 +412,8 @@ impl<'a> MessageBubble<'a> {
             on_view_reactions: None,
             on_open_emoji_picker: None,
             on_select: None,
+            on_pin: None,
+            is_pinned: false,
             selection_mode: false,
             selected: false,
             highlight: false,
@@ -436,6 +442,16 @@ impl<'a> MessageBubble<'a> {
 
     pub fn on_edit(mut self, f: impl FnOnce(&'a str) + 'a) -> Self {
         self.on_edit = Some(Box::new(f));
+        self
+    }
+
+    pub fn on_pin(mut self, f: impl FnOnce(&'a str, Option<u32>) + 'a) -> Self {
+        self.on_pin = Some(Box::new(f));
+        self
+    }
+
+    pub fn is_pinned(mut self, pinned: bool) -> Self {
+        self.is_pinned = pinned;
         self
     }
 
@@ -1404,6 +1420,36 @@ impl<'a> Widget for MessageBubble<'a> {
                         f(&self.message.id);
                     }
                     ui.close();
+                }
+            }
+            let mut on_pin = self.on_pin;
+            if on_pin.is_some() {
+                ui.separator();
+                if self.is_pinned {
+                    if ui.button("📌 Odepnout").clicked() {
+                        if let Some(f) = on_pin.take() {
+                            f(&self.message.id, None);
+                        }
+                        ui.close();
+                    }
+                } else {
+                    ui.label(
+                        RichText::new("Připnout pro všechny")
+                            .font(FontId::proportional(11.0))
+                            .color(Color32::from_rgb(0x86, 0x96, 0xA0)),
+                    );
+                    for (label, secs) in [
+                        ("📌 Na 24 hodin", 86_400u32),
+                        ("📌 Na 7 dní", 604_800),
+                        ("📌 Na 30 dní", 2_592_000),
+                    ] {
+                        if ui.button(label).clicked() {
+                            if let Some(f) = on_pin.take() {
+                                f(&self.message.id, Some(secs));
+                            }
+                            ui.close();
+                        }
+                    }
                 }
             }
             if ui.button("Copy").clicked() {

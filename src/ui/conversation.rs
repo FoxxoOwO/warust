@@ -88,7 +88,10 @@ fn show_chat_view(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Chat, 
     }
 
     ui.separator();
-    
+
+    // Above the history, below the header — the same slot WhatsApp uses.
+    show_pinned_banner(ui, state, messages, chat_jid, backend);
+
     // Bottom-up layout pins composer to the absolute bottom of the window (no empty gap)
     ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
         if !selecting {
@@ -346,6 +349,110 @@ fn show_chat_header(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Chat
     ui.add_space(8.0);
 }
 
+/// One-line summary of a pinned message, used by the banner.
+fn pinned_preview(message: &Message) -> String {
+    let text = message.text.trim();
+    if !text.is_empty() {
+        return text.to_string();
+    }
+    match message.media_type {
+        Some(crate::state::MediaType::Image) => "📷 Fotka".to_string(),
+        Some(crate::state::MediaType::Video) => "📹 Video".to_string(),
+        Some(crate::state::MediaType::Audio) => "🎵 Audio".to_string(),
+        Some(crate::state::MediaType::Voice) => "🎤 Hlasová zpráva".to_string(),
+        Some(crate::state::MediaType::Document) => "📄 Dokument".to_string(),
+        Some(crate::state::MediaType::Sticker) => "🎨 Samolepka".to_string(),
+        None => {
+            if message.poll.is_some() {
+                "📊 Anketa".to_string()
+            } else {
+                "Zpráva".to_string()
+            }
+        }
+    }
+}
+
+/// Banner with the chat's pinned message: click jumps to it, ✕ unpins.
+fn show_pinned_banner(
+    ui: &mut Ui,
+    state: &mut AppState,
+    messages: &[Message],
+    chat_jid: &Jid,
+    backend: &crate::backend::BackendHandle,
+) {
+    let Some(pin) = state
+        .pinned
+        .get(chat_jid)
+        .filter(|pin| !pin.expired())
+        .cloned()
+    else {
+        return;
+    };
+    let preview = messages
+        .iter()
+        .find(|message| message.id == pin.message_id)
+        .map(pinned_preview)
+        // The pin can outlive the message (deleted locally, not yet resynced).
+        .unwrap_or_else(|| "Připnutá zpráva už není k dispozici".to_string());
+
+    let mut jump = false;
+    let mut unpin = false;
+
+    egui::Frame::new()
+        .fill(Color32::from_rgb(0x1D, 0x28, 0x2E))
+        .inner_margin(egui::Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("📌").font(FontId::proportional(14.0)));
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new("Připnutá zpráva")
+                            .font(FontId::proportional(11.0))
+                            .color(crate::theme::ACCENT),
+                    );
+                    let label = ui.add(
+                        egui::Label::new(
+                            RichText::new(preview)
+                                .font(FontId::proportional(12.0))
+                                .color(Color32::WHITE),
+                        )
+                        .wrap_mode(egui::TextWrapMode::Truncate)
+                        .sense(egui::Sense::click()),
+                    );
+                    if label.clicked() {
+                        jump = true;
+                    }
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("✕").font(FontId::proportional(13.0)),
+                            )
+                            .frame(false),
+                        )
+                        .on_hover_text("Odepnout")
+                        .clicked()
+                    {
+                        unpin = true;
+                    }
+                });
+            });
+        });
+    ui.add_space(2.0);
+
+    if jump {
+        state.jump_target = Some(crate::state::JumpTarget::new(pin.message_id.clone()));
+    }
+    if unpin {
+        let _ = backend.send_command(Command::PinMessage {
+            chat_jid: chat_jid.clone(),
+            message_id: pin.message_id,
+            duration_secs: None,
+        });
+    }
+}
+
 fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Chat, messages: &[Message], chat_jid: &Jid, backend: &crate::backend::BackendHandle) {
     let available_height = ui.available_height();
     
@@ -356,6 +463,13 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
     // built once per message inside the scroll loop.
     let poll_click = std::rc::Rc::new(std::cell::RefCell::new(None::<(String, String)>));
     let poll_submit = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+    // (message id, duration) — `None` duration means "unpin".
+    let pin_action = std::rc::Rc::new(std::cell::RefCell::new(None::<(String, Option<u32>)>));
+    let pinned_id = state
+        .pinned
+        .get(chat_jid)
+        .filter(|pin| !pin.expired())
+        .map(|pin| pin.message_id.clone());
     let me_jid = state
         .self_jid
         .as_ref()
@@ -448,6 +562,8 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
                     // One handle pair per bubble: the callbacks are `move`.
                     let poll_click_handle = poll_click.clone();
                     let poll_submit_handle = poll_submit.clone();
+                    let pin_handle = pin_action.clone();
+                    let is_pinned = pinned_id.as_deref() == Some(msg.id.as_str());
 
                     let bubble_resp = MessageBubble::new(msg, is_own)
                         .show_sender(sender_name_str)
@@ -481,6 +597,13 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
                             let to_open_picker = to_open_picker.clone();
                             move |id| {
                                 *to_open_picker.borrow_mut() = Some(id.to_string());
+                            }
+                        })
+                        .is_pinned(is_pinned)
+                        .on_pin({
+                            let msg_id = msg.id.clone();
+                            move |_id: &str, secs: Option<u32>| {
+                                *pin_handle.borrow_mut() = Some((msg_id.clone(), secs));
                             }
                         })
                         .highlight(jump_here)
@@ -566,6 +689,15 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
         let _ = backend.send_command(Command::DownloadMedia {
             chat_jid: chat_jid.clone(),
             message_id: id,
+        });
+    }
+
+    let pin_request = pin_action.borrow().clone();
+    if let Some((message_id, secs)) = pin_request {
+        let _ = backend.send_command(Command::PinMessage {
+            chat_jid: chat_jid.clone(),
+            message_id,
+            duration_secs: secs,
         });
     }
 
@@ -1247,5 +1379,40 @@ pub fn show_reaction_detail_modal(ctx: &Context, state: &SharedState, backend: &
 
     if should_close || !is_open {
         state.write().reaction_detail_modal = None;
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base(id: &str, text: &str) -> Message {
+        let jid: Jid = "123@s.whatsapp.net".parse().unwrap();
+        Message::new_text(
+            id.to_string(),
+            jid.clone(),
+            jid,
+            text.to_string(),
+            chrono::Utc::now(),
+            false,
+            crate::state::MessageStatus::Delivered,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn pinned_preview_prefers_text_over_media_kind() {
+        let mut msg = base("a", "  nazdar  ");
+        msg.media_type = Some(crate::state::MediaType::Image);
+        assert_eq!(pinned_preview(&msg), "nazdar");
+    }
+
+    #[test]
+    fn pinned_preview_describes_media_without_caption() {
+        let mut msg = base("b", "");
+        msg.media_type = Some(crate::state::MediaType::Voice);
+        assert_eq!(pinned_preview(&msg), "🎤 Hlasová zpráva");
+        msg.media_type = None;
+        assert_eq!(pinned_preview(&msg), "Zpráva");
     }
 }
