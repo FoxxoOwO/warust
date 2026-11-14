@@ -726,6 +726,15 @@ fn extract_poll_creation(message: &wa::Message, sender: &Jid) -> Option<crate::s
 /// Votes are separate messages carrying only ciphertext, so they are never
 /// stored as bubbles: the option hashes are mapped back to the option names we
 /// keep for the poll and counted from there.
+/// Map a requested pin duration onto the three lengths WhatsApp offers.
+fn pin_duration(secs: u32) -> whatsapp_rust::send::PinDuration {
+    match secs {
+        86_400 => whatsapp_rust::send::PinDuration::Hours24,
+        2_592_000 => whatsapp_rust::send::PinDuration::Days30,
+        _ => whatsapp_rust::send::PinDuration::Days7,
+    }
+}
+
 async fn apply_poll_vote(
     client: Arc<Client>,
     state: SharedState,
@@ -904,6 +913,47 @@ async fn handle_incoming_message(
             )
             .await;
         }
+        return;
+    }
+
+    // Pin/unpin is a control message too: it rewrites `AppState.pinned` and
+    // must not turn into a bubble. WhatsApp pins for everyone, so at most one
+    // pin exists per chat and the newest one replaces the previous.
+    if let Some(pin) = base_msg.pin_in_chat_message.as_option() {
+        let target = pin
+            .key
+            .as_option()
+            .and_then(|key| key.id.clone())
+            .unwrap_or_default();
+        let canon_chat = if info.source.is_group {
+            chat_jid.clone()
+        } else {
+            state.read().canonical_jid(&chat_jid)
+        };
+        let unpin = matches!(
+            pin.r#type.as_ref(),
+            Some(&wa::message::pin_in_chat_message::Type::UnpinForAll)
+        );
+        {
+            let mut s = state.write();
+            if unpin {
+                s.pinned.remove(&canon_chat);
+            } else if !target.is_empty() {
+                // Duration travels beside the pin, not inside it.
+                let duration = base_msg
+                    .message_context_info
+                    .as_option()
+                    .and_then(|ctx| ctx.message_add_on_duration_in_secs);
+                let entry = crate::state::PinnedMessage::new(
+                    target,
+                    duration,
+                    Some(sender_jid.clone()),
+                );
+                s.pinned.insert(canon_chat.clone(), entry);
+            }
+            s.dirty = true;
+        }
+        let _ = crate::storage::persist_state(&state).await;
         return;
     }
 
@@ -2951,6 +3001,58 @@ async fn handle_command(
             client.chat_actions().unstar_message(&chat_jid, participant_jid.as_ref(), &message_id, from_me).await?;
         }
         
+        Command::PinMessage { chat_jid, message_id, duration_secs } => {
+            let canon_chat = state.read().canonical_jid(&chat_jid);
+            let (from_me, sender_jid) = state
+                .read()
+                .messages
+                .get(&canon_chat)
+                .and_then(|msgs| msgs.iter().find(|m| m.id == message_id))
+                .map(|m| (m.from_me, m.sender_jid.clone()))
+                .unwrap_or((true, canon_chat.clone()));
+            let is_group = state
+                .read()
+                .chats
+                .get(&canon_chat)
+                .map_or(false, |chat| chat.is_group);
+            let key = wa::MessageKey {
+                id: Some(message_id.clone()),
+                from_me: Some(from_me),
+                remote_jid: Some(canon_chat.to_string()),
+                // Group pins must name the original sender, or the server
+                // cannot resolve the key.
+                participant: if is_group && !from_me {
+                    Some(sender_jid.to_string())
+                } else {
+                    None
+                },
+                ..Default::default()
+            };
+            match duration_secs {
+                Some(secs) => {
+                    client
+                        .pin_message(canon_chat.clone(), key, pin_duration(secs))
+                        .await?
+                }
+                None => client.unpin_message(canon_chat.clone(), key).await?,
+            }
+            {
+                let mut s = state.write();
+                match duration_secs {
+                    Some(secs) => {
+                        let me = client.pn().or(client.lid());
+                        let entry =
+                            crate::state::PinnedMessage::new(message_id, Some(secs), me);
+                        s.pinned.insert(canon_chat.clone(), entry);
+                    }
+                    None => {
+                        s.pinned.remove(&canon_chat);
+                    }
+                }
+                s.dirty = true;
+            }
+        }
+
         Command::DeleteMessageForMe { chat_jid, message_id } => {
             let res = client.revoke_message(chat_jid.clone(), message_id.clone(), whatsapp_rust::send::RevokeType::Sender).await;
             {

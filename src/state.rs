@@ -525,6 +525,45 @@ impl NewPollState {
     }
 }
 
+/// A message pinned to the top of a chat.
+///
+/// WhatsApp pins for everyone, so this mirrors the server's current pin: one
+/// per chat, replaced by the next pin. `until` is `None` when the duration is
+/// unknown (older clients send no duration) — such a pin lives until unpinned.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PinnedMessage {
+    pub message_id: String,
+    pub pinned_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_by: Option<Jid>,
+}
+
+impl PinnedMessage {
+    pub fn new(
+        message_id: impl Into<String>,
+        duration_secs: Option<u32>,
+        pinned_by: Option<Jid>,
+    ) -> Self {
+        let pinned_at = Utc::now();
+        let until = duration_secs
+            .filter(|secs| *secs > 0)
+            .and_then(|secs| chrono::Duration::try_seconds(secs as i64))
+            .map(|duration| pinned_at + duration);
+        Self {
+            message_id: message_id.into(),
+            pinned_at,
+            until,
+            pinned_by,
+        }
+    }
+
+    pub fn expired(&self) -> bool {
+        self.until.is_some_and(|until| until <= Utc::now())
+    }
+}
+
 /// A destructive action that asks for confirmation first.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConfirmRequest {
@@ -542,6 +581,27 @@ pub enum ConfirmAction {
     DeleteChat { chat_jid: Jid },
     RemoveMember { chat_jid: Jid, member: Jid },
 }
+/// Tabs of the media gallery in the chat info panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GalleryTab {
+    #[default]
+    Media,
+    Documents,
+    Links,
+}
+
+impl GalleryTab {
+    pub const ALL: [GalleryTab; 3] = [GalleryTab::Media, GalleryTab::Documents, GalleryTab::Links];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            GalleryTab::Media => "Fotky a videa",
+            GalleryTab::Documents => "Dokumenty",
+            GalleryTab::Links => "Odkazy",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppState {
     pub chats: HashMap<Jid, Chat>,
@@ -569,6 +629,12 @@ pub struct AppState {
     /// and `Jid` does not serialize as one.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub group_info: HashMap<String, GroupInfoSnapshot>,
+    /// One pinned message per chat, mirroring the server-side pin.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub pinned: HashMap<Jid, PinnedMessage>,
+    /// Selected tab of the media gallery in the chat info panel.
+    #[serde(skip)]
+    pub gallery_tab: GalleryTab,
     /// New-group dialog, `None` when closed.
     #[serde(skip)]
     pub new_group: Option<NewGroupState>,
@@ -698,6 +764,8 @@ impl Default for AppState {
             new_chat_input: String::new(),
             new_chat_error: None,
             group_info: HashMap::new(),
+            pinned: HashMap::new(),
+            gallery_tab: GalleryTab::default(),
             new_group: None,
             add_member: None,
             show_contacts_dialog: false,

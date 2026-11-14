@@ -155,6 +155,13 @@ pub enum Command {
         is_admin: bool,
         original_sender: Option<Jid>,
     },
+
+    /// Pin a message for everyone. `duration_secs: None` unpins instead.
+    PinMessage {
+        chat_jid: Jid,
+        message_id: String,
+        duration_secs: Option<u32>,
+    },
     
     // Contact actions
     SaveContact {
