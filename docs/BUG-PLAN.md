@@ -116,4 +116,4 @@ Postup, který se osvědčil u posledních dvou bugů:
 | BUG-20261114-07 | `cargo fmt --check` neprochází, formátování je v repu nekonzistentní | P3 | otevřeno — srovnat jednorázově, pak zapnout jako bránu |
 | BUG-20261114-08 | Nečinné okno si říkalo o frame každých 100 ms (`src/app.rs:297`), takže drželo GPU vzhůru a kreslilo tytéž pixely | P1 | opraveno (PR #29), kryto `idle_state_does_not_ask_for_animation_frames` |
 | BUG-20261114-09 | `extract_message_text` měl `for` přes tři poll payloady, který vracel v první iteraci (clippy `never_loop`) | P2 | opraveno (PR #29) — `or_else` řetěz se stejnou sémantikou |
-| BUG-20261114-10 | Panel zpráv nemá virtualizaci: kreslí všechny bubliny historie v každém framu | P1 | otevřeno — přírůstek: arrivals se už čtou jednou za frame (PR #29) |
+| BUG-20261114-10 | Panel zpráv nemá virtualizaci: kreslí všechny bubliny historie v každém framu | P1 | opraveno (PR #33) — 2000 zpráv 4,67 → 0,08 ms; kryto `a_long_history_only_draws_the_rows_around_the_viewport`, `spacers_keep_the_content_height` |
