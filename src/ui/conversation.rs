@@ -556,6 +556,81 @@ fn show_empty_chat(ui: &mut Ui, chat: &crate::state::Chat, backend: &crate::back
     });
 }
 
+/// Recording bar shown in place of the composer while a voice note is captured.
+fn show_recorder_bar(
+    ui: &mut Ui,
+    state: &mut AppState,
+    chat_jid: &Jid,
+    backend: &crate::backend::BackendHandle,
+) {
+    let elapsed = std::time::Duration::from_millis(crate::recorder::elapsed_ms());
+    Frame::new()
+        .fill(Color32::from_rgb(0x1F, 0x2C, 0x34))
+        .inner_margin(Margin::symmetric(16, 10))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                // Blink the dot twice a second so it reads as "live".
+                let on = (elapsed.as_millis() / 500) % 2 == 0;
+                let dot = if on {
+                    Color32::from_rgb(0xE6, 0x4A, 0x4A)
+                } else {
+                    Color32::from_rgb(0x7A, 0x2B, 0x2B)
+                };
+                ui.label(RichText::new("●").font(FontId::proportional(16.0)).color(dot));
+                ui.label(
+                    RichText::new(crate::audio::format_duration(elapsed))
+                        .font(FontId::proportional(15.0))
+                        .color(Color32::WHITE),
+                );
+                ui.label(
+                    RichText::new("Nahrávání…")
+                        .font(FontId::proportional(12.0))
+                        .color(Color32::from_rgb(0x86, 0x96, 0xA0)),
+                );
+
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let send = ui.add(
+                        egui::Button::new(
+                            RichText::new("➤")
+                                .font(FontId::proportional(22.0))
+                                .color(Color32::WHITE),
+                        )
+                        .frame(false)
+                        .fill(Color32::from_rgb(0x00, 0x80, 0x69)),
+                    );
+                    if send.on_hover_text("Odeslat hlasovou zprávu").clicked() {
+                        match crate::recorder::finish() {
+                            Ok(recording) => {
+                                state.recorder_error = None;
+                                let _ = backend.send_command(Command::SendVoiceNote {
+                                    chat_jid: chat_jid.clone(),
+                                    file_path: recording.path,
+                                    duration_seconds: (recording.duration_ms / 1000).max(1) as u32,
+                                    waveform: recording.waveform,
+                                });
+                            }
+                            Err(message) => state.recorder_error = Some(message),
+                        }
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("✕").font(FontId::proportional(18.0)),
+                            )
+                            .frame(false),
+                        )
+                        .on_hover_text("Zahodit nahrávku")
+                        .clicked()
+                    {
+                        crate::recorder::cancel();
+                    }
+                });
+            });
+        });
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(200));
+}
+
 fn show_composer(ui: &mut Ui, state: &mut AppState, chat_jid: &Jid, backend: &crate::backend::BackendHandle) {
     ui.add_space(4.0);
 
@@ -684,6 +759,35 @@ fn show_composer(ui: &mut Ui, state: &mut AppState, chat_jid: &Jid, backend: &cr
         state.pending_attachment = None;
     }
 
+    if let Some(message) = state.recorder_error.clone() {
+        Frame::new()
+            .fill(Color32::from_rgb(0x3A, 0x1E, 0x22))
+            .inner_margin(Margin::symmetric(14, 6))
+            .corner_radius(egui::CornerRadius::same(6))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("⚠ Mikrofon: {message}"))
+                            .font(FontId::proportional(12.0))
+                            .color(Color32::from_rgb(0xF2, 0x8B, 0x82)),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("✕").clicked() {
+                            state.recorder_error = None;
+                        }
+                    });
+                });
+            });
+        ui.add_space(2.0);
+    }
+
+    // While a take is running the composer row is replaced by the recorder bar,
+    // so a stray Enter cannot send text halfway through a voice note.
+    if crate::recorder::is_recording() {
+        show_recorder_bar(ui, state, chat_jid, backend);
+        return;
+    }
+
     Frame::new()
         .fill(Color32::from_rgb(0x1F, 0x2C, 0x34))
         .inner_margin(Margin::symmetric(16, 10))
@@ -749,11 +853,28 @@ fn show_composer(ui: &mut Ui, state: &mut AppState, chat_jid: &Jid, backend: &cr
                     state.show_schedule_dialog = true;
                 }
                 
-                let send_btn = ui.add(
-                    egui::Button::new(RichText::new("➤").font(FontId::proportional(22.0)).color(if can_send { Color32::WHITE } else { Color32::from_rgb(0x86, 0x96, 0xA0) }))
-                        .frame(false)
-                        .fill(if can_send { Color32::from_rgb(0x00, 0x80, 0x69) } else { Color32::TRANSPARENT })
-                ).on_hover_text("Send");
+                // WhatsApp swaps the send arrow for a microphone while the box
+                // is empty, so recording never needs a second control.
+                let send_btn = if can_send {
+                    ui.add(
+                        egui::Button::new(RichText::new("➤").font(FontId::proportional(22.0)).color(Color32::WHITE))
+                            .frame(false)
+                            .fill(Color32::from_rgb(0x00, 0x80, 0x69))
+                    ).on_hover_text("Send")
+                } else {
+                    ui.add(
+                        egui::Button::new(RichText::new("🎤").font(FontId::proportional(20.0)).color(Color32::from_rgb(0x86, 0x96, 0xA0)))
+                            .frame(false)
+                            .fill(Color32::TRANSPARENT)
+                    ).on_hover_text("Nahrát hlasovou zprávu")
+                };
+
+                if !can_send && send_btn.clicked() {
+                    match crate::recorder::start() {
+                        Ok(()) => ui.ctx().request_repaint(),
+                        Err(message) => state.recorder_error = Some(message),
+                    }
+                }
                 
                 if (enter_pressed || send_btn.clicked()) && can_send {
                     let text = state.composer_text.trim().to_string();

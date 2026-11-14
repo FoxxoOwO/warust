@@ -8,6 +8,7 @@ mod app;
 pub mod notifications;
 pub mod audio;
 pub mod video;
+pub mod recorder;
 pub mod autostart;
 mod backend;
 mod commands;

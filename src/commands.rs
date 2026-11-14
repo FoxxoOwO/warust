@@ -38,6 +38,13 @@ pub enum Command {
         caption: Option<String>,
         reply_to: Option<String>,
     },
+    /// Send a recorded voice note (already encoded to OGG/Opus by the recorder).
+    SendVoiceNote {
+        chat_jid: Jid,
+        file_path: std::path::PathBuf,
+        duration_seconds: u32,
+        waveform: Vec<u8>,
+    },
     /// Relay already-sent messages into another chat (`Client::forward_message`).
     ///
     /// `from_chat` is where the ids live; the backend rebuilds each body from
@@ -191,6 +198,10 @@ pub enum Command {
     GetGroupInviteLink {
         chat_jid: Jid,
     },
+    /// Fetch description, admin flags and settings for a group.
+    RequestGroupInfo {
+        chat_jid: Jid,
+    },
     SetGroupSubject {
         chat_jid: Jid,
         subject: String,
@@ -202,6 +213,16 @@ pub enum Command {
     SetEphemeral {
         chat_jid: Jid,
         expiration: u32,
+    },
+    /// Only admins may send messages while this is on.
+    SetGroupAnnounce {
+        chat_jid: Jid,
+        enabled: bool,
+    },
+    /// Only admins may edit the group subject, description and picture.
+    SetGroupLocked {
+        chat_jid: Jid,
+        enabled: bool,
     },
     
     // Presence

@@ -5974,6 +5974,7 @@ dependencies = [
  "async-channel",
  "chrono",
  "console_error_panic_hook",
+ "cpal",
  "dirs",
  "eframe",
  "egui",

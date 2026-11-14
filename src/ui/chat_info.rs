@@ -122,7 +122,7 @@ fn info_row(ui: &mut egui::Ui, label: &str, value: &str) {
 
 fn contact_details(
     ui: &mut egui::Ui,
-    state: &AppState,
+    state: &mut AppState,
     chat: &Chat,
     backend: &BackendHandle,
 ) {
@@ -168,21 +168,188 @@ fn contact_details(
         ))
         .clicked()
     {
-        let cmd = if blocked {
-            Command::UnblockContact {
+        if blocked {
+            let _ = backend.send_command(Command::UnblockContact {
                 jid: chat.jid.clone(),
-            }
+            });
         } else {
-            Command::BlockContact {
-                jid: chat.jid.clone(),
-            }
-        };
-        let _ = backend.send_command(cmd);
+            crate::ui::confirm_dialog::ask(
+                state,
+                format!("Blokovat {}?", chat.name),
+                "Nebudou ti chodit zprávy ani hovory a nebude vidět, že jsi online.",
+                "Blokovat",
+                crate::state::ConfirmAction::BlockContact {
+                    jid: chat.jid.clone(),
+                },
+            );
+        }
     }
 }
 
-fn group_details(ui: &mut egui::Ui, state: &AppState, chat: &Chat, backend: &BackendHandle) {
+fn group_details(ui: &mut egui::Ui, state: &mut AppState, chat: &Chat, backend: &BackendHandle) {
+    let key = chat.jid.to_string();
+    let snapshot = state.group_info.get(&key).cloned().unwrap_or_default();
+    let is_admin = state
+        .self_jid
+        .as_ref()
+        .map(|me| snapshot.is_admin(&state.canonical_jid(me)))
+        .unwrap_or(false);
+
+    // Ask once per group; the backend fills the snapshot and the panel redraws.
+    if !state.group_info.contains_key(&key) && !state.group_info_pending.contains(&key) {
+        state.group_info_pending.insert(key.clone());
+        let _ = backend.send_command(Command::RequestGroupInfo {
+            chat_jid: chat.jid.clone(),
+        });
+    } else if state.group_info.contains_key(&key) {
+        state.group_info_pending.remove(&key);
+    }
+
+    // --- Subject ---
+    section_title(ui, "NÁZEV SKUPINY");
+    let editing_subject = matches!(&state.group_subject_draft, Some((j, _)) if j == &chat.jid);
+    if editing_subject {
+        let mut save = None;
+        let mut cancel = false;
+        if let Some((_, draft)) = state.group_subject_draft.as_mut() {
+            ui.add(
+                egui::TextEdit::singleline(draft)
+                    .hint_text("Název skupiny")
+                    .desired_width(ui.available_width()),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Uložit").clicked() {
+                    save = Some(draft.trim().to_string());
+                }
+                if ui.button("Zrušit").clicked() {
+                    cancel = true;
+                }
+            });
+        }
+        if let Some(subject) = save {
+            if !subject.is_empty() {
+                let _ = backend.send_command(Command::SetGroupSubject {
+                    chat_jid: chat.jid.clone(),
+                    subject,
+                });
+                state.group_subject_draft = None;
+            }
+        } else if cancel {
+            state.group_subject_draft = None;
+        }
+    } else {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(&chat.name)
+                    .font(FontId::proportional(13.0))
+                    .color(Color32::WHITE),
+            );
+            if is_admin && ui.small_button("✏").clicked() {
+                state.group_subject_draft = Some((chat.jid.clone(), chat.name.clone()));
+            }
+        });
+    }
+
+    // --- Description ---
+    section_title(ui, "POPIS SKUPINY");
+    let editing_desc = matches!(&state.group_desc_draft, Some((j, _)) if j == &chat.jid);
+    if editing_desc {
+        let mut save = None;
+        let mut cancel = false;
+        if let Some((_, draft)) = state.group_desc_draft.as_mut() {
+            ui.add(
+                egui::TextEdit::multiline(draft)
+                    .hint_text("Čím se skupina zabývá…")
+                    .desired_rows(3)
+                    .desired_width(ui.available_width()),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Uložit").clicked() {
+                    save = Some(draft.trim().to_string());
+                }
+                if ui.button("Zrušit").clicked() {
+                    cancel = true;
+                }
+            });
+        }
+        if let Some(description) = save {
+            let _ = backend.send_command(Command::SetGroupDescription {
+                chat_jid: chat.jid.clone(),
+                description,
+            });
+            state.group_desc_draft = None;
+        } else if cancel {
+            state.group_desc_draft = None;
+        }
+    } else {
+        match snapshot.description.as_deref().filter(|d| !d.trim().is_empty()) {
+            Some(description) => {
+                ui.label(
+                    RichText::new(description)
+                        .font(FontId::proportional(13.0))
+                        .color(MUTED_TEXT),
+                );
+            }
+            None => {
+                ui.label(
+                    RichText::new("Skupina zatím nemá popis.")
+                        .font(FontId::proportional(12.0))
+                        .color(MUTED_TEXT),
+                );
+            }
+        }
+        if is_admin
+            && ui
+                .add(egui::Button::new(
+                    RichText::new("Upravit popis").font(FontId::proportional(12.0)),
+                ))
+                .clicked()
+        {
+            state.group_desc_draft = Some((
+                chat.jid.clone(),
+                snapshot.description.clone().unwrap_or_default(),
+            ));
+        }
+    }
+
+    // Admin switches for the two group-wide restrictions.
+    ui.add_space(4.0);
+    if is_admin {
+        let mut announce = snapshot.is_announcement;
+        if ui
+            .checkbox(&mut announce, "Zprávy mohou psát jen admini")
+            .changed()
+        {
+            let _ = backend.send_command(Command::SetGroupAnnounce {
+                chat_jid: chat.jid.clone(),
+                enabled: announce,
+            });
+        }
+        let mut locked = snapshot.is_locked;
+        if ui
+            .checkbox(&mut locked, "Info skupiny mohou měnit jen admini")
+            .changed()
+        {
+            let _ = backend.send_command(Command::SetGroupLocked {
+                chat_jid: chat.jid.clone(),
+                enabled: locked,
+            });
+        }
+    } else {
+        if snapshot.is_announcement {
+            info_row(ui, "Zprávy", "jen administrátoři");
+        }
+        if snapshot.is_locked {
+            info_row(ui, "Úpravy", "jen administrátoři");
+        }
+    }
+
+    // --- Members ---
     section_title(ui, &format!("ČLENOVÉ ({})", chat.participants.len()));
+    let mut remove_member: Option<Jid> = None;
+    let mut promote_member: Option<Jid> = None;
+    let mut demote_member: Option<Jid> = None;
+
     if chat.participants.is_empty() {
         ui.label(
             RichText::new("Seznam členů zatím není k dispozici.")
@@ -190,33 +357,126 @@ fn group_details(ui: &mut egui::Ui, state: &AppState, chat: &Chat, backend: &Bac
                 .color(MUTED_TEXT),
         );
     } else {
-        let mut participants: Vec<&Jid> = chat
+        let me = state.self_jid.as_ref().map(|j| state.canonical_jid(j));
+        let mut participants: Vec<Jid> = chat
             .participants
             .iter()
-            .filter(|p| Some(*p) != state.self_jid.as_ref())
+            .filter(|p| Some(*p) != me.as_ref())
+            .cloned()
             .collect();
         participants.sort_by_key(|p| display_name_for(state, p).to_lowercase());
+
         egui::ScrollArea::vertical()
             .id_salt("chat_info_participants")
-            .max_height(220.0)
+            .max_height(240.0)
             .auto_shrink([false, true])
             .show(ui, |ui| {
-                for participant in participants {
+                for participant in &participants {
+                    let name = display_name_for(state, participant);
+                    let admin = snapshot.is_admin(participant);
                     ui.horizontal(|ui| {
-                        ui.add(
-                            Avatar::new(display_name_for(state, participant))
-                                .jid(participant.clone())
-                                .size(26.0),
-                        );
+                        ui.add(Avatar::new(&name).jid(participant.clone()).size(26.0));
                         ui.add_space(6.0);
                         ui.label(
-                            RichText::new(display_name_for(state, participant))
+                            RichText::new(&name)
                                 .font(FontId::proportional(13.0))
                                 .color(Color32::WHITE),
                         );
+                        if admin {
+                            ui.label(
+                                RichText::new("admin")
+                                    .font(FontId::proportional(10.0))
+                                    .color(crate::theme::ACCENT),
+                            );
+                        }
+                        if is_admin {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.menu_button("⋯", |ui| {
+                                    if admin {
+                                        if ui.button("Odebrat admina").clicked() {
+                                            demote_member = Some(participant.clone());
+                                            ui.close();
+                                        }
+                                    } else if ui.button("Povýšit na admina").clicked() {
+                                        promote_member = Some(participant.clone());
+                                        ui.close();
+                                    }
+                                    if ui
+                                        .button(RichText::new("Odebrat ze skupiny").color(DANGER))
+                                        .clicked()
+                                    {
+                                        remove_member = Some(participant.clone());
+                                        ui.close();
+                                    }
+                                });
+                            });
+                        }
                     });
                 }
             });
+    }
+
+    if is_admin
+        && ui
+            .add(egui::Button::new(
+                RichText::new("➕  Přidat člena").font(FontId::proportional(12.0)),
+            ))
+            .clicked()
+    {
+        state.add_member = Some(crate::state::AddMemberState {
+            group_jid: chat.jid.clone(),
+            search: String::new(),
+            selected: Default::default(),
+        });
+    }
+
+    if let Some(member) = promote_member {
+        let _ = backend.send_command(Command::PromoteParticipants {
+            chat_jid: chat.jid.clone(),
+            participants: vec![member],
+        });
+    }
+    if let Some(member) = demote_member {
+        let _ = backend.send_command(Command::DemoteParticipants {
+            chat_jid: chat.jid.clone(),
+            participants: vec![member],
+        });
+    }
+    if let Some(member) = remove_member {
+        let member_name = display_name_for(state, &member);
+        crate::ui::confirm_dialog::ask(
+            state,
+            format!("Odebrat {member_name} ze skupiny?"),
+            "Tato osoba přestane dostávat zprávy skupiny.",
+            "Odebrat",
+            crate::state::ConfirmAction::RemoveMember {
+                chat_jid: chat.jid.clone(),
+                member,
+            },
+        );
+    }
+
+    // --- Invite link ---
+    section_title(ui, "POZVÁNKOVÝ ODKAZ");
+    match snapshot.invite_link.as_deref() {
+        Some(link) => {
+            let short: String = link.chars().take(38).collect();
+            ui.label(
+                RichText::new(format!("{short}…"))
+                    .font(FontId::proportional(11.0))
+                    .color(MUTED_TEXT),
+            );
+            if ui.button("Kopírovat odkaz").clicked() {
+                ui.ctx().copy_text(link.to_string());
+            }
+        }
+        None => {
+            if ui.button("Získat odkaz").clicked() {
+                let _ = backend.send_command(Command::GetGroupInviteLink {
+                    chat_jid: chat.jid.clone(),
+                });
+            }
+        }
     }
 
     ui.add_space(8.0);
@@ -231,9 +491,15 @@ fn group_details(ui: &mut egui::Ui, state: &AppState, chat: &Chat, backend: &Bac
         ))
         .clicked()
     {
-        let _ = backend.send_command(Command::LeaveGroup {
-            chat_jid: chat.jid.clone(),
-        });
+        crate::ui::confirm_dialog::ask(
+            state,
+            format!("Opustit skupinu {}?", chat.name),
+            "Zprávy, které jsi poslal, zůstanou ostatním.",
+            "Opustit",
+            crate::state::ConfirmAction::LeaveGroup {
+                chat_jid: chat.jid.clone(),
+            },
+        );
     }
 }
 
@@ -332,8 +598,14 @@ fn chat_settings(ui: &mut egui::Ui, state: &mut AppState, chat: &Chat, backend: 
         ))
         .clicked()
     {
-        let _ = backend.send_command(Command::ClearChat {
-            chat_jid: chat.jid.clone(),
-        });
+        crate::ui::confirm_dialog::ask(
+            state,
+            format!("Vymazat zprávy v chatu {}?", chat.name),
+            "Historie zmizí jen u tebe, ostatní ji pořád uvidí.",
+            "Vymazat",
+            crate::state::ConfirmAction::ClearChat {
+                chat_jid: chat.jid.clone(),
+            },
+        );
     }
 }
