@@ -7,13 +7,29 @@ also published on the [Releases page](https://github.com/FoxxoOwO/warust/release
 
 ## [Unreleased]
 
-### Added
+## [0.3.0] - 2026-11-14
+
+Updates arrive on their own from this version on, and the interface finally
+moves instead of snapping.
+
+### Added — updates
 - Automatic update checks against the GitHub releases API: a background check
   every six hours, a manual "Check for updates" button and an update dialog with
   the release notes.
 - Self-update: the app downloads the platform package, replaces its own
   executable through a detached script, and restarts.
 - Update preferences: background checking and silent auto-install.
+
+### Added — interface
+- Animation pass across the main surfaces. Chat list rows cross-fade on hover and
+  selection and grow an accent bar; switching chats fades the whole conversation
+  in; messages that arrive fade in with a short stagger; the history scrolls
+  smoothly; and the jump-to-message highlight now fades in and back out instead of
+  blinking off after two seconds.
+
+### Fixed
+- Faded accent colours no longer darken towards black while they lose opacity.
+- The message history no longer paints over the composer.
 
 ## [0.2.0] - 2026-11-14
 
