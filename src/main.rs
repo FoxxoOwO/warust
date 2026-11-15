@@ -24,6 +24,7 @@ mod theme;
 pub mod tray;
 mod ui;
 mod updater;
+mod i18n;
 mod util;
 mod vcard;
 

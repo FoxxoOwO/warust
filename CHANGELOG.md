@@ -7,6 +7,40 @@ also published on the [Releases page](https://github.com/FoxxoOwO/warust/release
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-11-15
+
+Messages show up again in long chats, quit means quit, the built-in updater can
+download its own package, and the interface speaks English.
+
+### Fixed
+- A chat with a long history drew nothing at all after 0.3.4: the visible window
+  was computed by subtracting a content-space row offset from a screen-space
+  cursor, so scrolling down pushed the window past the end of the history (a 1901
+  message chat scrolled to the bottom asked for a start roughly twice the length
+  of the whole history and drew zero rows). The window is now computed in one
+  coordinate system and its start is clamped to the end of the history.
+- "Quit Warust" in the notification area only hid the window: the close-to-tray
+  rule cancelled the close request, so the process kept running and never logged
+  a shutdown. A tray quit now carries a flag that the rule respects.
+- "Download and install" always failed with "the response body is larger than
+  request limit: 10485760": the package is 144 241 688 bytes, but the body was
+  read into memory through an API capped at 10 MiB. The body now streams straight
+  to disk, a partial file is deleted after a failure instead of being left to look
+  like a valid package, and an empty response is rejected.
+
+### Added
+- English interface: Settings → Appearance → Interface language switches between
+  Čeština and English and applies immediately (the notification-area icon follows
+  after a restart). Czech strings stay the translation keys, so a missing English
+  text falls back to Czech instead of disappearing, and a test fails the build when
+  a `tr!` string has no English counterpart or a translation is unused.
+- A jump-to-newest-messages button appears above the composer while you are
+  reading older history, and hides again once the tail is on screen.
+
+### Changed
+- The update dialog and update statuses are translated, and the dialog reports a
+  failed download where you can see it instead of closing silently.
+
 ## [0.3.4] - 2026-11-15
 
 Scrolls smoothly in long chats: the message panel no longer draws, nor copies, the

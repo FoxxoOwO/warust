@@ -51,7 +51,8 @@ pub fn show_chat_list(ui: &mut Ui, state: &SharedState, backend: &crate::backend
                         if !archived.is_empty() {
                             ui.add_space(6.0);
                             let arrow = if show_archived { "▾" } else { "▸" };
-                            let label = format!("{arrow}  Archivované ({})", archived.len());
+                            let label =
+                                format!("{arrow}  {} ({})", crate::tr!("Archivované"), archived.len());
                             let toggle = ui
                                 .add(
                                     egui::Button::new(
@@ -60,7 +61,7 @@ pub fn show_chat_list(ui: &mut Ui, state: &SharedState, backend: &crate::backend
                                     .frame(false)
                                     .fill(Color32::TRANSPARENT),
                                 )
-                                .on_hover_text("Zobrazit archivované chaty");
+                                .on_hover_text(crate::tr!("Zobrazit archivované chaty"));
                             if toggle.clicked() {
                                 toggle_archived = true;
                             }
@@ -213,7 +214,7 @@ fn show_header(ui: &mut Ui, state: &mut AppState, backend: &crate::backend::Back
         let refresh_btn = ui.add(
             egui::Button::new(RichText::new("🔄").font(FontId::proportional(15.0)))
                 .frame(true)
-        ).on_hover_text("Synchronizovat kontakty a názvy z WhatsAppu");
+        ).on_hover_text(crate::tr!("Synchronizovat kontakty a názvy z WhatsAppu"));
         
         if refresh_btn.clicked() {
             let _ = backend.send_command(crate::commands::Command::RefreshChats);
@@ -246,7 +247,7 @@ fn show_header(ui: &mut Ui, state: &mut AppState, backend: &crate::backend::Back
                     )
                     .frame(true),
                 )
-                .on_hover_text("Skočit na další nepřečtenou zprávu (Alt+↓)");
+                .on_hover_text(crate::tr!("Skočit na další nepřečtenou zprávu (Alt+↓)"));
             if next_btn.clicked()
                 || ui.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::ArrowDown))
             {
@@ -265,12 +266,12 @@ fn show_header(ui: &mut Ui, state: &mut AppState, backend: &crate::backend::Back
             .inner_margin(Margin::same(10))
             .corner_radius(egui::CornerRadius::same(8))
             .show(ui, |ui| {
-                ui.label(RichText::new("Nová konverzace").font(FontId::proportional(13.0)).color(Color32::WHITE));
+                ui.label(RichText::new(crate::tr!("Nová konverzace")).font(FontId::proportional(13.0)).color(Color32::WHITE));
                 ui.add_space(6.0);
                 // The two ways of starting a conversation that are not a phone
                 // number live here so the ➕ button covers everything.
                 ui.horizontal(|ui| {
-                    if ui.button("👥  Nová skupina").clicked() {
+                    if ui.button(crate::tr!("👥  Nová skupina")).clicked() {
                         state.new_group = Some(crate::state::NewGroupState::default());
                         state.show_new_chat_dialog = false;
                     }
@@ -283,7 +284,7 @@ fn show_header(ui: &mut Ui, state: &mut AppState, backend: &crate::backend::Back
                 ui.separator();
                 ui.add_space(4.0);
                 // Joining by link lives here because it needs no contact.
-                ui.label(RichText::new("Připojit se do skupiny").font(FontId::proportional(13.0)).color(Color32::WHITE));
+                ui.label(RichText::new(crate::tr!("Připojit se do skupiny")).font(FontId::proportional(13.0)).color(Color32::WHITE));
                 ui.add_space(4.0);
                 let mut join_requested = false;
                 ui.horizontal(|ui| {
@@ -296,14 +297,14 @@ fn show_header(ui: &mut Ui, state: &mut AppState, backend: &crate::backend::Back
                     if input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         join_requested = true;
                     }
-                    if ui.button("Připojit").clicked() {
+                    if ui.button(crate::tr!("Připojit")).clicked() {
                         join_requested = true;
                     }
                 });
                 if join_requested {
                     let code = state.join_link_input.trim().to_string();
                     if code.is_empty() {
-                        state.new_chat_error = Some("Zadej odkaz nebo kód pozvánky".to_string());
+                        state.new_chat_error = Some(crate::tr!("Zadej odkaz nebo kód pozvánky").to_string());
                     } else {
                         let _ = backend.send_command(crate::commands::Command::JoinGroup { invite_code: code });
                         state.join_link_input.clear();
@@ -466,10 +467,10 @@ fn show_chat_context_menu(
     
     // Mute notifications, with the duration choices WhatsApp offers.
     ui.menu_button(
-        if chat.is_muted() { "🔔  Umlčení" } else { "🔕  Umlčení" },
+        if chat.is_muted() { crate::tr!("🔔  Umlčení") } else { crate::tr!("🔕  Umlčení") },
         |ui| {
             if ui
-                .selectable_label(!chat.is_muted(), "Vypnout umlčení")
+                .selectable_label(!chat.is_muted(), crate::tr!("Vypnout umlčení"))
                 .clicked()
             {
                 let _ = backend.send_command(crate::commands::Command::UnmuteChat {
@@ -477,7 +478,7 @@ fn show_chat_context_menu(
                 });
                 ui.close();
             }
-            for (label, hours) in [("8 hodin", 8i64), ("1 týden", 24 * 7)] {
+            for (label, hours) in [(crate::tr!("8 hodin"), 8i64), (crate::tr!("1 týden"), 24 * 7)] {
                 if ui.selectable_label(false, label).clicked() {
                     let until = chrono::Utc::now() + chrono::Duration::hours(hours);
                     let _ = backend.send_command(crate::commands::Command::MuteChat {
@@ -487,7 +488,7 @@ fn show_chat_context_menu(
                     ui.close();
                 }
             }
-            if ui.selectable_label(false, "Vždy").clicked() {
+            if ui.selectable_label(false, crate::tr!("Vždy")).clicked() {
                 let _ = backend.send_command(crate::commands::Command::MuteChat {
                     chat_jid: jid.clone(),
                     until: None,
@@ -512,9 +513,9 @@ fn show_chat_context_menu(
     // Delete chat. Destructive, so it asks first.
     if ui.selectable_label(false, "🗑  Delete chat").clicked() {
         *confirm_req = Some(crate::ui::confirm_dialog::request(
-            format!("Smazat chat {}?", chat.name),
-            "Chat zmizí ze seznamu; zprávy zůstanou na serveru.",
-            "Smazat",
+            format!("{} {}?", crate::tr!("Smazat chat"), chat.name),
+            crate::tr!("Chat zmizí ze seznamu; zprávy zůstanou na serveru."),
+            crate::tr!("Smazat"),
             crate::state::ConfirmAction::DeleteChat {
                 chat_jid: jid.clone(),
             },
@@ -525,9 +526,9 @@ fn show_chat_context_menu(
     // Clear messages
     if ui.selectable_label(false, "🧹  Clear messages").clicked() {
         *confirm_req = Some(crate::ui::confirm_dialog::request(
-            format!("Vymazat zprávy v chatu {}?", chat.name),
-            "Historie zmizí jen u tebe, ostatní ji pořád uvidí.",
-            "Vymazat",
+            crate::trf!("Vymazat zprávy v chatu {}?", chat.name),
+            crate::tr!("Historie zmizí jen u tebe, ostatní ji pořád uvidí."),
+            crate::tr!("Vymazat"),
             crate::state::ConfirmAction::ClearChat {
                 chat_jid: jid.clone(),
             },

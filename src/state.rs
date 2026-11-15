@@ -401,6 +401,9 @@ pub struct UserPreferences {
     /// Nainstalovat nalezenou aktualizaci bez ptaní.
     #[serde(default)]
     pub auto_install_updates: bool,
+    /// Jazyk rozhraní; čeština je výchozí i pro dřív uložené nastavení.
+    #[serde(default)]
+    pub language: crate::i18n::Language,
 }
 
 impl Default for UserPreferences {
@@ -421,6 +424,7 @@ impl Default for UserPreferences {
             start_with_windows: false,
             check_updates: true,
             auto_install_updates: false,
+            language: crate::i18n::Language::default(),
         }
     }
 }
@@ -817,6 +821,10 @@ pub struct AppState {
     /// Message the UI should scroll to and flash briefly (search, replies).
     #[serde(skip)]
     pub jump_target: Option<JumpTarget>,
+    /// The user pressed "back to the newest message". The click happens after
+    /// the history was already laid out, so the scroll itself runs next frame.
+    #[serde(skip)]
+    pub scroll_to_bottom_requested: bool,
     /// Whether the archived section is expanded in the chat list.
     #[serde(skip)]
     pub show_archived: bool,
@@ -897,6 +905,7 @@ impl Default for AppState {
             new_poll: None,
             poll_draft: None,
             jump_target: None,
+            scroll_to_bottom_requested: false,
             show_archived: false,
         }
     }

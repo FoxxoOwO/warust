@@ -27,7 +27,7 @@ impl SystemTray {
         let mut tray = TrayItem::new("Warust", icon)?;
 
         let tx_show = tx.clone();
-        let _ = tray.add_menu_item("Otevřít Warust", move || {
+        let _ = tray.add_menu_item(crate::tr!("Otevřít Warust"), move || {
             let _ = tx_show.send(TrayMessage::ShowWindow);
         });
 
@@ -35,7 +35,7 @@ impl SystemTray {
         let _ = tray.inner_mut().add_separator();
 
         let tx_quit = tx;
-        let _ = tray.add_menu_item("Ukončit Warust", move || {
+        let _ = tray.add_menu_item(crate::tr!("Ukončit Warust"), move || {
             let _ = tx_quit.send(TrayMessage::QuitApp);
         });
 

@@ -8,7 +8,7 @@ use crate::backend::BackendHandle;
 pub fn show_settings_with_ctx(ctx: &Context, state: &SharedState, backend: &BackendHandle, open: &mut bool) {
     let mut should_close = false;
     
-    Window::new("⚙️  Nastavení")
+    Window::new(crate::tr!("⚙️  Nastavení"))
         .open(open)
         .resizable(true)
         .default_width(760.0)
@@ -40,13 +40,13 @@ fn show_settings_content(ui: &mut Ui, state: &SharedState, backend: &BackendHand
             ui.add_space(8.0);
 
             let tabs = [
-                (SettingsTab::Profile, "👤  Účet a profil"),
-                (SettingsTab::Chats, "💬  Konverzace a média"),
-                (SettingsTab::Notifications, "🔔  Oznámení"),
-                (SettingsTab::Privacy, "🔒  Soukromí"),
-                (SettingsTab::Appearance, "🎨  Vzhled"),
-                (SettingsTab::Storage, "ℹ️  O aplikaci a data"),
-                (SettingsTab::System, "🖥️  Systém a spuštění"),
+                (SettingsTab::Profile, crate::tr!("👤  Účet a profil")),
+                (SettingsTab::Chats, crate::tr!("💬  Konverzace a média")),
+                (SettingsTab::Notifications, crate::tr!("🔔  Oznámení")),
+                (SettingsTab::Privacy, crate::tr!("🔒  Soukromí")),
+                (SettingsTab::Appearance, crate::tr!("🎨  Vzhled")),
+                (SettingsTab::Storage, crate::tr!("ℹ️  O aplikaci a data")),
+                (SettingsTab::System, crate::tr!("🖥️  Systém a spuštění")),
             ];
 
             for (tab, label) in tabs {
@@ -80,7 +80,7 @@ fn show_settings_content(ui: &mut Ui, state: &SharedState, backend: &BackendHand
             ui.add_space(24.0);
             ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
                 ui.add_space(8.0);
-                if ui.button(RichText::new("Zavřít").font(FontId::proportional(13.0))).clicked() {
+                if ui.button(RichText::new(crate::tr!("Zavřít")).font(FontId::proportional(13.0))).clicked() {
                     *should_close = true;
                 }
             });
@@ -261,14 +261,37 @@ fn show_privacy_settings(ui: &mut Ui, _s: &mut crate::state::AppState) {
 }
 
 fn show_appearance_settings(ui: &mut Ui, s: &mut crate::state::AppState) {
-    ui.label(RichText::new("Vzhled aplikace").font(FontId::proportional(18.0)).strong());
-    ui.label(RichText::new("Přizpůsobte si barevné schéma a styl rozhraní").font(FontId::proportional(12.0)).color(Color32::from_rgb(0x86, 0x96, 0xA0)));
+    ui.label(RichText::new(crate::tr!("Vzhled aplikace")).font(FontId::proportional(18.0)).strong());
+    ui.label(RichText::new(crate::tr!("Přizpůsobte si barevné schéma a styl rozhraní")).font(FontId::proportional(12.0)).color(Color32::from_rgb(0x86, 0x96, 0xA0)));
     ui.add_space(12.0);
 
-    setting_card(ui, "Barevné schéma", |ui| {
-        ui.radio_value(&mut s.preferences.dark_theme_preset, 0, "Výchozí WhatsApp Dark (#111B21)");
-        ui.radio_value(&mut s.preferences.dark_theme_preset, 1, "OLED Černá (#000000)");
-        ui.radio_value(&mut s.preferences.dark_theme_preset, 2, "Půlnoční modrá (#0A192F)");
+    // Jazyk je první, protože je to jediné nastavení, které mění jazyk
+    // ostatních položek — kdo ho hledá, musí ho najít bez čtení zbytku.
+    setting_card(ui, crate::tr!("Jazyk rozhraní"), |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(crate::tr!("Jazyk")).strong());
+            let current = s.preferences.language;
+            for language in crate::i18n::Language::all() {
+                if ui
+                    .selectable_label(current == language, language.label())
+                    .clicked()
+                {
+                    s.preferences.language = language;
+                    crate::i18n::set_language(language);
+                }
+            }
+        });
+        ui.label(
+            RichText::new(crate::tr!("Změna se projeví okamžitě, u ikony v oznamovací oblasti až po restartu aplikace."))
+                .font(FontId::proportional(11.0))
+                .color(Color32::from_rgb(0x86, 0x96, 0xA0)),
+        );
+    });
+
+    setting_card(ui, crate::tr!("Barevné schéma"), |ui| {
+        ui.radio_value(&mut s.preferences.dark_theme_preset, 0, crate::tr!("Výchozí WhatsApp Dark (#111B21)"));
+        ui.radio_value(&mut s.preferences.dark_theme_preset, 1, crate::tr!("OLED Černá (#000000)"));
+        ui.radio_value(&mut s.preferences.dark_theme_preset, 2, crate::tr!("Půlnoční modrá (#0A192F)"));
     });
 }
 

@@ -477,6 +477,25 @@ const ROW_OVERSCAN: f32 = 700.0;
 /// Stop remembering heights at some point; a long session with many chats would
 /// otherwise keep a map entry per message ever drawn.
 const ROW_HEIGHT_CACHE_LIMIT: usize = 20_000;
+/// Diameter of the round "back to the newest message" button.
+const JUMP_TO_BOTTOM_SIZE: f32 = 38.0;
+/// The button only appears once the user is genuinely reading older messages.
+/// Around a line of text of slack keeps it from flickering while a scroll comes
+/// to rest a pixel above the bottom.
+const JUMP_TO_BOTTOM_SLACK: f32 = 48.0;
+
+/// Whether the "jump to the newest message" button belongs on screen.
+///
+/// `content_height` is the full height of the history, `viewport_height` the
+/// visible part and `offset` how far down the user scrolled. The button is
+/// pointless when everything fits, and noise when the tail is still on screen.
+fn should_show_jump_to_bottom(content_height: f32, viewport_height: f32, offset: f32) -> bool {
+    let scrollable = content_height - viewport_height;
+    if scrollable <= JUMP_TO_BOTTOM_SLACK {
+        return false;
+    }
+    scrollable - offset > JUMP_TO_BOTTOM_SLACK
+}
 
 /// Which rows a virtualized list has to draw, and how much empty space stands in
 /// for the rest.
@@ -533,11 +552,23 @@ impl RowModel<'_> {
         (0..idx.min(self.messages.len())).map(|i| self.height(i)).sum()
     }
 
-    /// The window of rows to draw for `viewport` (in content coordinates), with
-    /// `top` being the content y of the first row.
+    /// The window of rows to draw, with `top` being where row 0 starts.
+    ///
+    /// `viewport` has to be in the *same* coordinate system as `top`. The scroll
+    /// area hands out its viewport in content coordinates while `ui.cursor()` is
+    /// in screen coordinates; mixing the two put the window a whole scroll
+    /// offset past the end of the history and the panel stayed empty.
     fn visible(&self, top: f32, viewport: Rect, overscan: f32) -> VisibleRows {
-        let from = viewport.min.y - top - overscan;
-        let to = viewport.max.y - top + overscan;
+        if self.messages.is_empty() {
+            return VisibleRows { first: 0, count: 0, before: 0.0, after: 0.0 };
+        }
+        let total: f32 = (0..self.messages.len()).map(|i| self.height(i)).sum();
+        // A scroll offset remembered from before the heights were measured can
+        // point past the end of a history that turned out shorter. Clamping keeps
+        // the panel populated instead of blank until the next scroll event.
+        let max_from = (total - viewport.height()).max(0.0);
+        let from = (viewport.min.y - top - overscan).clamp(0.0, max_from);
+        let to = from + viewport.height() + overscan * 2.0;
         let mut y = 0.0f32;
         let mut first = self.messages.len();
         let mut count = 0usize;
@@ -656,7 +687,7 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
     if let Some(offset) = jump_offset {
         scroll_area = scroll_area.vertical_scroll_offset(offset);
     }
-    scroll_area.show_viewport(ui, |ui, viewport| {
+    let output = scroll_area.show_viewport(ui, |ui, _viewport| {
             ui.add_space(8.0);
             
             // On-demand message history button (Peer Data Operation to primary phone)
@@ -679,12 +710,15 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
                 // where the whole cost of a long history used to be.
                 // The model is borrowed only long enough to pick the window: the
                 // loop below writes the measured heights back into the cache.
+                // The clip rect, not the scroll area's `viewport`: the cursor below
+                // is in screen coordinates and the two have to agree, otherwise a
+                // scrolled-down history draws nothing at all.
                 let window = {
                     let rows = RowModel {
                         heights: &state.row_heights,
                         messages,
                     };
-                    rows.visible(ui.cursor().min.y, viewport, ROW_OVERSCAN)
+                    rows.visible(ui.cursor().min.y, ui.clip_rect(), ROW_OVERSCAN)
                 };
                 ui.add_space(window.before);
 
@@ -852,7 +886,70 @@ fn show_messages_area(ui: &mut Ui, state: &mut AppState, chat: &crate::state::Ch
             
             // Bottom padding for stick_to_bottom
             ui.add_space(24.0);
+
+            // A request from the button below the pane: the click lands after the
+            // history was laid out, so the actual jump happens on the next frame,
+            // when the whole content rect is known.
+            if state.scroll_to_bottom_requested {
+                state.scroll_to_bottom_requested = false;
+                // Asking the scroll area itself (instead of writing an offset)
+                // keeps its animation and lets it re-enter sticky mode, so new
+                // messages keep following the bottom afterwards.
+                ui.scroll_to_rect(
+                    Rect::from_min_size(ui.min_rect().left_bottom(), egui::Vec2::ZERO),
+                    Some(Align::BOTTOM),
+                );
+            }
         });
+
+    // Reading older messages: offer the way back to the tail. The rule lives in
+    // a pure function so it can be tested without a window.
+    let distance_from_viewport_top = output.state.clamped_offset().y;
+    if should_show_jump_to_bottom(
+        output.content_size.y,
+        output.inner_rect.height(),
+        distance_from_viewport_top,
+    ) {
+        let anchor = output.inner_rect.right_bottom();
+        let mut clicked = false;
+        egui::Area::new(egui::Id::unique(("jump_to_bottom", chat_jid.to_string())))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(anchor.x - 54.0, anchor.y - 54.0))
+            .show(ui.ctx(), |ui| {
+                let (rect, response) = ui.allocate_exact_size(
+                    egui::Vec2::splat(JUMP_TO_BOTTOM_SIZE),
+                    egui::Sense::click(),
+                );
+                let fill = if response.hovered() {
+                    Color32::from_rgb(0x06, 0xCF, 0x9C)
+                } else {
+                    Color32::from_rgb(0x00, 0xA8, 0x84)
+                };
+                let painter = ui.painter();
+                // A dark rim keeps the circle readable over bright photo bubbles.
+                painter.circle_filled(
+                    rect.center(),
+                    JUMP_TO_BOTTOM_SIZE / 2.0,
+                    Color32::from_rgba_unmultiplied(0, 0, 0, 70),
+                );
+                painter.circle_filled(rect.center(), JUMP_TO_BOTTOM_SIZE / 2.0 - 2.0, fill);
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "⬇",
+                    FontId::proportional(17.0),
+                    Color32::WHITE,
+                );
+                clicked = response
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text(crate::tr!("Skočit na nejnovější zprávy"))
+                    .clicked();
+            });
+        if clicked {
+            state.scroll_to_bottom_requested = true;
+            ui.ctx().request_repaint();
+        }
+    }
         
     if let Some(id) = selected_toggle {
         state.toggle_selected(&id);
@@ -1808,6 +1905,20 @@ mod tests {
         assert!(window.count > 0 && window.count < messages.len());
     }
 
+    /// A scroll offset pointing past the end of the history must not blank the
+    /// panel: this is what a shrink after measuring looks like.
+    #[test]
+    fn a_stale_scroll_offset_still_draws_rows() {
+        let (messages, heights) = history(60, Some(60.0));
+        let model = RowModel {
+            heights: &heights,
+            messages: &messages,
+        };
+        let window = model.visible(60.0, viewport(500_000.0, 700.0), ROW_OVERSCAN);
+        assert!(window.count > 0, "panel zůstal prázdný");
+        assert_eq!(window.after, 0.0, "pod oknem už nic není");
+    }
+
     /// Rows nobody has drawn yet use the fallback, so the first frame of a chat
     /// still shows something instead of an empty scroll area.
     #[test]
@@ -1908,6 +2019,84 @@ mod tests {
         start.elapsed().as_secs_f64() * 1000.0 / rounds as f64
     }
 
+    /// The panel must actually draw something, and it has to be the rows the
+    /// user is looking at: a window offset by the scroll position draws nothing
+    /// at all, and a window that always starts at zero draws the wrong end of
+    /// the history.
+    #[test]
+    fn the_panel_draws_the_visible_bubbles() {
+        use crate::backend::BackendHandle;
+        use crate::state::Chat;
+        use std::sync::Arc;
+
+        let jid: Jid = "123@s.whatsapp.net".parse().unwrap();
+        let state: SharedState = Arc::new(parking_lot::RwLock::new(AppState::default()));
+        {
+            let mut s = state.write();
+            s.chats.insert(
+                jid.clone(),
+                Chat {
+                    jid: jid.clone(),
+                    name: "Měření".to_string(),
+                    last_message: None,
+                    unread_count: 0,
+                    is_group: false,
+                    is_archived: false,
+                    is_pinned: false,
+                    mute_until: None,
+                    last_activity: chrono::Utc::now(),
+                    participants: Default::default(),
+                    is_typing: false,
+                    typing_until: None,
+                },
+            );
+            s.messages.insert(
+                jid.clone(),
+                (0..200)
+                    .map(|i| base(&format!("m{i}"), "zpráva s dost dlouhým textem, aby se musela lámat do řádků"))
+                    .collect(),
+            );
+            s.selected_chat = Some(jid.clone());
+        }
+        let backend = BackendHandle {
+            tx_command: tokio::sync::mpsc::unbounded_channel().0,
+            rx_status: tokio::sync::watch::channel(crate::state::ConnectionStatus::Disconnected).1,
+            state: state.clone(),
+            bot_handle: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+
+        let ctx = Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 700.0)));
+        for _ in 0..3 {
+            let mut output = ctx.run_ui(input.clone(), |ui| {
+                show_conversation(ui, &state, &backend);
+            });
+            // Glyph atlases are freed again at the end of the pass; dropping the
+            // delta keeps the shared TextureManager from complaining.
+            output.textures_delta.clear();
+        }
+
+        let heights: Vec<f32> = state.read().row_heights.values().copied().collect();
+        assert!(!heights.is_empty(), "panel nenakreslil ani jednu bublinu");
+        let drawn: f32 = heights.iter().sum();
+        assert!(
+            drawn >= 300.0,
+            "nakreslené bubliny mají dohromady jen {drawn} px, viewport má 700 px"
+        );
+        assert!(
+            heights.len() < 200,
+            "kreslí se {} z 200 zpráv — virtualizace nefunguje",
+            heights.len()
+        );
+        // Historie je odscrollovaná na konec, takže musí být nakreslená poslední
+        // zpráva. Bez toho se panel jeví prázdný, i když se něco nakreslilo.
+        assert!(
+            state.read().row_heights.contains_key("m199"),
+            "poslední zpráva se nenakreslila — okno je mimo viditelnou část"
+        );
+    }
+
     fn frame_cost_ms(count: usize) -> f64 {
         use crate::backend::BackendHandle;
         use crate::state::Chat;
@@ -1981,6 +2170,26 @@ mod tests {
             }
         }
         total / (frames - warmup) as f64
+    }
+
+    #[test]
+    fn jump_to_bottom_hides_while_the_tail_is_on_screen() {
+        // A short chat that fits: nothing to jump to.
+        assert!(!should_show_jump_to_bottom(300.0, 700.0, 0.0));
+        // Scrolled to the very bottom of a long history.
+        assert!(!should_show_jump_to_bottom(20_000.0, 700.0, 19_300.0));
+        // Just a few pixels above the bottom: the button would only flicker.
+        assert!(!should_show_jump_to_bottom(20_000.0, 700.0, 19_280.0));
+    }
+
+    #[test]
+    fn jump_to_bottom_shows_when_the_user_is_reading_older_messages() {
+        assert!(should_show_jump_to_bottom(20_000.0, 700.0, 0.0));
+        assert!(should_show_jump_to_bottom(20_000.0, 700.0, 10_000.0));
+        // One screen above the bottom is still "in the past".
+        assert!(should_show_jump_to_bottom(20_000.0, 700.0, 18_000.0));
+        // After the jump the offset equals the scrollable range again.
+        assert!(!should_show_jump_to_bottom(20_000.0, 700.0, 19_300.0));
     }
 
     #[test]

@@ -20,6 +20,9 @@ pub struct WarustApp {
     show_settings: bool,
     tray: Option<crate::tray::SystemTray>,
     playback_error: Option<(String, std::time::Instant)>,
+    /// Set when the tray asks for a real quit. The close button only hides the
+    /// window, so the quit has to be told apart from a plain close.
+    quit_requested: bool,
 }
 
 impl WarustApp {
@@ -34,6 +37,9 @@ impl WarustApp {
         
         // Load persisted state or create fresh
         let loaded_state = runtime.block_on(crate::storage::load_state()).unwrap_or_default();
+        // Ikona v oznamovací oblasti se staví jednou při startu a její popisky
+        // měnit neumíme, takže jazyk musí být znám dřív než vznikne.
+        crate::i18n::set_language(loaded_state.preferences.language);
         let run_in_tray = loaded_state.preferences.run_in_tray;
         let state = Arc::new(RwLock::new(loaded_state));
         
@@ -66,6 +72,7 @@ impl WarustApp {
             show_settings: false,
             tray,
             playback_error: None,
+            quit_requested: false,
         })
     }
     
@@ -74,8 +81,21 @@ impl WarustApp {
     }
 }
 
+/// Does a close request only hide the window to the tray?
+///
+/// The close button does, "Ukončit Warust" from the tray menu does not. Without
+/// the distinction the quit request went through the same close handler, was
+/// cancelled and the app just vanished from the taskbar while it kept running.
+fn should_close_to_tray(close_to_tray: bool, tray_present: bool, quit_requested: bool) -> bool {
+    close_to_tray && tray_present && !quit_requested
+}
+
 impl eframe::App for WarustApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        // Celý snímek se kreslí v jednom jazyce; přepínač v nastavení se
+        // projeví hned následujícím snímkem.
+        crate::i18n::set_language(self.state.read().preferences.language);
+
         // Track focus so incoming messages only toast when the user is elsewhere.
         let focused = ui.input(|i| i.viewport().focused).unwrap_or(true);
         crate::notifications::set_window_focused(focused);
@@ -89,6 +109,9 @@ impl eframe::App for WarustApp {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
                     }
                     crate::tray::TrayMessage::QuitApp => {
+                        // A real quit: the close handler below must not turn this
+                        // into "hide to the tray".
+                        self.quit_requested = true;
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 }
@@ -131,7 +154,11 @@ impl eframe::App for WarustApp {
 
         // Intercept close event if close-to-tray is enabled
         if ui.input(|i| i.viewport().close_requested()) {
-            let close_to_tray = self.state.read().preferences.close_to_tray && self.tray.is_some();
+            let close_to_tray = should_close_to_tray(
+                self.state.read().preferences.close_to_tray,
+                self.tray.is_some(),
+                self.quit_requested,
+            );
             if close_to_tray {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -280,7 +307,7 @@ impl eframe::App for WarustApp {
                             .inner_margin(egui::Margin::symmetric(12, 8))
                             .show(ui, |ui| {
                                 ui.label(
-                                    RichText::new(format!("⚠ Přehrávání: {msg}"))
+                                    RichText::new(format!("⚠ {}: {msg}", crate::tr!("Přehrávání")))
                                         .color(Color32::from_rgb(0xF2, 0x8B, 0x82))
                                         .font(FontId::proportional(12.0)),
                                 );
@@ -320,5 +347,23 @@ impl eframe::App for WarustApp {
         self.runtime.block_on(crate::storage::persist_or_log(&self.state));
         
         info!("Shutdown complete");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_close_to_tray;
+
+    /// „Ukončit Warust" z traye musí opravdu ukončit aplikaci, i když je
+    /// zapnuté zavírání do traye — jinak se okno jen schová a proces zůstane.
+    #[test]
+    fn a_tray_quit_is_not_cancelled_by_close_to_tray() {
+        assert!(should_close_to_tray(true, true, false), "zavření křížkem se má schovat do traye");
+        assert!(
+            !should_close_to_tray(true, true, true),
+            "Ukončit Warust se zrušilo jako zavření do traye"
+        );
+        assert!(!should_close_to_tray(false, true, false), "bez traye se okno zavírá");
+        assert!(!should_close_to_tray(true, false, false), "bez traye není kam se schovat");
     }
 }

@@ -103,7 +103,7 @@ Postup, který se osvědčil u posledních dvou bugů:
 - Sekce 1 se doplní, pokud bug vznikl v novém typu místa.
 - Známé a neopravené bugy zůstávají v tabulce níže — nezavírat je mazáním.
 
-## 9. Otevřené nálezy (stav k 2026-11-14)
+## 9. Otevřené nálezy (stav k 2026-11-15)
 
 | ID | Popis | Závažnost | Stav |
 |----|-------|-----------|------|
@@ -117,3 +117,7 @@ Postup, který se osvědčil u posledních dvou bugů:
 | BUG-20261114-08 | Nečinné okno si říkalo o frame každých 100 ms (`src/app.rs:297`), takže drželo GPU vzhůru a kreslilo tytéž pixely | P1 | opraveno (PR #29), kryto `idle_state_does_not_ask_for_animation_frames` |
 | BUG-20261114-09 | `extract_message_text` měl `for` přes tři poll payloady, který vracel v první iteraci (clippy `never_loop`) | P2 | opraveno (PR #29) — `or_else` řetěz se stejnou sémantikou |
 | BUG-20261114-10 | Panel zpráv nemá virtualizaci: kreslí všechny bubliny historie v každém framu | P1 | opraveno (PR #33) — 2000 zpráv 4,67 → 0,08 ms; kryto `a_long_history_only_draws_the_rows_around_the_viewport`, `spacers_keep_the_content_height` |
+| BUG-20261115-11 | Po v0.3.4 se v dlouhém chatu neukázala žádná zpráva: `RowModel::visible` míchal souřadnice obrazovky a obsahu, takže `from` vyrostlo na dvojnásobek odscrollované vzdálenosti a okno zpráv vyšlo prázdné (1901 zpráv, odscrollováno dolů: `cursor_y=-124263`, `viewport=124376…125034`, `count = 0`) | P0 | opraveno — okno se počítá v souřadnicích obrazovky, `from` se zastropuje na `total - viewport.height()`; kryto `the_panel_draws_the_visible_bubbles` (kreslí se poslední zpráva) |
+| BUG-20261115-12 | „Ukončit Warust“ v oznamovací oblasti jen skrylo okno: pravidlo „zavřít do traye“ zrušilo požadavek na zavření, proces žil dál bez jediného „Shutting down Warust“ v logu | P1 | opraveno — `quit_requested` pole + čistá `should_close_to_tray(close_to_tray, tray_present, quit_requested)`; kryto `a_tray_quit_is_not_cancelled_by_close_to_tray` |
+| BUG-20261115-13 | „Stáhnout a nainstalovat“ spadlo na `the response body is larger than request limit: 10485760`: balíček má 144 241 688 B, ale tělo se četlo přes `read_to_vec()` se stropem 10 MiB v ureq 3 | P0 | opraveno — tělo se teče do souboru přes `as_reader()`, po chybě se nedopsaný soubor smaže, prázdná odpověď se odmítne; kryto `stazeny_balicek_se_tece_do_souboru_cely`, `nedopsany_balicek_po_chybe_zmizi` + reálným stažením (`--test-update`: 138 MB, tar 0, `warust.exe` spustitelný) |
+| BUG-20261115-14 | Video testy (`decodes_frames_from_generated_clip`, `seeks_to_requested_offset`) občas spadnou, když stroj něco počítá: čekají na snímek s pevnou lhůtou 3 s a kolem sebe spouští ffmpeg. Na prázdném stroji projdou (133/133) | P3 | otevřeno — zvýšit lhůtu, nebo čekat na signál z dekodéru místo na čas |

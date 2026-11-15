@@ -56,11 +56,11 @@ impl UpdateStatus {
     pub fn label(&self) -> String {
         match self {
             UpdateStatus::Idle => String::new(),
-            UpdateStatus::Checking => "Zjišťuji novou verzi…".to_string(),
-            UpdateStatus::UpToDate => "Máš nejnovější verzi.".to_string(),
-            UpdateStatus::Available(version) => format!("Dostupná verze {}.", version),
-            UpdateStatus::Downloading => "Stahuji aktualizaci…".to_string(),
-            UpdateStatus::Failed(error) => format!("Chyba: {}", error),
+            UpdateStatus::Checking => crate::tr!("Zjišťuji novou verzi…").to_string(),
+            UpdateStatus::UpToDate => crate::tr!("Máš nejnovější verzi.").to_string(),
+            UpdateStatus::Available(version) => crate::trf!("Dostupná verze {}.", version),
+            UpdateStatus::Downloading => crate::tr!("Stahuji aktualizaci…").to_string(),
+            UpdateStatus::Failed(error) => format!("{}: {}", crate::tr!("Chyba"), error),
         }
     }
 
@@ -163,15 +163,38 @@ pub fn fetch_latest() -> Result<Option<UpdateInfo>> {
 /// Stáhne balíček do dočasné složky a vrátí cestu k němu.
 pub fn download(url: &str) -> Result<PathBuf> {
     let mut response = ureq::get(url).header("User-Agent", USER_AGENT).call()?;
-    let bytes = response.body_mut().read_to_vec()?;
     let name = url
         .rsplit('/')
         .next()
         .filter(|name| !name.is_empty())
         .unwrap_or("warust-update");
     let path = std::env::temp_dir().join(name);
-    std::fs::write(&path, &bytes)?;
+    // Tělo se teče rovnou do souboru, ne přes `read_to_vec()`: ten má v ureq 3
+    // strop 10 MiB a balíček má kolem 40 MB, takže stahování skončilo chybou
+    // "the response body is larger than request limit" a nic se neuložilo.
+    // `as_reader()` limit nemá a do paměti se nic nekopíruje.
+    let written = save_body_to_file(response.body_mut().as_reader(), &path)?;
+    if written == 0 {
+        let _ = std::fs::remove_file(&path);
+        return Err(anyhow!("server vrátil prázdný balíček ({url})"));
+    }
     Ok(path)
+}
+
+/// Překopíruje tělo odpovědi do souboru a vrátí počet zapsaných bajtů.
+///
+/// Nedopsaný soubor se po chybě smaže: při dalším pokusu by se s ním jinak
+/// pracovalo jako s platným balíčkem.
+fn save_body_to_file<R: std::io::Read>(mut reader: R, path: &Path) -> Result<u64> {
+    let mut file = std::fs::File::create(path)?;
+    match std::io::copy(&mut reader, &mut file) {
+        Ok(written) => Ok(written),
+        Err(error) => {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            Err(error.into())
+        }
+    }
 }
 
 /// Skript pro Windows, který počká na ukončení procesu, rozbalí archiv a
@@ -433,8 +456,10 @@ pub fn check_now(state: &SharedState) -> bool {
 /// Stáhne balíček a předá ho instalačnímu skriptu (blokující).
 pub fn install_now(state: &SharedState, info: &UpdateInfo) -> bool {
     let Some(url) = info.asset_url.clone() else {
-        state.write().update_status =
-            UpdateStatus::Failed("vydání nemá balíček pro tuto platformu".to_string());
+        state.write().update_status = UpdateStatus::Failed(crate::tr!(
+            "vydání nemá balíček pro tuto platformu"
+        )
+        .to_string());
         return false;
     };
     state.write().update_status = UpdateStatus::Downloading;
@@ -593,6 +618,7 @@ mod tests {
 
     #[test]
     fn status_labels_are_readable() {
+        let _language = crate::i18n::lock_language();
         assert!(UpdateStatus::Checking.label().contains("Zjišťuji"));
         assert!(UpdateStatus::Available("0.3.0".to_string())
             .label()
@@ -603,5 +629,63 @@ mod tests {
         assert!(UpdateStatus::UpToDate.label().contains("nejnovější"));
         assert!(UpdateStatus::Checking.is_busy());
         assert!(!UpdateStatus::Idle.is_busy());
+    }
+
+    /// Balíček má kolem 40 MB, ale `read_to_vec()` má v ureq 3 strop 10 MiB a
+    /// stahování na něm skončilo chybou "the response body is larger than request
+    /// limit". Tělo se proto teče do souboru; test hlídá, že se limit neuplatní
+    /// a že se zapíše všechno.
+    #[test]
+    fn stazeny_balicek_se_tece_do_souboru_cely() {
+        const DATA: u64 = 12 * 1024 * 1024;
+
+        /// Nekonečný zdroj, který se po `DATA` bajtech zastaví.
+        struct NekonecnyZroj {
+            zbyva: u64,
+        }
+
+        impl std::io::Read for NekonecnyZroj {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let kus = (buf.len() as u64).min(self.zbyva) as usize;
+                buf[..kus].fill(b'x');
+                self.zbyva -= kus as u64;
+                Ok(kus)
+            }
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "warust-test-tece-{}.zip", std::process::id()
+        ));
+        let written = save_body_to_file(NekonecnyZroj { zbyva: DATA }, &path).unwrap();
+        assert_eq!(written, DATA);
+        let saved = std::fs::metadata(&path).unwrap().len();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(saved, DATA, "na disk se dostalo jen {saved} z {DATA} bajtů");
+    }
+
+    /// Nedopsaný balíček by při dalším pokusu vypadal jako platný, takže po
+    /// chybě musí po souboru nezůstat ani stopa.
+    #[test]
+    fn nedopsany_balicek_po_chybe_zmizi() {
+        struct Rozbity {
+            zbyva: u8,
+        }
+
+        impl std::io::Read for Rozbity {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.zbyva == 0 {
+                    return Err(std::io::Error::other("spojení spadlo"));
+                }
+                self.zbyva -= 1;
+                buf[0] = b'x';
+                Ok(1)
+            }
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "warust-test-nedopsany-{}.zip", std::process::id()
+        ));
+        assert!(save_body_to_file(Rozbity { zbyva: 4 }, &path).is_err());
+        assert!(!path.exists(), "zůstal nedopsaný soubor {}", path.display());
     }
 }

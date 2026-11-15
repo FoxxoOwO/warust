@@ -32,7 +32,7 @@ pub fn show_update_dialog(ctx: &egui::Context, state: &SharedState) {
         .default_width(460.0)
         .show(ctx, |ui| {
             ui.label(
-                RichText::new(format!("Nainstalováno: v{CURRENT_VERSION}"))
+                RichText::new(crate::trf!("Nainstalováno: v{}", CURRENT_VERSION))
                     .color(Color32::from_gray(170)),
             );
 
@@ -40,7 +40,7 @@ pub fn show_update_dialog(ctx: &egui::Context, state: &SharedState) {
                 Some(info) => {
                     ui.add_space(4.0);
                     ui.label(
-                        RichText::new(format!("K dispozici je v{}", info.version))
+                        RichText::new(crate::trf!("K dispozici je v{}", info.version))
                             .strong()
                             .size(16.0)
                             .color(ACCENT),
@@ -66,7 +66,7 @@ pub fn show_update_dialog(ctx: &egui::Context, state: &SharedState) {
                             if ui
                                 .add_enabled(
                                     !status.is_busy(),
-                                    egui::Button::new(RichText::new("⬇ Stáhnout a nainstalovat").strong()),
+                                    egui::Button::new(RichText::new(crate::tr!("⬇ Stáhnout a nainstalovat")).strong()),
                                 )
                                 .clicked()
                             {
@@ -75,24 +75,24 @@ pub fn show_update_dialog(ctx: &egui::Context, state: &SharedState) {
                                 install = true;
                             }
                         }
-                        if ui.button("Stránka vydání").clicked() {
+                        if ui.button(crate::tr!("Stránka vydání")).clicked() {
                             open_page = Some(info.page_url.clone());
                         }
-                        if ui.button("Později").clicked() {
+                        if ui.button(crate::tr!("Později")).clicked() {
                             close = true;
                         }
                     });
                     if info.has_asset() {
                         ui.label(
                             RichText::new(
-                                "Aplikace se po stažení zavře, vymění se spustitelný soubor a znovu se otevře.",
+                                crate::tr!("Aplikace se po stažení zavře, vymění se spustitelný soubor a znovu se otevře."),
                             )
                             .size(11.0)
                             .color(Color32::from_gray(150)),
                         );
                     } else {
                         ui.label(
-                            RichText::new("Pro tuto platformu není v tomto vydání balíček ke stažení.")
+                            RichText::new(crate::tr!("Pro tuto platformu není v tomto vydání balíček ke stažení."))
                                 .size(11.0)
                                 .color(Color32::from_rgb(0xE0, 0xA0, 0x40)),
                         );
@@ -108,7 +108,7 @@ pub fn show_update_dialog(ctx: &egui::Context, state: &SharedState) {
                     }
                     if auto_install {
                         ui.label(
-                            RichText::new("Automatická instalace je zapnutá — aktualizace proběhne sama.")
+                            RichText::new(crate::tr!("Automatická instalace je zapnutá — aktualizace proběhne sama."))
                                 .size(11.0)
                                 .color(Color32::from_gray(150)),
                         );
@@ -116,7 +116,7 @@ pub fn show_update_dialog(ctx: &egui::Context, state: &SharedState) {
                 }
                 None => {
                     ui.add_space(4.0);
-                    ui.label("Není k dispozici žádná novější verze.");
+                    ui.label(crate::tr!("Není k dispozici žádná novější verze."));
                     if !status.label().is_empty() {
                         ui.label(
                             RichText::new(status.label())
@@ -126,10 +126,10 @@ pub fn show_update_dialog(ctx: &egui::Context, state: &SharedState) {
                     }
                     ui.separator();
                     ui.horizontal(|ui| {
-                        if ui.button("Zkontrolovat znovu").clicked() {
+                        if ui.button(crate::tr!("Zkontrolovat znovu")).clicked() {
                             updater::spawn_check(state.clone());
                         }
-                        if ui.button("Zavřít").clicked() {
+                        if ui.button(crate::tr!("Zavřít")).clicked() {
                             close = true;
                         }
                     });
@@ -163,6 +163,6 @@ pub fn update_badge(ui: &mut egui::Ui, state: &SharedState) -> bool {
     };
     let label = format!("⬆ v{}", info.version);
     ui.button(label)
-        .on_hover_text("Je dostupná nová verze — klikni pro podrobnosti.")
+        .on_hover_text(crate::tr!("Je dostupná nová verze — klikni pro podrobnosti."))
         .clicked()
 }
