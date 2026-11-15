@@ -7,6 +7,26 @@ also published on the [Releases page](https://github.com/FoxxoOwO/warust/release
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-11-15
+
+Scrolls smoothly in long chats: the message panel no longer draws, nor copies, the
+whole history every frame.
+
+### Changed
+- The message list draws only the messages around the viewport. Heights measured
+  while drawing are cached per message, so the rows above and below are replaced by
+  blank space of the right height — the scrollbar and "stick to bottom" stay honest.
+- The panel takes the history out of the app state for the duration of the frame
+  and puts it back, instead of cloning it (a clone of 2000 messages with thumbnails
+  cost 1.9 ms per frame).
+- Jumping to a message from search or the info panel now computes the scroll offset
+  from the row model, because the target may not be drawn yet.
+
+### Fixed
+- A 2000-message chat spent 4.67 ms per frame just laying out rows nobody could
+  see; it now spends 0.08 ms and the cost no longer grows with history length
+  (measured by `bench_conversation_frames`).
+
 ## [0.3.3] - 2026-11-14
 
 Saves work on this machine, lighter idle rendering, and a log file to attach to a
