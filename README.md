@@ -1,5 +1,8 @@
 # Warust
 
+> [!WARNING]
+> **Deprecated:** `warust` has been deprecated in favor of **[WaLite](https://github.com/FoxxoOwO/walite)** (Flutter Desktop UI + Rust `whatsapp-rust` backend). All new development and releases continue there.
+
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![egui](https://img.shields.io/badge/egui-0.37-blue.svg?style=flat-square)](https://github.com/emilk/egui)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green.svg?style=flat-square)](LICENSE)
